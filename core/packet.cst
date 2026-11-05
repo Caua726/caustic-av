@@ -1,0 +1,74 @@
+// =======================================================
+// caustic-av/core/packet.cst
+// One demuxed packet: a borrowed view of bytes owned by the source buffer,
+// plus the track and timestamps that place it on a timeline. A packet never
+// owns or copies its data, so a demuxer can hand out slices of the input
+// without allocation and a decoder must consume it before the source moves.
+//
+// Timestamps are in the track's own timebase, which the container reports
+// alongside the track; this struct does not convert them.
+// =======================================================
+
+use "errno.cst" as errno;
+
+struct Packet {
+    data     as *u8;   // borrowed bytes, valid for len bytes
+    len      as i64;   // byte count, >= 0
+    track    as i32;   // track index this packet belongs to
+    pts      as i64;   // presentation timestamp
+    dts      as i64;   // decode timestamp
+    duration as i64;   // duration in timebase units, 0 when unknown
+    keyframe as i64;   // 1 for a keyframe / seek point, 0 otherwise
+}
+
+// Empty packet on the given track, with no data and zero timestamps.
+fn packet_init(p as *Packet, track as i32) as void {
+    p.data = cast(*u8, 0);
+    p.len = 0;
+    p.track = track;
+    p.pts = 0;
+    p.dts = 0;
+    p.duration = 0;
+    p.keyframe = 0;
+}
+
+// Borrow data[0..len] for the given track and timestamps. Returns 0, or
+// I_BADPARAM for a negative length, a null pointer with bytes, or a negative
+// duration. Arguments are validated before anything is written, so on failure
+// the packet is untouched.
+fn packet_set(p as *Packet, data as *u8, len as i64, track as i32,
+              pts as i64, dts as i64, duration as i64, keyframe as i64) as i64 {
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, data) == 0) { return errno.I_BADPARAM; }
+    if (duration < 0) { return errno.I_BADPARAM; }
+    packet_init(p, track);
+    p.data = data;
+    p.len = len;
+    p.pts = pts;
+    p.dts = dts;
+    p.duration = duration;
+    if (keyframe != 0) { p.keyframe = 1; }
+    return errno.I_OK;
+}
+
+// Replace the packet's data view without touching track or timestamps.
+fn packet_set_data(p as *Packet, data as *u8, len as i64) as i64 {
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, data) == 0) { return errno.I_BADPARAM; }
+    p.data = data;
+    p.len = len;
+    return errno.I_OK;
+}
+
+fn packet_len(p as *Packet) as i64 {
+    return p.len;
+}
+
+fn packet_is_key(p as *Packet) as i64 {
+    return p.keyframe;
+}
+
+// Drop the borrowed view and all metadata. A later packet_set can reuse it.
+fn packet_clear(p as *Packet) as void {
+    packet_init(p, 0);
+}

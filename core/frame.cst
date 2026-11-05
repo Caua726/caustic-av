@@ -1,0 +1,137 @@
+// =======================================================
+// caustic-av/core/frame.cst
+// A decoded video surface in I420: one 8-bit luma plane and two 8-bit
+// chroma planes, each with an explicit row stride. Planes point into memory
+// the caller provides; this module validates sizes and carves the layout but
+// never allocates, so the same code works for a decoder's reusable pool, a
+// caller's arena, or a block from std/mem.
+//
+// The caller allocates frame_size(coded_width, coded_height) bytes (after
+// checking it is not negative), passes the block and its capacity to
+// frame_init, and frees it with whichever owner supplied it. frame_free only
+// drops the view; it does not release memory it does not own.
+//
+// Visible and coded sizes are separate because VP9 codes in superblocks:
+// coded_width/coded_height describe the allocated planes, width/height the
+// part that is actually shown after cropping. For codecs without padding the
+// two are equal.
+// =======================================================
+
+use "errno.cst" as errno;
+
+// VP9 profile 0 tops out at 65536 pixels per side; a larger value is a
+// corrupt or hostile header, not a frame this library allocates.
+let is i64 as FRAME_MAX_DIM   with imut = 65536;
+// Stay well below the i64 ceiling so all offsets remain positive.
+let is i64 as FRAME_MAX_BYTES with imut = 4611686018427387904;
+
+struct Frame {
+    width        as i64;   // visible width in pixels
+    height       as i64;   // visible height in pixels
+    coded_width  as i64;   // allocated luma width
+    coded_height as i64;   // allocated luma height
+    y            as *u8;   // luma plane, stride_y bytes per row
+    u            as *u8;   // Cb plane
+    v            as *u8;   // Cr plane
+    stride_y     as i64;
+    stride_u     as i64;
+    stride_v     as i64;
+    pixels       as *u8;   // start of the caller-provided block
+    cap          as i64;   // bytes available from pixels
+}
+
+// a*b with an overflow check. Both operands must be non-negative.
+fn frame_mul(a as i64, b as i64) as i64 {
+    if (a < 0 || b < 0) { return errno.I_DIMS; }
+    if (a == 0 || b == 0) { return 0; }
+    if (a > FRAME_MAX_BYTES / b) { return errno.I_DIMS; }
+    return a * b;
+}
+
+fn frame_add(a as i64, b as i64) as i64 {
+    if (a < 0 || b < 0) { return errno.I_DIMS; }
+    if (a > FRAME_MAX_BYTES - b) { return errno.I_DIMS; }
+    return a + b;
+}
+
+// Bytes needed for coded_width x coded_height I420. Chroma is half size in
+// each dimension, rounded up so odd dimensions still have a sample for every
+// luma column and row. Returns a positive byte count or I_DIMS.
+fn frame_size(coded_width as i64, coded_height as i64) as i64 {
+    if (coded_width <= 0 || coded_width > FRAME_MAX_DIM) { return errno.I_DIMS; }
+    if (coded_height <= 0 || coded_height > FRAME_MAX_DIM) { return errno.I_DIMS; }
+    let is i64 as cw = (coded_width + 1) / 2;
+    let is i64 as ch = (coded_height + 1) / 2;
+    let is i64 as luma = frame_mul(coded_width, coded_height);
+    if (luma < 0) { return luma; }
+    let is i64 as chroma = frame_mul(cw, ch);
+    if (chroma < 0) { return chroma; }
+    let is i64 as total = frame_add(luma, chroma);
+    if (total < 0) { return total; }
+    return frame_add(total, chroma);
+}
+
+// Point f at mem[0..cap] as an I420 frame of the given coded size, with the
+// visible area starting at (0,0). mem must hold at least frame_size(...)
+// bytes; cap is the size of the block the caller actually owns. Returns 0,
+// I_DIMS for impossible dimensions, I_BADPARAM for a negative capacity or a
+// null block, or I_NOMEM when cap is too small. On failure f is cleared and
+// no memory is touched.
+fn frame_init_coded(f as *Frame, width as i64, height as i64,
+                    coded_width as i64, coded_height as i64,
+                    mem as *u8, cap as i64) as i64 {
+    frame_free(f);
+    if (width <= 0 || width > FRAME_MAX_DIM) { return errno.I_DIMS; }
+    if (height <= 0 || height > FRAME_MAX_DIM) { return errno.I_DIMS; }
+    if (coded_width < width || coded_width > FRAME_MAX_DIM) { return errno.I_DIMS; }
+    if (coded_height < height || coded_height > FRAME_MAX_DIM) { return errno.I_DIMS; }
+    let is i64 as total = frame_size(coded_width, coded_height);
+    if (total < 0) { return total; }
+    if (cap < 0) { return errno.I_BADPARAM; }
+    if (cap < total) { return errno.I_NOMEM; }
+    if (cast(i64, mem) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as cw = (coded_width + 1) / 2;
+    let is i64 as ch = (coded_height + 1) / 2;
+    let is i64 as luma = frame_mul(coded_width, coded_height);
+    if (luma < 0) { return luma; }
+    let is i64 as chroma = frame_mul(cw, ch);
+    if (chroma < 0) { return chroma; }
+
+    f.width = width;
+    f.height = height;
+    f.coded_width = coded_width;
+    f.coded_height = coded_height;
+    f.stride_y = coded_width;
+    f.stride_u = cw;
+    f.stride_v = cw;
+    f.y = mem;
+    f.u = cast(*u8, cast(i64, mem) + luma);
+    f.v = cast(*u8, cast(i64, f.u) + chroma);
+    f.pixels = mem;
+    f.cap = cap;
+    return errno.I_OK;
+}
+
+// frame_init_coded with coded size equal to visible size.
+fn frame_init(f as *Frame, width as i64, height as i64,
+              mem as *u8, cap as i64) as i64 {
+    return frame_init_coded(f, width, height, width, height, mem, cap);
+}
+
+// Drop all plane pointers and sizes. The caller's block is untouched and
+// remains the caller's to release.
+fn frame_free(f as *Frame) as void {
+    f.width = 0;
+    f.height = 0;
+    f.coded_width = 0;
+    f.coded_height = 0;
+    f.y = cast(*u8, 0);
+    f.u = cast(*u8, 0);
+    f.v = cast(*u8, 0);
+    f.stride_y = 0;
+    f.stride_u = 0;
+    f.stride_v = 0;
+    f.pixels = cast(*u8, 0);
+    f.cap = 0;
+}

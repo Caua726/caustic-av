@@ -1,0 +1,94 @@
+// =======================================================
+// caustic-av/core/samples.cst
+// A decoded audio block: a format tag, sample rate, channel count, and an
+// interleaved PCM buffer. Like Frame, the buffer is caller-owned: this module
+// validates the layout arithmetic and points Samples at the block, but does
+// not allocate. The caller sizes the block with samples_size, checks that the
+// result is not negative, and frees it with the owner that supplied it.
+//
+// `count` is frames per channel, not total scalar values: an interleaved
+// buffer holds count * channels values. The format tags describe the scalar
+// type in the buffer, not the file's encoding.
+// =======================================================
+
+use "errno.cst" as errno;
+
+let is i64 as SAMPLE_FMT_S16 with imut = 0;   // signed 16-bit
+let is i64 as SAMPLE_FMT_S32 with imut = 1;   // signed 32-bit
+let is i64 as SAMPLE_FMT_F32 with imut = 2;   // IEEE 754 single precision
+
+// Audio has no reason to exceed these; both bounds catch corrupt headers
+// before any size is computed.
+let is i64 as SAMPLES_MAX_CHANNELS with imut = 64;
+let is i64 as SAMPLES_MAX_RATE     with imut = 768000;
+let is i64 as SAMPLES_MAX_BYTES    with imut = 4611686018427387904;
+
+struct Samples {
+    fmt      as i64;   // SAMPLE_FMT_*
+    rate     as i64;   // samples per second, > 0
+    channels as i64;   // interleaved channels, 1..SAMPLES_MAX_CHANNELS
+    data     as *u8;   // interleaved scalar values
+    count    as i64;   // frames per channel, >= 0
+    cap      as i64;   // bytes available from data
+}
+
+// Bytes per scalar value for a format tag, or I_BADPARAM.
+fn sample_bytes(fmt as i64) as i64 {
+    if (fmt == SAMPLE_FMT_S16) { return 2; }
+    if (fmt == SAMPLE_FMT_S32) { return 4; }
+    if (fmt == SAMPLE_FMT_F32) { return 4; }
+    return errno.I_BADPARAM;
+}
+
+// a*b with an overflow check. Both operands must be non-negative.
+fn samples_mul(a as i64, b as i64) as i64 {
+    if (a < 0 || b < 0) { return errno.I_BADPARAM; }
+    if (a == 0 || b == 0) { return 0; }
+    if (a > SAMPLES_MAX_BYTES / b) { return errno.I_DIMS; }
+    return a * b;
+}
+
+// Bytes needed for count frames of channels interleaved values in fmt.
+// Returns 0 for an empty block, a positive byte count, or a negative code.
+fn samples_size(fmt as i64, channels as i64, count as i64) as i64 {
+    let is i64 as bytes = sample_bytes(fmt);
+    if (bytes < 0) { return bytes; }
+    if (channels <= 0 || channels > SAMPLES_MAX_CHANNELS) { return errno.I_BADPARAM; }
+    if (count < 0) { return errno.I_BADPARAM; }
+    let is i64 as values = samples_mul(channels, count);
+    if (values < 0) { return values; }
+    return samples_mul(values, bytes);
+}
+
+// Point s at mem[0..cap] as an interleaved block. Returns 0, I_BADPARAM for
+// an unknown format, bad rate/channels/count, or a null block with data,
+// I_DIMS if the size overflows, or I_NOMEM if cap is too small. On failure s
+// is cleared and no memory is touched.
+fn samples_init(s as *Samples, fmt as i64, rate as i64, channels as i64,
+                count as i64, mem as *u8, cap as i64) as i64 {
+    samples_free(s);
+    if (rate <= 0 || rate > SAMPLES_MAX_RATE) { return errno.I_BADPARAM; }
+    let is i64 as total = samples_size(fmt, channels, count);
+    if (total < 0) { return total; }
+    if (cap < 0) { return errno.I_BADPARAM; }
+    if (cap < total) { return errno.I_NOMEM; }
+    if (total > 0 && cast(i64, mem) == 0) { return errno.I_BADPARAM; }
+
+    s.fmt = fmt;
+    s.rate = rate;
+    s.channels = channels;
+    s.data = mem;
+    s.count = count;
+    s.cap = cap;
+    return errno.I_OK;
+}
+
+// Drop the view. The caller's block is untouched.
+fn samples_free(s as *Samples) as void {
+    s.fmt = 0;
+    s.rate = 0;
+    s.channels = 0;
+    s.data = cast(*u8, 0);
+    s.count = 0;
+    s.cap = 0;
+}
