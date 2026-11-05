@@ -1,0 +1,31 @@
+// =======================================================
+// caustic-av/core/errno.cst
+// Negative i64 status codes for the whole library. A success is 0; every
+// failure is a distinct negative value so a caller can branch on the exact
+// reason. Functions that also return a value report these codes separately
+// (status return plus an out parameter), never by overloading the value.
+// =======================================================
+
+let is i64 as I_OK          with imut = 0;
+let is i64 as I_EOF         with imut = 0 - 1;   // input truncated / ran out of bytes
+let is i64 as I_BADMAGIC    with imut = 0 - 2;   // signature does not match this format
+let is i64 as I_UNSUPPORTED with imut = 0 - 3;   // valid but unsupported subformat/feature
+let is i64 as I_OOM         with imut = 0 - 4;   // the allocator returned nothing
+let is i64 as I_DIMS        with imut = 0 - 5;   // dimensions or a size overflow / exceed the ceiling
+let is i64 as I_CORRUPT     with imut = 0 - 6;   // malformed data inside a valid container
+let is i64 as I_BADPARAM    with imut = 0 - 7;   // bad argument from the caller
+let is i64 as I_NOMEM       with imut = 0 - 8;   // caller-supplied buffer too small
+
+// Human-readable name for a status code (CLI diagnostics).
+fn err_name(code as i64) as *u8 {
+    if (code == I_OK)          { return "ok"; }
+    if (code == I_EOF)         { return "unexpected end of input"; }
+    if (code == I_BADMAGIC)    { return "bad magic / wrong format"; }
+    if (code == I_UNSUPPORTED) { return "unsupported subformat or feature"; }
+    if (code == I_OOM)         { return "out of memory"; }
+    if (code == I_DIMS)        { return "invalid or oversized dimensions"; }
+    if (code == I_CORRUPT)     { return "corrupt data"; }
+    if (code == I_BADPARAM)    { return "bad parameter"; }
+    if (code == I_NOMEM)       { return "buffer too small"; }
+    return "unknown error";
+}

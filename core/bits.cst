@@ -1,0 +1,200 @@
+// =======================================================
+// caustic-av/core/bits.cst
+// Bit readers over a caller-owned byte range. Readers take (ptr, len) rather
+// than owning a buffer because VP9, Opus and MP3 each parse packet slices that
+// the demuxer owns.
+//
+// Two orders are provided because two families of formats use them:
+//   BitsMsb — most-significant bit first: VP8/VP9, AV1, Opus, MP3, FLAC.
+//   BitsLsb — least-significant bit first: DEFLATE-style streams (via
+//             caustic-compact) and the PCM sample packing some containers use.
+//
+// Every read is bounds-checked before the position moves. On EOF or a bad
+// count the call returns a negative code and the position is unchanged, so a
+// truncated packet cannot make a decoder read past its slice.
+//
+// Values are returned through `read` for 0..63 bits. `read_wide` accepts
+// 0..64 bits and writes the raw bits through an out parameter, because a
+// 64-bit value with bit 63 set is negative as an i64 and would otherwise be
+// indistinguishable from an error. The same applies to Exp-Golomb `se`, which
+// legitimately produces negative values: it uses an out parameter and returns
+// a status. Exp-Golomb is defined on the MSB reader only.
+// =======================================================
+
+use "errno.cst" as errno;
+
+// 2^60 - 1 bytes keeps len*8 inside a positive i64.
+let is i64 as BITS_MAX_BYTES with imut = 1152921504606846975;
+
+// ── most-significant-bit first ──────────────────────────────────────
+
+struct BitsMsb {
+    ptr as *u8;    // first byte of the slice
+    len as i64;    // slice length in bytes
+    pos as i64;    // next bit to read, counting from the first MSB (0-based)
+}
+
+// Bind the reader to ptr[0..len]. Returns 0, I_BADPARAM for a negative length
+// or a null pointer with bytes, or I_DIMS if len is beyond BITS_MAX_BYTES.
+// On failure the reader is left empty.
+fn bits_msb_init(b as *BitsMsb, ptr as *u8, len as i64) as i64 {
+    b.ptr = ptr;
+    b.len = 0;
+    b.pos = 0;
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > BITS_MAX_BYTES) { return errno.I_DIMS; }
+    if (len > 0 && cast(i64, ptr) == 0) { return errno.I_BADPARAM; }
+    b.len = len;
+    return errno.I_OK;
+}
+
+fn bits_msb_remaining(b as *BitsMsb) as i64 {
+    return b.len * 8 - b.pos;
+}
+
+fn bits_msb_consumed(b as *BitsMsb) as i64 {
+    return b.pos;
+}
+
+// One bit as 0 or 1, or I_EOF. Nothing is consumed on failure.
+fn bits_msb_bit(b as *BitsMsb) as i64 {
+    if (b.pos >= b.len * 8) { return errno.I_EOF; }
+    let is i64 as byte = cast(i64, b.ptr[b.pos >> 3]);
+    let is i64 as bit = (byte >> (7 - (b.pos & 7))) & 1;
+    b.pos = b.pos + 1;
+    return bit;
+}
+
+// Read n bits (0 <= n <= 63) MSB first as an unsigned value.
+// Returns I_BADPARAM for n outside that range, I_EOF if the slice is short.
+fn bits_msb_read(b as *BitsMsb, n as i64) as i64 {
+    if (n < 0 || n > 63) { return errno.I_BADPARAM; }
+    if (bits_msb_remaining(b) < n) { return errno.I_EOF; }
+    let is u64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as byte = cast(i64, b.ptr[b.pos >> 3]);
+        let is i64 as bit = (byte >> (7 - (b.pos & 7))) & 1;
+        v = (v << cast(u64, 1)) | cast(u64, bit);
+        b.pos = b.pos + 1;
+        i = i + 1;
+    }
+    return cast(i64, v);
+}
+
+// Read n bits (0 <= n <= 64) MSB first into *out as raw bits. Returns 0 or a
+// negative code; *out is untouched on failure.
+fn bits_msb_read_wide(b as *BitsMsb, n as i64, out as *i64) as i64 {
+    if (n < 0 || n > 64) { return errno.I_BADPARAM; }
+    if (bits_msb_remaining(b) < n) { return errno.I_EOF; }
+    let is u64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as byte = cast(i64, b.ptr[b.pos >> 3]);
+        let is i64 as bit = (byte >> (7 - (b.pos & 7))) & 1;
+        v = (v << cast(u64, 1)) | cast(u64, bit);
+        b.pos = b.pos + 1;
+        i = i + 1;
+    }
+    *out = cast(i64, v);
+    return errno.I_OK;
+}
+
+// Unsigned Exp-Golomb (ue): zero or more 0 bits, then a 1, then that many
+// payload bits. The value is 2^zeros - 1 + payload, so the encoding of 0 is
+// a single 1 bit. More than 31 leading zeros is rejected as I_CORRUPT rather
+// than allowed to overflow. Returns the value (>= 0) or a negative code.
+fn bits_msb_ue(b as *BitsMsb) as i64 {
+    let is i64 as zeros with mut = 0;
+    let is i64 as bit with mut = 0;
+    while (1) {
+        bit = bits_msb_bit(b);
+        if (bit < 0) { return bit; }
+        if (bit == 1) { break; }
+        zeros = zeros + 1;
+        if (zeros > 31) { return errno.I_CORRUPT; }
+    }
+    if (zeros == 0) { return 0; }
+    let is i64 as rest = bits_msb_read(b, zeros);
+    if (rest < 0) { return rest; }
+    return (1 << zeros) - 1 + rest;
+}
+
+// Signed Exp-Golomb (se): ue mapped 1,2,3,4,... to 1,-1,2,-2,... and 0 to 0.
+// The value is written to *out because negatives are valid results. Returns
+// 0 or a negative code; *out is untouched on failure.
+fn bits_msb_se(b as *BitsMsb, out as *i64) as i64 {
+    let is i64 as ue = bits_msb_ue(b);
+    if (ue < 0) { return ue; }
+    if ((ue & 1) == 1) { *out = (ue + 1) / 2; }
+    else { *out = 0 - (ue / 2); }
+    return errno.I_OK;
+}
+
+// ── least-significant-bit first ─────────────────────────────────────
+
+struct BitsLsb {
+    ptr as *u8;    // first byte of the slice
+    len as i64;    // slice length in bytes
+    pos as i64;    // next bit to read, counting from the first LSB (0-based)
+}
+
+fn bits_lsb_init(b as *BitsLsb, ptr as *u8, len as i64) as i64 {
+    b.ptr = ptr;
+    b.len = 0;
+    b.pos = 0;
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > BITS_MAX_BYTES) { return errno.I_DIMS; }
+    if (len > 0 && cast(i64, ptr) == 0) { return errno.I_BADPARAM; }
+    b.len = len;
+    return errno.I_OK;
+}
+
+fn bits_lsb_remaining(b as *BitsLsb) as i64 {
+    return b.len * 8 - b.pos;
+}
+
+fn bits_lsb_consumed(b as *BitsLsb) as i64 {
+    return b.pos;
+}
+
+fn bits_lsb_bit(b as *BitsLsb) as i64 {
+    if (b.pos >= b.len * 8) { return errno.I_EOF; }
+    let is i64 as byte = cast(i64, b.ptr[b.pos >> 3]);
+    let is i64 as bit = (byte >> (b.pos & 7)) & 1;
+    b.pos = b.pos + 1;
+    return bit;
+}
+
+// Read n bits (0 <= n <= 63) LSB first. The first bit read becomes bit 0 of
+// the result.
+fn bits_lsb_read(b as *BitsLsb, n as i64) as i64 {
+    if (n < 0 || n > 63) { return errno.I_BADPARAM; }
+    if (bits_lsb_remaining(b) < n) { return errno.I_EOF; }
+    let is u64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as byte = cast(i64, b.ptr[b.pos >> 3]);
+        let is i64 as bit = (byte >> (b.pos & 7)) & 1;
+        v = v | (cast(u64, bit) << cast(u64, i));
+        b.pos = b.pos + 1;
+        i = i + 1;
+    }
+    return cast(i64, v);
+}
+
+fn bits_lsb_read_wide(b as *BitsLsb, n as i64, out as *i64) as i64 {
+    if (n < 0 || n > 64) { return errno.I_BADPARAM; }
+    if (bits_lsb_remaining(b) < n) { return errno.I_EOF; }
+    let is u64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as byte = cast(i64, b.ptr[b.pos >> 3]);
+        let is i64 as bit = (byte >> (b.pos & 7)) & 1;
+        v = v | (cast(u64, bit) << cast(u64, i));
+        b.pos = b.pos + 1;
+        i = i + 1;
+    }
+    *out = cast(i64, v);
+    return errno.I_OK;
+}
