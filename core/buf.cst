@@ -62,8 +62,8 @@ fn buf_skip(b as *Buf, n as i64) as i64 {
 // Byte at off bytes ahead of the cursor, without consuming. Negative offsets
 // are rejected rather than reading before the start.
 fn buf_peek(b as *Buf, off as i64) as i64 {
-    let is i64 as i = b.pos + off;
     if (off < 0) { return errno.I_EOF; }
+    let is i64 as i = b.pos + off;
     if (i >= b.len) { return errno.I_EOF; }
     return cast(i64, b.ptr[i]);
 }
