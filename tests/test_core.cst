@@ -12,6 +12,8 @@ use "std/io.cst"   as io;
 use "../core/buf.cst"     as buf;
 use "../core/bits.cst"    as bits;
 use "../core/frame.cst"   as frame;
+use "../core/packet.cst"  as packet;
+use "../core/samples.cst" as samples;
 use "../core/errno.cst"   as errno;
 
 fn group_buf() as i64 {
@@ -137,6 +139,23 @@ fn group_frame() as i64 {
     return 0;
 }
 
+fn group_bounds() as i64 {
+    // Sample sizes are checked before a block is touched. 64 channels x 2^62
+    // frames x 2 bytes overflows any sane block and must be refused, not
+    // multiplied.
+    if (samples.samples_size(samples.SAMPLE_FMT_S16, 64, 4611686018427387904)
+        != errno.I_DIMS) { return 1; }
+    if (samples.samples_size(samples.SAMPLE_FMT_S16, 0, 1) != errno.I_BADPARAM) { return 2; }
+
+    // A bad packet length is rejected without mutating the packet.
+    let is *u8 as d with imut = "\x00";
+    let is packet.Packet as p;
+    packet.packet_init(&p, 2);
+    if (packet.packet_set(&p, d, 0 - 1, 5, 0, 0, 0, 1) != errno.I_BADPARAM) { return 3; }
+    if (p.track != 2 || p.len != 0) { return 4; }
+    return 0;
+}
+
 fn failed(name as *u8, code as i64) as i32 {
     io.write_str(1, "FAIL ");
     io.write_str(1, name);
@@ -160,6 +179,10 @@ fn main() as i32 {
     rc = group_frame();
     if (rc != 0) { return failed("frame", rc); }
     io.write_str(1, "PASS frame\n");
+
+    rc = group_bounds();
+    if (rc != 0) { return failed("bounds", rc); }
+    io.write_str(1, "PASS bounds\n");
 
     return 0;
 }
