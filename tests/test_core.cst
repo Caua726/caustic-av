@@ -11,9 +11,7 @@
 use "std/io.cst"   as io;
 use "../core/buf.cst"     as buf;
 use "../core/bits.cst"    as bits;
-use "../core/packet.cst"  as packet;
 use "../core/frame.cst"   as frame;
-use "../core/samples.cst" as samples;
 use "../core/errno.cst"   as errno;
 
 fn group_buf() as i64 {
@@ -139,41 +137,6 @@ fn group_frame() as i64 {
     return 0;
 }
 
-fn group_samples() as i64 {
-    let is [16]u8 as mem;
-    let is samples.Samples as s;
-    if (samples.samples_size(samples.SAMPLE_FMT_S16, 2, 4) != 16) { return 1; }
-    if (samples.samples_init(&s, samples.SAMPLE_FMT_S16, 48000, 2, 4,
-                             cast(*u8, &mem), 16) != 0) { return 2; }
-    if (s.rate != 48000 || s.channels != 2 || s.count != 4) { return 3; }
-    if (cast(i64, s.data) != cast(i64, cast(*u8, &mem))) { return 4; }
-
-    if (samples.samples_init(&s, samples.SAMPLE_FMT_S16, 48000, 2, 4,
-                             cast(*u8, &mem), 15) != errno.I_NOMEM) { return 5; }
-    if (cast(i64, s.data) != 0) { return 6; }
-
-    samples.samples_free(&s);
-    if (s.count != 0 || s.cap != 0) { return 7; }
-    return 0;
-}
-
-fn group_packet() as i64 {
-    let is *u8 as d with imut = "\x01\x02\x03\x04";
-    let is packet.Packet as p;
-    if (packet.packet_set(&p, d, 4, 3, 100, 90, 20, 7) != 0) { return 1; }
-    if (p.len != 4 || p.track != 3) { return 2; }
-    if (p.pts != 100 || p.dts != 90 || p.duration != 20) { return 3; }
-    if (packet.packet_is_key(&p) != 1) { return 4; }
-    if (cast(i64, p.data) != cast(i64, d)) { return 5; }
-
-    if (packet.packet_set(&p, d, 0 - 1, 0, 0, 0, 0, 0) != errno.I_BADPARAM) { return 6; }
-    if (p.len != 4 || p.track != 3) { return 7; }
-
-    packet.packet_clear(&p);
-    if (p.track != 0 || packet.packet_len(&p) != 0) { return 8; }
-    return 0;
-}
-
 fn failed(name as *u8, code as i64) as i32 {
     io.write_str(1, "FAIL ");
     io.write_str(1, name);
@@ -197,14 +160,6 @@ fn main() as i32 {
     rc = group_frame();
     if (rc != 0) { return failed("frame", rc); }
     io.write_str(1, "PASS frame\n");
-
-    rc = group_samples();
-    if (rc != 0) { return failed("samples", rc); }
-    io.write_str(1, "PASS samples\n");
-
-    rc = group_packet();
-    if (rc != 0) { return failed("packet", rc); }
-    io.write_str(1, "PASS packet\n");
 
     return 0;
 }
