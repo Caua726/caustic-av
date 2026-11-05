@@ -1,0 +1,48 @@
+name "caustic-av"
+version "0.1.0"
+author "Cauã Alvarenga Neves"
+
+// caustic-av — build and test surface.
+//
+//   caustic-mk run test        every suite at the default optimization level
+//   caustic-mk run test-opt    the same suites through the optimizing backend
+//   caustic-mk build run       the test runner
+//   caustic-mk run clean       build artifacts, cache and test binaries
+//
+// The runner is Caustic, not a shell script: it resolves `caustic` from PATH,
+// compiles each tests/test_*.cst itself, and decides pass/fail from the
+// compiled binary's exit status. Keeping that logic in the repository means
+// the test surface does not depend on the shell being present.
+
+env_default "OPT" "-O1"
+
+// ── Targets ──────────────────────────────────────────────────────────
+
+target "run" {
+    src "tests/run.cst"
+    out "build/run"
+}
+
+// ── Scripts ──────────────────────────────────────────────────────────
+
+script "test" {
+    "caustic-mk build run"
+    "./build/run"
+}
+
+// The same suites through the optimizing backend, built with ${OPT} and
+// passing it to each case. Kept apart from `test` so "passes at the default,
+// fails at -O1" names a compiler regression instead of a test bug.
+script "test-opt" {
+    "caustic-mk build run"
+    "./build/run ${OPT}"
+}
+
+// Artifacts only: compiled runner and cases, the build-system cache, and
+// binaries a case may have produced beside its source. Sources, vectors and
+// the worktree are untouched.
+script "clean" {
+    "rm -rf build .caustic"
+    "rm -f tests/test_core tests/test_core.exe"
+    "echo 'clean: build artifacts, cache and test binaries removed'"
+}

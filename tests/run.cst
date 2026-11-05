@@ -1,0 +1,143 @@
+// =======================================================
+// tests/run.cst — the test runner.
+//
+// Compiles every case in the list below with the installed `caustic`, then
+// runs the resulting binary. A case passes only when its compile succeeds and
+// the binary exits 0. The runner exits 0 only when every case passes.
+//
+// There is no shell script behind this: `caustic-mk run test` builds this
+// program and runs it, so the test surface is Caustic too.
+//
+// Each case is compiled with
+//   caustic --path .caustic/deps [-O0|-O1|-O2] tests/test_*.cst -o build/<name>
+//
+// The dependency path is passed unconditionally because it is harmless when
+// no dependency has been cloned, and when one exists it is the only place the
+// case can find it: caustic-mk puts resolved dependencies in .caustic/deps.
+//
+// Run from the repository root:
+//   caustic-mk run test
+//   caustic-mk run test-opt
+// =======================================================
+
+use "std/process.cst" as proc;
+use "std/io.cst"       as io;
+use "std/env.cst"      as env;
+use "std/string.cst"   as str;
+
+// Where caustic-mk puts a resolved `depend`.
+let is *u8 as DEPS with imut = ".caustic/deps";
+
+// An optimization level to build every case with, or null for the default.
+let is *u8 as OPT with mut = cast(*u8, 0);
+
+fn app(buf as *u8, pos as i64, s as *u8) as i64 {
+    let is i64 as p with mut = pos;
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { buf[p] = s[i]; p = p + 1; i = i + 1; }
+    return p;
+}
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn label(name as *u8) as void {
+    io.write_str(1, "[test] ");
+    io.write_str(1, name);
+    let is i64 as pad with mut = 18 - slen(name);
+    while (pad > 0) { io.write_str(1, " "); pad = pad - 1; }
+}
+
+// Resolve `file` against $PATH into out. proc.spawnp executes the path, so a
+// bare name is not enough. Returns 1 when found.
+fn which(file as *u8, out as *u8) as i32 {
+    let is *u8 as path = env.getenv("PATH");
+    if (cast(i64, path) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (path[i] != 0) {
+        let is i64 as start = i;
+        while (path[i] != 0 && path[i] != 58 && path[i] != 59) { i = i + 1; }   // ':' or ';'
+        let is i64 as q with mut = 0;
+        let is i64 as k with mut = start;
+        while (k < i) { out[q] = path[k]; q = q + 1; k = k + 1; }
+        out[q] = cast(u8, 47); q = q + 1;                                       // '/'
+        q = app(out, q, file);
+        out[q] = cast(u8, 0);
+        if (io.exists(out) == 1) { return 1; }
+        if (path[i] != 0) { i = i + 1; }
+    }
+    return 0;
+}
+
+// Compile and run one case. The compiler's stderr is left alone so a compile
+// failure prints its diagnostics; its stdout (progress chatter) is captured.
+fn run_case(cc as *u8, name as *u8, src as *u8) as i32 {
+    let is [512]u8 as out;
+    let is i64 as p with mut = app(cast(*u8, &out), 0, "build/");
+    p = app(cast(*u8, &out), p, name);
+    out[p] = cast(u8, 0);
+
+    label(name);
+    io.unlink(cast(*u8, &out));
+
+    let is [8]i64 as cav;
+    let is i64 as n with mut = 0;
+    cav[n] = cast(i64, cc); n = n + 1;
+    cav[n] = cast(i64, "--path"); n = n + 1;
+    cav[n] = cast(i64, DEPS); n = n + 1;
+    if (cast(i64, OPT) != 0) { cav[n] = cast(i64, OPT); n = n + 1; }
+    cav[n] = cast(i64, src); n = n + 1;
+    cav[n] = cast(i64, "-o"); n = n + 1;
+    cav[n] = cast(i64, cast(*u8, &out)); n = n + 1;
+    cav[n] = 0;
+    let is str.String as _log = proc.capture(cc, cast(*u8, &cav));
+
+    if (io.exists(cast(*u8, &out)) == 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
+
+    let is [2]i64 as rav;
+    rav[0] = cast(i64, cast(*u8, &out)); rav[1] = 0;
+    let is i64 as rpid = proc.spawnp(cast(*u8, &out), cast(*u8, &rav));
+    let is i32 as rc = proc.wait_pid(rpid);
+    if (rc == 0) { io.write_str(1, "PASS\n"); return 0; }
+    io.write_str(1, "FAIL (exit "); io.write_int(1, cast(i64, rc)); io.write_str(1, ")\n");
+    return 1;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is [4096]u8 as cc;
+    if (which("caustic", cast(*u8, &cc)) == 0) {
+        io.write_str(1, "caustic not found in PATH\n");
+        return 2;
+    }
+    let is *u8 as ccp = cast(*u8, &cc);
+
+    let is i64 as ai with mut = 1;
+    while (ai < env.argc()) {
+        let is *u8 as a = env.argv(ai);
+        if (a[0] == 45 && a[1] == 79) { OPT = a; }              // "-O…"
+        else {
+            io.write_str(1, "usage: run [-O0|-O1|-O2]\n");
+            return 2;
+        }
+        ai = ai + 1;
+    }
+    if (cast(i64, OPT) != 0) {
+        io.write_str(1, "optimization: "); io.write_str(1, OPT); io.write_str(1, "\n");
+    }
+
+    let is i64 as fail with mut = 0;
+
+    // ── foundation ────────────────────────────────────────────────
+    // One case at this stage. Add tests/test_<area>.cst here, in the order
+    // the areas are built, and keep the list explicit so a new file cannot be
+    // silently skipped.
+    fail = fail + cast(i64, run_case(ccp, "test_core", "tests/test_core.cst"));
+
+    if (fail == 0) { io.write_str(1, "all green\n"); return 0; }
+    io.write_str(1, "FAILURES: "); io.write_int(1, fail); io.write_str(1, "\n");
+    return 1;
+}
