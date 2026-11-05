@@ -1,0 +1,14 @@
+# Scratch, specs, downloaded vectors, logs and git worktrees.
+.work/
+
+# Build output and resolved dependencies.
+build/
+.caustic/
+*.cst.s
+*.cst.s.o
+
+# Downloaded conformance vectors stay out of git; the small committed ones
+# live under tests/vectors/small/ and are re-included below.
+tests/vectors/*
+!tests/vectors/small/
+!tests/vectors/small/**
