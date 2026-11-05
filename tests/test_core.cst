@@ -109,7 +109,7 @@ fn group_frame() as i64 {
     let is [12]u8 as mem;
     let is frame.Frame as f;
     if (frame.frame_size(4, 2) != 12) { return 1; }
-    if (frame.frame_init(&f, 4, 2, cast(*u8, &mem), 12) != 0) { return 2; }
+    if (frame.frame_alloc(&f, 4, 2, cast(*u8, &mem), 12) != 0) { return 2; }
     if (f.stride_y != 4 || f.stride_u != 2 || f.stride_v != 2) { return 3; }
     if (cast(i64, f.y) != cast(i64, cast(*u8, &mem)))     { return 4; }
     if (cast(i64, f.u) != cast(i64, cast(*u8, &mem)) + 8) { return 5; }
@@ -118,7 +118,7 @@ fn group_frame() as i64 {
     // Coded larger than visible: VP9 superblock padding.
     let is [36]u8 as padded;
     if (frame.frame_size(6, 4) != 36) { return 7; }
-    if (frame.frame_init_coded(&f, 4, 2, 6, 4, cast(*u8, &padded), 36) != 0) { return 8; }
+    if (frame.frame_alloc_coded(&f, 4, 2, 6, 4, cast(*u8, &padded), 36) != 0) { return 8; }
     if (f.width != 4 || f.height != 2) { return 9; }
     if (f.coded_width != 6 || f.coded_height != 4) { return 10; }
     if (f.stride_y != 6) { return 11; }
@@ -126,7 +126,7 @@ fn group_frame() as i64 {
     if (cast(i64, f.v) != cast(i64, cast(*u8, &padded)) + 30) { return 13; }
 
     // A short block is refused before any pointer is published.
-    if (frame.frame_init(&f, 4, 2, cast(*u8, &mem), 11) != errno.I_NOMEM) { return 14; }
+    if (frame.frame_alloc(&f, 4, 2, cast(*u8, &mem), 11) != errno.I_NOMEM) { return 14; }
     if (cast(i64, f.y) != 0) { return 15; }
 
     // Oversized and degenerate dimensions are refused, never multiplied.

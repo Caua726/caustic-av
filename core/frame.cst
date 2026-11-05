@@ -8,7 +8,7 @@
 //
 // The caller allocates frame_size(coded_width, coded_height) bytes (after
 // checking it is not negative), passes the block and its capacity to
-// frame_init, and frees it with whichever owner supplied it. frame_free only
+// frame_alloc, and frees it with whichever owner supplied it. frame_free only
 // drops the view; it does not release memory it does not own.
 //
 // Visible and coded sizes are separate because VP9 codes in superblocks:
@@ -77,9 +77,9 @@ fn frame_size(coded_width as i64, coded_height as i64) as i64 {
 // I_DIMS for impossible dimensions, I_BADPARAM for a negative capacity or a
 // null block, or I_NOMEM when cap is too small. On failure f is cleared and
 // no memory is touched.
-fn frame_init_coded(f as *Frame, width as i64, height as i64,
-                    coded_width as i64, coded_height as i64,
-                    mem as *u8, cap as i64) as i64 {
+fn frame_alloc_coded(f as *Frame, width as i64, height as i64,
+                     coded_width as i64, coded_height as i64,
+                     mem as *u8, cap as i64) as i64 {
     frame_free(f);
     if (width <= 0 || width > FRAME_MAX_DIM) { return errno.I_DIMS; }
     if (height <= 0 || height > FRAME_MAX_DIM) { return errno.I_DIMS; }
@@ -113,10 +113,10 @@ fn frame_init_coded(f as *Frame, width as i64, height as i64,
     return errno.I_OK;
 }
 
-// frame_init_coded with coded size equal to visible size.
-fn frame_init(f as *Frame, width as i64, height as i64,
-              mem as *u8, cap as i64) as i64 {
-    return frame_init_coded(f, width, height, width, height, mem, cap);
+// frame_alloc_coded with coded size equal to visible size.
+fn frame_alloc(f as *Frame, width as i64, height as i64,
+               mem as *u8, cap as i64) as i64 {
+    return frame_alloc_coded(f, width, height, width, height, mem, cap);
 }
 
 // Drop all plane pointers and sizes. The caller's block is untouched and
