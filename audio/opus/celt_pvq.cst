@@ -618,7 +618,10 @@ fn _celt_quant_partition(d as *st.CeltDec, r as *rc.OpusRange,
         while (j < n) {
             ctx.seed = _pvq_seed_next(ctx.seed);
             // 12-bit centred noise; only the shape survives renormalisation.
-            x[j] = cast(f64, ((ctx.seed >> 20) & 0xFFF) - 2048);
+            // The seed as a signed 32-bit value, shifted arithmetically.
+            let is i64 as nv with mut = (ctx.seed >> 20) & 0xFFF;
+            if (nv >= 2048) { nv = nv - 4096; }
+            x[j] = cast(f64, nv);
             j = j + 1;
         }
         celt_renormalise(x, n, gain);
