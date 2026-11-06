@@ -11,12 +11,18 @@
 //                DocTypeReadVersion must be <= 4 (the elements read here
 //                exist in that version).
 //   Segment:     may have an unknown size (the file length ends it).
-//   Info:        TimecodeScale (default 1,000,000 ns) and Duration.
+//   Info:        TimecodeScale (default 1,000,000 ns) and Duration. An
+//                absent Duration stays 0.0; a present one must be finite and
+//                greater than zero, the range RFC 9559 Section 5.1.2.10
+//                gives, so a present zero is refused rather than reported
+//                as "absent".
 //   Tracks:      up to MK_MAX_TRACKS entries, fixed at compile time. A count
 //                past the array is corrupt, not something to allocate for.
-//   Cluster:     Timecode plus SimpleBlock and BlockGroup/Block. A cluster
-//                may have an unknown size too; then it ends at the next
-//                Cluster or at the end of the Segment.
+//   Cluster:     Timestamp (mandatory, RFC 9559 Section 5.1.3.1; a Block
+//                that arrives before it is I_CORRUPT) plus SimpleBlock and
+//                BlockGroup/Block. A cluster may have an unknown size too;
+//                then it ends at the next Cluster or at the end of the
+//                Segment.
 //
 // Timestamps: a block's raw timestamp is
 //   (cluster Timecode + block relative timestamp) * TimecodeScale
@@ -41,6 +47,72 @@
 // lace i gets total*(i+1)/count - total*i/count nanoseconds, so a remainder is
 // spread one nanosecond at a time instead of landing entirely on the last
 // frame.
+//
+// A lace size is a VINT but not an Element Data Size: RFC 8794 Section 6.2
+// reserves all-ones VINT_DATA as "unknown" only for Element Data Size, so in
+// the lacing header 0xFF is the value 127 for a first frame size and +64 for
+// a one-byte signed difference (127 minus the 1-byte bias 63). The block's
+// TrackNumber is a VINT of the same kind: all-ones data bits are a number,
+// not a sentinel.
+//
+// Tracks: a TrackEntry must carry a nonzero TrackNumber, a nonzero TrackType
+// and a non-empty CodecID; an entry missing any of them is I_CORRUPT rather
+// than a track whose type or codec is guessed. TrackUID is not required; it
+// identifies a track for stream copy, not for block routing here.
+//
+// Audio: when the Audio master is present, a missing (or zero-octet)
+// SamplingFrequency means its 8000 Hz default and a missing Channels means
+// 1. A frequency that is non-finite or not greater than zero, or a channel
+// count of zero, is outside the specification's range and is I_CORRUPT
+// instead of being clamped to a number the file did not state. A track with
+// no Audio master keeps 0.0/0, which is how video tracks report "no audio".
+//
+// DiscardPadding is positive for padding at the end of a Block and negative
+// for padding at its beginning (RFC 9559 Section 5.1.3.5.7). The Packet field
+// this module fills describes end padding only, so a negative value is
+// I_UNSUPPORTED: reporting its magnitude as end padding, or dropping it,
+// would change packet semantics silently.
+//
+// Limits and deliberate leniency:
+//
+//   Metadata after the first Cluster. RFC 9559 Section 6.1 requires the
+//   first Info and Tracks to be stored before the first Cluster, or to be
+//   referenced by a SeekHead before it. The segment walk stops at the first
+//   Cluster and SeekHead is not parsed, so a file that keeps Info or Tracks
+//   only after that Cluster, and needs its SeekHead followed to reach them,
+//   is unsupported. It ends the walk with no tracks and is reported
+//   I_CORRUPT: without SeekHead there is no honest way to distinguish
+//   "metadata later" from "no metadata", so I_UNSUPPORTED cannot be produced
+//   there today.
+//
+//   Unknown-size Cluster ends. Only a Cluster ID ends one. Every other
+//   supported element is skipped by its validated size, so treating a
+//   Segment-level sibling (Cues, Tags, Chapters, Attachments, SeekHead,
+//   Void, CRC-32) as a skipped cluster child has the same net effect as
+//   ending the cluster: it yields no packets, and the next Cluster is still
+//   found at its own header. Only Cluster and Segment may be unknown-size
+//   (RFC 8794 Section 6.2); any other unknown-size child is I_CORRUPT.
+//
+//   EBML header bounds are checked, not enforced. A declared
+//   EBMLMaxIDLength that is zero or above 4, or EBMLMaxSizeLength that is
+//   zero or above 8, is I_UNSUPPORTED, but a narrower declaration does not
+//   restrict ebml.cst, whose IDs are fixed at four bytes and sizes at eight.
+//   Enforcing the narrower bound would mean passing it into Ebml, an
+//   interface this stage keeps fixed; the declared values are therefore
+//   validated and reported but not applied to every vint.
+//
+//   Block leniency. The reserved bits of SimpleBlock/Block are accepted
+//   nonzero, Invisible and Discardable are ignored (Packet has no field for
+//   them), and lacing is decoded even when the track's FlagLacing is 0. The
+//   bits that are consumed are masked; the rest is left to the encoder.
+//   The lace table itself is strict: a size that does not fit the block is
+//   I_CORRUPT before any packet is published.
+//
+//   Track capacity. MK_MAX_TRACKS is fixed at 64 and Tracks is an array
+//   inside Mk, so a file with more entries is I_CORRUPT rather than an
+//   allocation. Growing it would change the caller-visible layout; some
+//   future interface may instead accept a caller-supplied array and report
+//   I_UNSUPPORTED when the file exceeds it.
 //
 // Packet data points into src and stays valid until the next mk_next call,
 // like every borrowed view in this library.
@@ -105,6 +177,7 @@ let is i64 as MK_TRACK_LOGO      with imut = 16;
 let is i64 as MK_TRACK_SUBTITLE  with imut = 17;
 let is i64 as MK_TRACK_BUTTONS   with imut = 18;
 let is i64 as MK_TRACK_CONTROL   with imut = 32;
+let is i64 as MK_TRACK_METADATA  with imut = 33;
 
 let is i64 as MK_MAX_TRACKS with imut = 64;
 
@@ -148,6 +221,7 @@ struct Mk {
     cl_end        as i64;      // known end, or seg_end when unknown
     cl_unknown    as i64;
     cluster_timecode as i64;   // ticks
+    cl_ts_seen    as i64;      // 1 once this cluster's Timestamp was read
 
     laces       as [256]MkLace;
     lace_count  as i64;
@@ -186,6 +260,19 @@ fn _ns_from_ticks(ticks as i64, scale as i64, out as *i64) as i64 {
     return errno.I_OK;
 }
 
+// 1 when x is a finite f64, 0 for NaN or either infinity. IEEE 754 binary64
+// puts exponent bits 62..52 in the top; all ones there is an infinity (zero
+// mantissa) or a NaN (nonzero mantissa). Inspecting the bits avoids needing
+// an infinity literal and does not depend on how the compiler treats
+// inf - inf, which is the one arithmetic trick this could otherwise use.
+fn _f64_is_finite(x as f64) as i64 {
+    let is f64 as v with mut = x;
+    let is i64 as bits = *cast(*i64, &v);
+    let is i64 as exp = (bits >> 52) & 2047;
+    if (exp == 2047) { return 0; }
+    return 1;
+}
+
 fn _be16(src as *u8, off as i64) as i64 {
     return (cast(i64, src[off]) << 8) | cast(i64, src[off + 1]);
 }
@@ -220,7 +307,12 @@ fn _parse_info(m as *Mk, e as *ebml.Ebml, off as i64, size as i64) as i64 {
             let is f64 as v with mut = 0.0;
             r = ebml.ebml_float(e, &el, &v);
             if (r < 0) { return r; }
-            if (v < 0.0) { return errno.I_CORRUPT; }
+            // RFC 9559 Section 5.1.2.10 gives Duration the range > 0. An
+            // absent Duration is different from a present zero, and the two
+            // must not collapse: zero, NaN and infinity are refused rather
+            // than published as a length.
+            if (_f64_is_finite(v) == 0) { return errno.I_CORRUPT; }
+            if (v <= 0.0) { return errno.I_CORRUPT; }
             m.duration_ticks = v;
         }
         pos = el.next;
@@ -253,6 +345,14 @@ fn _parse_video(e as *ebml.Ebml, off as i64, size as i64,
 
 fn _parse_audio(e as *ebml.Ebml, off as i64, size as i64,
                 t as *MkTrack) as i64 {
+    // RFC 9559 Sections 5.1.4.1.29.1 and 5.1.4.1.29.3: SamplingFrequency
+    // defaults to 8000 Hz (0x1.f4p+12) and Channels to 1 when the Audio
+    // master does not carry them. The defaults belong to the presence of
+    // Audio, which is why they are applied here and not to a track with no
+    // Audio element at all (there, 0.0/0 records "no audio").
+    t.sample_rate = 8000.0;
+    t.channels = 1;
+
     let is i64 as pos with mut = off;
     let is i64 as end = off + size;
     while (pos < end) {
@@ -261,17 +361,30 @@ fn _parse_audio(e as *ebml.Ebml, off as i64, size as i64,
         if (r < 0) { return r; }
         if (el.unknown != 0) { return errno.I_CORRUPT; }
         if (el.id == MK_SAMPLING_FREQUENCY) {
-            let is f64 as v with mut = 0.0;
-            r = ebml.ebml_float(e, &el, &v);
-            if (r < 0) { return r; }
-            t.sample_rate = v;
+            // A zero-octet Float takes the element's declared default
+            // (RFC 8794 Section 7.3), so it leaves 8000.0 in place.
+            if (el.size != 0) {
+                r = ebml.ebml_float(e, &el, &t.sample_rate);
+                if (r < 0) { return r; }
+            }
         } else if (el.id == MK_CHANNELS) {
-            r = ebml.ebml_uint(e, &el, &t.channels);
-            if (r < 0) { return r; }
-            if (t.channels < 0) { return errno.I_CORRUPT; }
+            // Likewise an empty Unsigned Integer is its default (Section
+            // 7.2), so it leaves 1 in place.
+            if (el.size != 0) {
+                r = ebml.ebml_uint(e, &el, &t.channels);
+                if (r < 0) { return r; }
+            }
         }
         pos = el.next;
     }
+
+    // Both elements carry an explicit range of > 0 (Channels: not 0). A
+    // non-finite frequency, a zero or negative frequency, or a channel count
+    // of zero would be reinvented by every caller, so the track is refused
+    // here instead of exposing a value the specification does not allow.
+    if (_f64_is_finite(t.sample_rate) == 0) { return errno.I_CORRUPT; }
+    if (t.sample_rate <= 0.0) { return errno.I_CORRUPT; }
+    if (t.channels <= 0) { return errno.I_CORRUPT; }
     return errno.I_OK;
 }
 
@@ -305,7 +418,11 @@ fn _parse_entry(m as *Mk, e as *ebml.Ebml, off as i64, size as i64,
         } else if (el.id == MK_DEFAULT_DURATION) {
             r = ebml.ebml_uint(e, &el, &t.default_duration);
             if (r < 0) { return r; }
-            if (t.default_duration < 0) { return errno.I_CORRUPT; }
+            // Range "not 0" (RFC 9559 Section 5.1.4.1.13). An absent
+            // DefaultDuration is 0 here and means "no fixed frame duration";
+            // an element present with 0 is outside the range and is refused,
+            // so the two never collapse into the same state.
+            if (t.default_duration <= 0) { return errno.I_CORRUPT; }
         } else if (el.id == MK_TRACK_TIMESTAMP_SCALE) {
             // The default is 1.0. Anything else would scale every timestamp
             // of this track, which this stage's timing contract does not
@@ -331,7 +448,14 @@ fn _parse_entry(m as *Mk, e as *ebml.Ebml, off as i64, size as i64,
         }
         pos = el.next;
     }
+    // TrackNumber, TrackType and CodecID are mandatory (RFC 9559 Sections
+    // 5.1.4.1.1, 5.1.4.1.3 and 5.1.4.1.21). Refusing the entry is the only
+    // option that does not invent a type or a codec for it. TrackUID is not
+    // read, so it is not required: this demuxer routes blocks by
+    // TrackNumber, not by UID.
     if (t.number <= 0) { return errno.I_CORRUPT; }
+    if (t.typ == 0) { return errno.I_CORRUPT; }
+    if (t.codec_id_len == 0) { return errno.I_CORRUPT; }
     return errno.I_OK;
 }
 
@@ -373,6 +497,7 @@ fn _mk_clear(m as *Mk) as void {
     m.cl_end = 0;
     m.cl_unknown = 0;
     m.cluster_timecode = 0;
+    m.cl_ts_seen = 0;
     m.lace_count = 0;
     m.lace_index = 0;
     m.lace_pts = 0;
@@ -384,8 +509,13 @@ fn _mk_clear(m as *Mk) as void {
 
 // Parse the file at src[0..len]. Returns 0, or a negative code:
 //   I_BADMAGIC    not EBML, no Segment, or a DocType other than webm/matroska
-//   I_UNSUPPORTED DocTypeReadVersion above 4
+//   I_UNSUPPORTED DocTypeReadVersion above 4, an EBML header bound outside
+//                 this reader's four-byte IDs / eight-byte sizes, a
+//                 TrackTimestampScale other than 1.0, or a negative
+//                 DiscardPadding
 //   I_CORRUPT     malformed element, unknown size where the level forbids it,
+//                 a TrackEntry without TrackNumber/TrackType/CodecID, an
+//                 out-of-range Duration, DefaultDuration or Audio value,
 //                 no tracks, or a track count past MK_MAX_TRACKS
 //   I_EOF         a header cut short
 // On failure every field is cleared, so a later mk_next returns 0.
@@ -409,6 +539,7 @@ fn _mk_open(m as *Mk, src as *u8, len as i64) as i64 {
     m.cl_end = 0;
     m.cl_unknown = 0;
     m.cluster_timecode = 0;
+    m.cl_ts_seen = 0;
     m.lace_count = 0;
     m.lace_index = 0;
     m.lace_pts = 0;
@@ -541,6 +672,7 @@ fn _next_cluster(m as *Mk, e as *ebml.Ebml) as i64 {
             m.cl_pos = el.off;
             m.cl_unknown = el.unknown;
             m.cluster_timecode = 0;
+            m.cl_ts_seen = 0;
             if (el.unknown != 0) {
                 m.cl_end = m.seg_end;
                 m.seg_pos = m.seg_end;
@@ -608,12 +740,15 @@ fn _parse_laces(m as *Mk, pos as i64, end as i64, lacing as i64,
     } else {
         // EBML: first size is unsigned; each later size is a biased signed
         // difference from the previous one. The last is the remainder.
+        // RFC 9559 Section 10.3.3 encodes these as VINTs, and the all-ones
+        // "unknown" reservation belongs to Element Data Size alone (RFC 8794
+        // Section 6.2): 0xFF is the first size 127, or +64 as a one-byte
+        // difference, never a sentinel. *v.value* is therefore used as is.
         let is i64 as prev with mut = 0;
         while (i < count - 1) {
             let is ebml.EbmlVint as v;
             let is i64 as r = ebml.ebml_read_vint(m.src, q, end, 0, &v);
             if (r < 0) { return r; }
-            if (v.unknown != 0) { return errno.I_CORRUPT; }
             q = v.next;
             if (i == 0) {
                 prev = v.value;
@@ -663,7 +798,9 @@ fn _parse_block(m as *Mk, off as i64, size as i64, key_in as i64,
     let is ebml.EbmlVint as tv;
     let is i64 as r with mut = ebml.ebml_read_vint(m.src, pos, end, 0, &tv);
     if (r < 0) { return r; }
-    if (tv.unknown != 0) { return errno.I_CORRUPT; }
+    // The Track Number is a VINT (RFC 9559 Sections 10.1 and 10.2), not an
+    // Element Data Size, so all-ones data bits are a number: 0xFF is track
+    // 127. The "unknown" sentinel does not apply here.
     pos = tv.next;
     if (end - pos < 3) { return errno.I_CORRUPT; }
 
@@ -755,7 +892,13 @@ fn _parse_block_group(m as *Mk, e as *ebml.Ebml, off as i64,
         } else if (el.id == MK_DISCARD_PADDING) {
             r = ebml.ebml_int(e, &el, &discard);
             if (r < 0) { return r; }
-            if (discard < 0) { return errno.I_CORRUPT; }
+            // RFC 9559 Section 5.1.3.5.7: a positive value is padding at
+            // the end of the Block, a negative one is padding at its
+            // beginning. Packet's discard padding is end padding only, so
+            // there is nowhere to report a start padding: returning its
+            // magnitude would trim the wrong end, and dropping it would
+            // hide the sample. Refuse the case instead.
+            if (discard < 0) { return errno.I_UNSUPPORTED; }
         }
         pos = el.next;
     }
@@ -791,16 +934,22 @@ fn _cluster_step(m as *Mk, e as *ebml.Ebml) as i64 {
             if (m.cluster_timecode > 4611686018427387904) {
                 return errno.I_CORRUPT;
             }
+            m.cl_ts_seen = 1;
             m.cl_pos = el.next;
             continue;
         }
         if (el.id == MK_SIMPLE_BLOCK) {
+            // Cluster Timestamp is mandatory (RFC 9559 Section 5.1.3.1). A
+            // block before it would otherwise be stamped from a zero that
+            // was never in the file, so refuse rather than place it at 0.
+            if (m.cl_ts_seen == 0) { return errno.I_CORRUPT; }
             r = _parse_block(m, el.off, el.size, 0 - 1, 0, 0, 0);
             if (r < 0) { return r; }
             m.cl_pos = el.next;
             return 1;
         }
         if (el.id == MK_BLOCK_GROUP) {
+            if (m.cl_ts_seen == 0) { return errno.I_CORRUPT; }
             r = _parse_block_group(m, e, el.off, el.size);
             if (r < 0) { return r; }
             m.cl_pos = el.next;
