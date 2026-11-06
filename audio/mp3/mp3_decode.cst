@@ -1,0 +1,1047 @@
+// =======================================================
+// caustic-av/audio/mp3/mp3_decode.cst
+// MPEG-1/2/2.5 Layer III decode: the front end from one parsed Mp3Frame to
+// interleaved s16 PCM. The stream parser, header and side-information
+// parser, and the table blobs live in mp3.cst and mp3_tables.cst (stages
+// 8a). This file adds the decode-only path:
+//
+//   * logical main-data assembly from the frame's main_data_len bytes and
+//     the saved previous main-data tail (reservoir_back bytes);
+//   * scalefactor decode for MPEG-1 (scfsi, slen1/slen2) and for the LSF
+//     partitions (ID==0) through mp3_lsf_nsf;
+//   * Huffman big_values and count1 decoding with linbits and sign bits;
+//   * requantization is^(4/3) and the global/scalefactor/subblock gains;
+//   * MS and intensity stereo;
+//   * reordering, alias reduction, IMDCT/overlap, frequency inversion and
+//     the polyphase synthesis filterbank, all in mp3_synth.cst.
+//
+// Memory
+// ------
+// Mp3Decode is caller-owned and contains the stream parser state plus one
+// Mp3Synth. Nothing here allocates. mp3_decode_init must be called once
+// before any other call; mp3_decode_open is a convenience that initialises
+// and opens the stream in one step. mp3_decode_reset clears the inter-frame
+// history but keeps the computed tables and the open stream.
+//
+// Reservoir
+// ---------
+// Mp3Frame.main_data_offset/main_data_len locate this frame's main data in
+// the stream. main_data_begin (reservoir_back) is the number of bytes to
+// take from the end of the saved previous main-data tail. The assembled
+// logical stream is [saved tail of reservoir_back bytes][current main data];
+// after decoding, the last 512 bytes of that stream become the new tail.
+// The parser guarantees a backpointer never exceeds the main data already
+// returned, so a stream that starts at frame 0 needs no history. A frame
+// whose backpointer exceeds the saved tail is rejected with I_EOF.
+//
+// Bit budget
+// ----------
+// part2_3_length is per granule/channel and covers scalefactors and Huffman
+// data. Each part is decoded inside [start, start+part2_3_length) of the
+// logical main-data bitstream; overshooting the budget is I_CORRUPT and a
+// truncated stream is I_EOF. Padding inside the budget is skipped.
+//
+// Output
+// ------
+// mp3_decode_frame writes frames_per_channel * channels signed 16-bit
+// little-endian samples and returns frames_per_channel (1152 for MPEG-1,
+// 576 for MPEG-2/2.5), or a negative error. cap is in bytes.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "../../core/bits.cst" as bits;
+use "std/math.cst" as fm;
+use "mp3.cst" as base;
+use "mp3_tables.cst" as tbl;
+use "mp3_synth.cst" as syn;
+
+let is i64 as MP3_MAIN_MAX with imut = 4096;
+let is i64 as MP3_RESERVOIR_MAX with imut = 512;
+let is f64 as MP3_INV_SQRT2 with imut = 0.70710678118654752440;
+
+struct Mp3Decode {
+    stream as base.Mp3;
+    main as [4096]u8;
+    reservoir as [512]u8;
+    reservoir_len as i64;
+    spec as [1152]f64;         // [ch*576 + line], Huffman order
+    gain as [1152]f64;         // per line, Huffman order
+    subband as [1152]f64;      // [ch*576 + subband*18 + t]
+    scfl as [44]i64;           // [ch*22 + sfb]
+    scfs as [80]i64;           // [ch*40 + sfb*3 + window]
+    pan as [14]f64;            // Table 3-B.9 intensity pan, 7 pairs
+    synth as syn.Mp3Synth;
+    initialized as i64;
+}
+
+fn _zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+fn _min(a as i64, b as i64) as i64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn _abs64(a as i64) as i64 {
+    if (a < 0) { return 0 - a; }
+    return a;
+}
+
+// ── initialisation ─────────────────────────────────────────────────
+
+fn _init_pan(m as *Mp3Decode) as void {
+    // ISO 2.4.3.4 Table 3-B.9 intensity positions 0..6: kl, kr.
+    m.pan[0] = 0.0;            m.pan[1] = 1.0;
+    m.pan[2] = 0.21132487;     m.pan[3] = 0.78867513;
+    m.pan[4] = 0.36602540;     m.pan[5] = 0.63397460;
+    m.pan[6] = 0.5;            m.pan[7] = 0.5;
+    m.pan[8] = 0.63397460;     m.pan[9] = 0.36602540;
+    m.pan[10] = 0.78867513;    m.pan[11] = 0.21132487;
+    m.pan[12] = 1.0;           m.pan[13] = 0.0;
+}
+
+fn mp3_decode_init(m as *Mp3Decode) as i64 {
+    _zero(cast(*u8, m), sizeof(Mp3Decode));
+    let is i64 as st = syn.syn_init(&m.synth);
+    if (st < 0) { return st; }
+    _init_pan(m);
+    m.reservoir_len = 0;
+    m.initialized = 1;
+    return errno.I_OK;
+}
+
+// Initialise and open src[0..len]. The caller then obtains frames with
+// base.mp3_next and passes them to mp3_decode_frame.
+fn mp3_decode_open(m as *Mp3Decode, src as *u8, len as i64) as i64 {
+    let is i64 as st = mp3_decode_init(m);
+    if (st < 0) { return st; }
+    return base.mp3_open(&m.stream, src, len);
+}
+
+// Clear the inter-frame history. The computed tables and the open stream
+// stay in place.
+fn mp3_decode_reset(m as *Mp3Decode) as i64 {
+    if (m.initialized == 0) { return errno.I_BADPARAM; }
+    _zero(cast(*u8, &m.main), MP3_MAIN_MAX);
+    _zero(cast(*u8, &m.reservoir), MP3_RESERVOIR_MAX);
+    m.reservoir_len = 0;
+    _zero(cast(*u8, &m.spec), 1152 * 8);
+    _zero(cast(*u8, &m.gain), 1152 * 8);
+    _zero(cast(*u8, &m.subband), 1152 * 8);
+    _zero(cast(*u8, &m.scfl), 44 * 8);
+    _zero(cast(*u8, &m.scfs), 80 * 8);
+    syn.syn_reset(&m.synth);
+    return errno.I_OK;
+}
+
+// ── bit helpers ───────────────────────────────────────────────────
+
+fn _skip_bits(rd as *bits.BitsMsb, n as i64) as i64 {
+    if (n < 0) { return errno.I_BADPARAM; }
+    let is i64 as left with mut = n;
+    while (left > 0) {
+        let is i64 as w with mut = 63;
+        if (left < w) { w = left; }
+        let is i64 as v = bits.bits_msb_read(rd, w);
+        if (v < 0) { return v; }
+        left = left - w;
+    }
+    return errno.I_OK;
+}
+
+// Read count values of `width` bits into dst; width 0 writes zeros and
+// consumes nothing.
+fn _read_n(rd as *bits.BitsMsb, width as i64, count as i64,
+           dst as *i64) as i64 {
+    if (width < 0 || width > 16) { return errno.I_CORRUPT; }
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        if (width == 0) {
+            dst[i] = 0;
+        } else {
+            let is i64 as v = bits.bits_msb_read(rd, width);
+            if (v < 0) { return v; }
+            dst[i] = v;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// Generic canonical VLC lookup. code[]/len[] are in symbol order; the code
+// is accumulated MSB-first and matched against every entry of that length.
+fn _vlc_symbol(rd as *bits.BitsMsb, code as *i64, len as *i64,
+               entries as i64, maxbits as i64) as i64 {
+    let is i64 as acc with mut = 0;
+    let is i64 as n with mut = 0;
+    while (n < maxbits) {
+        let is i64 as bit = bits.bits_msb_bit(rd);
+        if (bit < 0) { return bit; }
+        acc = (acc << 1) | bit;
+        n = n + 1;
+        let is i64 as sym with mut = 0;
+        while (sym < entries) {
+            if (len[sym] == n && code[sym] == acc) { return sym; }
+            sym = sym + 1;
+        }
+    }
+    return errno.I_CORRUPT;
+}
+
+// ── scalefactors ──────────────────────────────────────────────────
+
+// MPEG-1 scalefactors. scfsi copies granule 0's group for granule 1.
+fn _scf_mpeg1(m as *Mp3Decode, rd as *bits.BitsMsb, f as *base.Mp3Frame,
+              gr as i64, ch as i64, short as i64, mixed as i64) as i64 {
+    let is *base.Mp3Granule as g = &f.side.granule[gr][ch];
+    let is i64 as slen1 = tbl.mp3_slen1(g.scalefac_compress);
+    let is i64 as slen2 = tbl.mp3_slen2(g.scalefac_compress);
+    if (slen1 < 0 || slen2 < 0) { return errno.I_CORRUPT; }
+    let is i64 as base_s = ch * 22;
+
+    if (short == 0) {
+        let is i64 as k with mut = 0;
+        while (k < 4) {
+            let is i64 as off with mut = 0;
+            let is i64 as cnt with mut = 5;
+            if (k == 0) { off = 0; cnt = 6; }
+            else if (k == 1) { off = 6; cnt = 5; }
+            else if (k == 2) { off = 11; cnt = 5; }
+            else { off = 16; cnt = 5; }
+            let is i64 as copy with mut = 0;
+            if (gr == 1 && f.side.scfsi[ch][k] != 0) { copy = 1; }
+            if (copy == 0) {
+                let is i64 as width with mut = slen1;
+                if (k >= 2) { width = slen2; }
+                let is i64 as st = _read_n(rd, width, cnt,
+                    cast(*i64, &m.scfl[base_s + off]));
+                if (st < 0) { return st; }
+            }
+            k = k + 1;
+        }
+        m.scfl[base_s + 21] = 0;
+        return errno.I_OK;
+    }
+
+    let is i64 as sb = ch * 40;
+    if (mixed == 0) {
+        let is i64 as st with mut = _read_n(rd, slen1, 18,
+            cast(*i64, &m.scfs[sb]));
+        if (st < 0) { return st; }
+        st = _read_n(rd, slen2, 18, cast(*i64, &m.scfs[sb + 18]));
+        if (st < 0) { return st; }
+        m.scfs[sb + 36] = 0;
+        m.scfs[sb + 37] = 0;
+        m.scfs[sb + 38] = 0;
+        m.scfs[sb + 39] = 0;
+        return errno.I_OK;
+    }
+
+    // Mixed: 8 long bands with slen1, then short bands 3..5 with slen1 and
+    // 6..11 with slen2.
+    let is i64 as st2 with mut = _read_n(rd, slen1, 8,
+        cast(*i64, &m.scfl[base_s]));
+    if (st2 < 0) { return st2; }
+    st2 = _read_n(rd, slen1, 9, cast(*i64, &m.scfs[sb + 9]));
+    if (st2 < 0) { return st2; }
+    st2 = _read_n(rd, slen2, 18, cast(*i64, &m.scfs[sb + 18]));
+    if (st2 < 0) { return st2; }
+    m.scfs[sb + 36] = 0;
+    m.scfs[sb + 37] = 0;
+    m.scfs[sb + 38] = 0;
+    m.scfs[sb + 39] = 0;
+    return errno.I_OK;
+}
+
+// Write one LSF scalefactor at sequential position pos for block_case
+// 0=long, 1=short, 2=mixed. Mixed stores the first six in scfl and the
+// remaining positions from short band 3 in scfs.
+fn _lsf_store(m as *Mp3Decode, ch as i64, block_case as i64,
+              pos as i64, value as i64) as i64 {
+    if (block_case == 0) {
+        if (pos < 0 || pos >= 21) { return errno.I_CORRUPT; }
+        m.scfl[ch * 22 + pos] = value;
+        return errno.I_OK;
+    }
+    if (block_case == 1) {
+        if (pos < 0 || pos >= 36) { return errno.I_CORRUPT; }
+        m.scfs[ch * 40 + pos] = value;
+        return errno.I_OK;
+    }
+    if (pos < 0) { return errno.I_CORRUPT; }
+    if (pos < 6) {
+        m.scfl[ch * 22 + pos] = value;
+    } else {
+        let is i64 as p = pos - 6;
+        if (p >= 27) { return errno.I_CORRUPT; }
+        m.scfs[ch * 40 + 9 + p] = value;
+    }
+    return errno.I_OK;
+}
+
+// LSF scalefactors (ID==0), ISO/IEC 13818-3. The four slen/nsf partitions
+// come from mp3_lsf_nsf; the split of scalefac_compress is the pseudocode
+// in 4.2.4 of the bitstream note.
+fn _scf_lsf(m as *Mp3Decode, rd as *bits.BitsMsb, f as *base.Mp3Frame,
+            ch as i64, short as i64, mixed as i64,
+            preflag_out as *i64) as i64 {
+    let is *base.Mp3Granule as g = &f.side.granule[0][ch];
+    let is i64 as sf = g.scalefac_compress;
+    let is i64 as context with mut = 0;
+    let is i64 as block_case with mut = 0;
+    let is i64 as slen0 with mut = 0;
+    let is i64 as slen1 with mut = 0;
+    let is i64 as slen2 with mut = 0;
+    let is i64 as slen3 with mut = 0;
+    let is i64 as preflag with mut = 0;
+
+    if (short != 0) {
+        if (mixed != 0) { block_case = 2; }
+        else { block_case = 1; }
+    }
+    let is i64 as intensity with mut = 0;
+    if (f.header.mode == tbl.MP3_MODE_JOINT) {
+        if ((f.header.mode_extension & 1) != 0 && ch == 1) { intensity = 1; }
+    }
+
+    if (intensity != 0) {
+        let is i64 as s = sf >> 1;
+        if (s < 180) {
+            context = 3;
+            slen0 = s / 36;
+            slen1 = (s % 36) / 6;
+            slen2 = (s % 36) % 6;
+            slen3 = 0;
+        } else if (s < 244) {
+            let is i64 as t = s - 180;
+            context = 4;
+            slen0 = t >> 4;
+            slen1 = (t % 16) >> 2;
+            slen2 = t % 4;
+            slen3 = 0;
+        } else {
+            let is i64 as t = s - 244;
+            context = 5;
+            slen0 = t / 3;
+            slen1 = t % 3;
+            slen2 = 0;
+            slen3 = 0;
+        }
+    } else {
+        if (sf < 400) {
+            context = 0;
+            slen0 = (sf >> 4) / 5;
+            slen1 = (sf >> 4) % 5;
+            slen2 = (sf % 16) >> 2;
+            slen3 = sf % 4;
+        } else if (sf < 500) {
+            let is i64 as t = sf - 400;
+            context = 1;
+            slen0 = (t >> 2) / 5;
+            slen1 = (t >> 2) % 5;
+            slen2 = t % 4;
+            slen3 = 0;
+        } else {
+            let is i64 as t = sf - 500;
+            context = 2;
+            slen0 = t / 3;
+            slen1 = t % 3;
+            slen2 = 0;
+            slen3 = 0;
+            preflag = 1;
+        }
+    }
+
+    let is i64 as n0 = tbl.mp3_lsf_nsf(context, block_case, 0);
+    let is i64 as n1 = tbl.mp3_lsf_nsf(context, block_case, 1);
+    let is i64 as n2 = tbl.mp3_lsf_nsf(context, block_case, 2);
+    let is i64 as n3 = tbl.mp3_lsf_nsf(context, block_case, 3);
+    if (n0 < 0 || n1 < 0 || n2 < 0 || n3 < 0) { return errno.I_CORRUPT; }
+
+    let is i64 as pos with mut = 0;
+    let is i64 as p with mut = 0;
+    while (p < 4) {
+        let is i64 as n with mut = n0;
+        let is i64 as width with mut = slen0;
+        if (p == 1) { n = n1; width = slen1; }
+        else if (p == 2) { n = n2; width = slen2; }
+        else if (p == 3) { n = n3; width = slen3; }
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            let is i64 as v with mut = 0;
+            if (width > 0) {
+                v = bits.bits_msb_read(rd, width);
+                if (v < 0) { return v; }
+            }
+            let is i64 as st = _lsf_store(m, ch, block_case, pos, v);
+            if (st < 0) { return st; }
+            pos = pos + 1;
+            i = i + 1;
+        }
+        p = p + 1;
+    }
+
+    let is i64 as expect with mut = 21;
+    if (block_case == 1) { expect = 36; }
+    else if (block_case == 2) { expect = 33; }
+    if (pos != expect) { return errno.I_CORRUPT; }
+
+    if (block_case == 0) {
+        m.scfl[ch * 22 + 21] = 0;
+    } else {
+        m.scfs[ch * 40 + 36] = 0;
+        m.scfs[ch * 40 + 37] = 0;
+        m.scfs[ch * 40 + 38] = 0;
+        m.scfs[ch * 40 + 39] = 0;
+    }
+    *preflag_out = preflag;
+    return errno.I_OK;
+}
+
+// ── requantisation gain table ─────────────────────────────────────
+
+// Fill m.gain[ch*576..] in Huffman order. long_count is 22 for a long
+// block, 8/6 for the long lower part of a mixed block, 0 otherwise.
+fn _fill_gain(m as *Mp3Decode, g as *base.Mp3Granule, ch as i64,
+              row as i64, short as i64, mixed as i64, mpeg1 as i64,
+              preflag as i64) as i64 {
+    let is i64 as shift = 1 << (g.scalefac_scale + 1);
+    let is i64 as base_exp = g.global_gain - 210;
+    let is i64 as long_count with mut = 0;
+    let is i64 as short_start with mut = 0;
+    if (short == 0) {
+        long_count = 22;
+    } else if (mixed != 0) {
+        if (mpeg1 != 0) { long_count = 8; } else { long_count = 6; }
+        short_start = 3;
+    }
+
+    let is i64 as pos with mut = 0;
+    let is i64 as sfb with mut = 0;
+    while (sfb < long_count) {
+        let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+        if (w < 0 || pos + w > 576) { return errno.I_CORRUPT; }
+        let is i64 as scf with mut = m.scfl[ch * 22 + sfb];
+        if (preflag != 0 && sfb < 21) { scf = scf + tbl.mp3_pretab(sfb); }
+        let is i64 as e4 = base_exp - scf * shift;
+        let is f64 as gv = fm.pow(2.0, cast(f64, e4) * 0.25);
+        let is i64 as i with mut = 0;
+        while (i < w) {
+            m.gain[ch * 576 + pos] = gv;
+            pos = pos + 1;
+            i = i + 1;
+        }
+        sfb = sfb + 1;
+    }
+
+    if (short != 0) {
+        sfb = short_start;
+        while (sfb < 13) {
+            let is i64 as w = tbl.mp3_sfb_short_width(row, sfb);
+            if (w < 0 || pos + 3 * w > 576) { return errno.I_CORRUPT; }
+            let is i64 as win with mut = 0;
+            while (win < 3) {
+                let is i64 as scf = m.scfs[ch * 40 + sfb * 3 + win];
+                let is i64 as e4 = base_exp - scf * shift
+                    - (g.subblock_gain[win] << 3);
+                let is f64 as gv = fm.pow(2.0, cast(f64, e4) * 0.25);
+                let is i64 as i with mut = 0;
+                while (i < w) {
+                    m.gain[ch * 576 + pos] = gv;
+                    pos = pos + 1;
+                    i = i + 1;
+                }
+                win = win + 1;
+            }
+            sfb = sfb + 1;
+        }
+    }
+    if (pos != 576) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+// ── Huffman ───────────────────────────────────────────────────────
+
+fn _dequant(is_ as i64, gain as f64) as f64 {
+    if (is_ == 0) { return 0.0; }
+    let is f64 as mag = fm.pow(cast(f64, _abs64(is_)), 4.0 / 3.0);
+    let is f64 as v = mag * gain;
+    if (is_ < 0) { return 0.0 - v; }
+    return v;
+}
+
+fn _huff_pair(rd as *bits.BitsMsb, code as *i64, len as *i64,
+              linbits as i64, gain0 as f64, gain1 as f64, out0 as *f64,
+              out1 as *f64) as i64 {
+    let is i64 as sym = _vlc_symbol(rd, code, len, 256, 19);
+    if (sym < 0) { return sym; }
+    let is i64 as x with mut = sym >> 4;
+    let is i64 as y with mut = sym & 15;
+    if (x == 15 && linbits > 0) {
+        let is i64 as v = bits.bits_msb_read(rd, linbits);
+        if (v < 0) { return v; }
+        x = x + v;
+    }
+    if (x != 0) {
+        let is i64 as s = bits.bits_msb_bit(rd);
+        if (s < 0) { return s; }
+        if (s != 0) { x = 0 - x; }
+    }
+    if (y == 15 && linbits > 0) {
+        let is i64 as v = bits.bits_msb_read(rd, linbits);
+        if (v < 0) { return v; }
+        y = y + v;
+    }
+    if (y != 0) {
+        let is i64 as s = bits.bits_msb_bit(rd);
+        if (s < 0) { return s; }
+        if (s != 0) { y = 0 - y; }
+    }
+    *out0 = _dequant(x, gain0);
+    *out1 = _dequant(y, gain1);
+    return errno.I_OK;
+}
+
+// Decode the big_values and count1 partitions of one granule/channel into
+// m.spec[ch*576..], stopping at the part2_3 bit boundary `end`.
+fn _huff_decode(m as *Mp3Decode, rd as *bits.BitsMsb, g as *base.Mp3Granule,
+                ch as i64, row as i64, end as i64) as i64 {
+    let is i64 as bv = g.big_values;
+    if (bv < 0 || bv > 288) { return errno.I_CORRUPT; }
+
+    let is i64 as r0 with mut = 0;
+    let is i64 as r1 with mut = 0;
+    let is i64 as r2 with mut = 0;
+    if (g.window_switching_flag != 0) {
+        if (g.block_type == 2) {
+            if (row == 8) { r0 = 36; } else { r0 = 18; }
+        } else {
+            r0 = tbl.mp3_sfb_long_offset(row, 8) / 2;
+        }
+        if (r0 > bv) { r0 = bv; }
+        r1 = bv - r0;
+        r2 = 0;
+    } else {
+        let is i64 as a1 = _min(g.region0_count + 1, 22);
+        let is i64 as a2 with mut = g.region0_count + g.region1_count + 2;
+        if (a2 > 22) { a2 = 22; }
+        let is i64 as p0 with mut = tbl.mp3_sfb_long_offset(row, a1) / 2;
+        let is i64 as p1 with mut = tbl.mp3_sfb_long_offset(row, a2) / 2;
+        if (p0 > bv) { p0 = bv; }
+        if (p1 > bv) { p1 = bv; }
+        r0 = p0;
+        r1 = p1 - p0;
+        if (r1 < 0) { r1 = 0; }
+        r2 = bv - r0 - r1;
+        if (r2 < 0) { r2 = 0; }
+    }
+
+    let is i64 as line with mut = 0;
+    let is i64 as reg with mut = 0;
+    while (reg < 3) {
+        let is i64 as count with mut = r0;
+        if (reg == 1) { count = r1; }
+        else if (reg == 2) { count = r2; }
+        if (count > 0) {
+            let is i64 as tab = g.table_select[reg];
+            if (tbl.mp3_huff_table_valid(tab) == 0) {
+                return errno.I_CORRUPT;
+            }
+            if (tab == 0) {
+                // Table 0 is the single (0,0) symbol: all pairs are zero
+                // and no bits are consumed.
+                line = line + 2 * count;
+            } else {
+                let is [256]i64 as code;
+                let is [256]i64 as len;
+                _zero(cast(*u8, &code), 256 * 8);
+                _zero(cast(*u8, &len), 256 * 8);
+                let is i64 as ld = tbl.mp3_huff_load(tab,
+                    cast(*i64, &code), cast(*i64, &len));
+                if (ld < 0) { return ld; }
+                let is i64 as lin = tbl.mp3_huff_linbits(tab);
+                if (lin < 0 || lin > 13) { return errno.I_CORRUPT; }
+                let is i64 as j with mut = 0;
+                while (j < count) {
+                    if (line + 1 >= 576) { return errno.I_CORRUPT; }
+                    let is f64 as v0 with mut = 0.0;
+                    let is f64 as v1 with mut = 0.0;
+                    let is i64 as st = _huff_pair(rd, cast(*i64, &code),
+                        cast(*i64, &len), lin,
+                        m.gain[ch * 576 + line],
+                        m.gain[ch * 576 + line + 1], &v0, &v1);
+                    if (st < 0) { return st; }
+                    m.spec[ch * 576 + line] = v0;
+                    m.spec[ch * 576 + line + 1] = v1;
+                    line = line + 2;
+                    j = j + 1;
+                }
+            }
+        }
+        reg = reg + 1;
+    }
+
+    let is i64 as ctab = g.count1table_select;
+    if (ctab < 0 || ctab > 1) { return errno.I_CORRUPT; }
+    let is [16]i64 as ccode;
+    let is [16]i64 as clen;
+    _zero(cast(*u8, &ccode), 16 * 8);
+    _zero(cast(*u8, &clen), 16 * 8);
+    let is i64 as cl = tbl.mp3_count1_load(ctab,
+        cast(*i64, &ccode), cast(*i64, &clen));
+    if (cl < 0) { return cl; }
+
+    while (line <= 572) {
+        if (bits.bits_msb_consumed(rd) >= end) { break; }
+        let is i64 as sym = _vlc_symbol(rd, cast(*i64, &ccode),
+            cast(*i64, &clen), 16, 6);
+        if (sym < 0) { return sym; }
+        let is i64 as j with mut = 0;
+        while (j < 4) {
+            if ((sym & (8 >> j)) != 0) {
+                let is i64 as s = bits.bits_msb_bit(rd);
+                if (s < 0) { return s; }
+                let is f64 as v = m.gain[ch * 576 + line + j];
+                if (s != 0) {
+                    m.spec[ch * 576 + line + j] = 0.0 - v;
+                } else {
+                    m.spec[ch * 576 + line + j] = v;
+                }
+            }
+            j = j + 1;
+        }
+        line = line + 4;
+    }
+    if (bits.bits_msb_consumed(rd) > end) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+// ── one granule/channel part ──────────────────────────────────────
+
+fn _decode_part(m as *Mp3Decode, rd as *bits.BitsMsb, f as *base.Mp3Frame,
+                gr as i64, ch as i64, row as i64, mpeg1 as i64) as i64 {
+    let is *base.Mp3Granule as g = &f.side.granule[gr][ch];
+    let is i64 as plen = g.part2_3_length;
+    if (plen < 0 || plen > 4095) { return errno.I_CORRUPT; }
+    if (g.block_type < 0 || g.block_type > 3) { return errno.I_CORRUPT; }
+    if (g.window_switching_flag != 0 && g.block_type == 0) {
+        return errno.I_CORRUPT;
+    }
+    if (g.window_switching_flag == 0 && g.block_type != 0) {
+        return errno.I_CORRUPT;
+    }
+    if (bits.bits_msb_remaining(rd) < plen) { return errno.I_EOF; }
+    let is i64 as start = bits.bits_msb_consumed(rd);
+    let is i64 as end = start + plen;
+
+    let is i64 as i with mut = 0;
+    while (i < 576) {
+        m.spec[ch * 576 + i] = 0.0;
+        m.gain[ch * 576 + i] = 0.0;
+        i = i + 1;
+    }
+    if (plen == 0) { return errno.I_OK; }
+
+    let is i64 as short with mut = 0;
+    if (g.block_type == 2 && g.window_switching_flag != 0) { short = 1; }
+    let is i64 as mixed with mut = 0;
+    if (short != 0 && g.mixed_block_flag != 0) { mixed = 1; }
+
+    let is i64 as preflag with mut = 0;
+    if (mpeg1 != 0) {
+        if (short == 0) { preflag = g.preflag; }
+        let is i64 as stm = _scf_mpeg1(m, rd, f, gr, ch, short, mixed);
+        if (stm < 0) { return stm; }
+    } else {
+        let is i64 as pf with mut = 0;
+        let is i64 as stl = _scf_lsf(m, rd, f, ch, short, mixed, &pf);
+        if (stl < 0) { return stl; }
+        if (short == 0) { preflag = pf; }
+    }
+    if (bits.bits_msb_consumed(rd) > end) { return errno.I_CORRUPT; }
+
+    let is i64 as st2 = _fill_gain(m, g, ch, row, short, mixed, mpeg1,
+                                   preflag);
+    if (st2 < 0) { return st2; }
+
+    let is i64 as st3 = _huff_decode(m, rd, g, ch, row, end);
+    if (st3 < 0) { return st3; }
+    if (bits.bits_msb_consumed(rd) > end) { return errno.I_CORRUPT; }
+    return _skip_bits(rd, end - bits.bits_msb_consumed(rd));
+}
+
+// ── stereo ────────────────────────────────────────────────────────
+
+fn _intensity_gains(m as *Mp3Decode, pos as i64, mpeg1 as i64,
+                    iscale as i64, kl as *f64, kr as *f64) as void {
+    if (mpeg1 != 0) {
+        let is i64 as p with mut = pos;
+        if (p < 0) { p = 0; }
+        if (p > 6) { p = 6; }
+        *kl = m.pan[2 * p];
+        *kr = m.pan[2 * p + 1];
+        return;
+    }
+    let is f64 as x with mut = 2.0;
+    if (iscale != 0) { x = 1.0; }
+    if (pos <= 0) {
+        *kl = 1.0;
+        *kr = 1.0;
+    } else if ((pos & 1) != 0) {
+        *kl = fm.pow(2.0, 0.0 - cast(f64, pos + 1) / (4.0 * x));
+        *kr = 1.0;
+    } else {
+        *kl = 1.0;
+        *kr = fm.pow(2.0, 0.0 - cast(f64, pos) / (4.0 * x));
+    }
+}
+
+fn _illegal_pos(pos as i64, mpeg1 as i64) as i64 {
+    if (mpeg1 != 0) {
+        if (pos >= 7) { return 1; }
+        return 0;
+    }
+    if (pos >= 16) { return 1; }
+    return 0;
+}
+
+// Fold one intensity band: L = M*kl, R = M*kr.
+fn _apply_intensity(m as *Mp3Decode, pos0 as i64, count as i64,
+                    kl as f64, kr as f64) as void {
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is f64 as mid = m.spec[0 * 576 + pos0 + i];
+        m.spec[0 * 576 + pos0 + i] = mid * kl;
+        m.spec[1 * 576 + pos0 + i] = mid * kr;
+        i = i + 1;
+    }
+}
+
+fn _apply_ms(m as *Mp3Decode, pos0 as i64, count as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is f64 as a = m.spec[0 * 576 + pos0 + i];
+        let is f64 as b = m.spec[1 * 576 + pos0 + i];
+        m.spec[0 * 576 + pos0 + i] = (a + b) * MP3_INV_SQRT2;
+        m.spec[1 * 576 + pos0 + i] = (a - b) * MP3_INV_SQRT2;
+        i = i + 1;
+    }
+}
+
+fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
+           row as i64, mpeg1 as i64) as i64 {
+    if (chans != 2) { return errno.I_OK; }
+    if (f.header.mode != tbl.MP3_MODE_JOINT) { return errno.I_OK; }
+    let is i64 as ms with mut = 0;
+    let is i64 as ins with mut = 0;
+    if ((f.header.mode_extension & 2) != 0) { ms = 1; }
+    if ((f.header.mode_extension & 1) != 0) { ins = 1; }
+    if (ms == 0 && ins == 0) { return errno.I_OK; }
+
+    let is *base.Mp3Granule as g0 = &f.side.granule[gr][0];
+    let is *base.Mp3Granule as g1 = &f.side.granule[gr][1];
+    if (g0.block_type != g1.block_type) { return errno.I_CORRUPT; }
+    if (g0.mixed_block_flag != g1.mixed_block_flag) { return errno.I_CORRUPT; }
+    if (g0.window_switching_flag != g1.window_switching_flag) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as mixed = g0.mixed_block_flag;
+    let is i64 as iscale with mut = 0;
+    if (mpeg1 == 0) { iscale = g1.scalefac_compress & 1; }
+
+    if (g0.block_type != 2) {
+        // Long block: find the highest right-channel band with a nonzero
+        // line, then intensity above it, MS below it.
+        let is i64 as max_band with mut = 0 - 1;
+        let is i64 as pos with mut = 0;
+        let is i64 as sfb with mut = 0;
+        while (sfb < 22) {
+            let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+            let is i64 as i with mut = 0;
+            while (i < w) {
+                if (m.spec[1 * 576 + pos + i] != 0.0) { max_band = sfb; }
+                i = i + 1;
+            }
+            pos = pos + w;
+            sfb = sfb + 1;
+        }
+        pos = 0;
+        sfb = 0;
+        while (sfb < 22) {
+            let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+            let is i64 as use_int with mut = 0;
+            if (ins != 0 && sfb > max_band) { use_int = 1; }
+            let is i64 as ispos = m.scfl[1 * 22 + sfb];
+            if (use_int != 0 && _illegal_pos(ispos, mpeg1) == 0) {
+                let is f64 as kl with mut = 0.0;
+                let is f64 as kr with mut = 0.0;
+                _intensity_gains(m, ispos, mpeg1, iscale, &kl, &kr);
+                _apply_intensity(m, pos, w, kl, kr);
+            } else if (ms != 0) {
+                _apply_ms(m, pos, w);
+            }
+            pos = pos + w;
+            sfb = sfb + 1;
+        }
+        return errno.I_OK;
+    }
+
+    // Short blocks. The lower part of a mixed block is a long block and is
+    // handled after the short region so the "last nonzero band" rule can
+    // span the whole granule.
+    let is i64 as long_count with mut = 0;
+    if (mixed != 0) {
+        if (mpeg1 != 0) { long_count = 8; } else { long_count = 6; }
+    }
+    let is i64 as short_start with mut = 0;
+    if (mixed != 0) { short_start = 3; }
+    let is i64 as long_lines with mut = 0;
+    let is i64 as sfb with mut = 0;
+    while (sfb < long_count) {
+        long_lines = long_lines + tbl.mp3_sfb_long_width(row, sfb);
+        sfb = sfb + 1;
+    }
+    if (long_lines > 576) { return errno.I_CORRUPT; }
+
+    let is i64 as nz0 with mut = 0 - 1;
+    let is i64 as nz1 with mut = 0 - 1;
+    let is i64 as nz2 with mut = 0 - 1;
+    let is i64 as pos with mut = long_lines;
+    sfb = short_start;
+    while (sfb < 13) {
+        let is i64 as w = tbl.mp3_sfb_short_width(row, sfb);
+        let is i64 as win with mut = 0;
+        while (win < 3) {
+            let is i64 as i with mut = 0;
+            while (i < w) {
+                if (m.spec[1 * 576 + pos + i] != 0.0) {
+                    if (win == 0) { nz0 = sfb; }
+                    else if (win == 1) { nz1 = sfb; }
+                    else { nz2 = sfb; }
+                }
+                i = i + 1;
+            }
+            pos = pos + w;
+            win = win + 1;
+        }
+        sfb = sfb + 1;
+    }
+
+    let is i64 as nz_any with mut = 0;
+    if (nz0 >= short_start || nz1 >= short_start || nz2 >= short_start) {
+        nz_any = 1;
+    }
+
+    pos = long_lines;
+    sfb = short_start;
+    while (sfb < 13) {
+        let is i64 as w = tbl.mp3_sfb_short_width(row, sfb);
+        let is i64 as win with mut = 0;
+        while (win < 3) {
+            let is i64 as nz with mut = nz0;
+            if (win == 1) { nz = nz1; }
+            else if (win == 2) { nz = nz2; }
+            let is i64 as ispos = m.scfs[1 * 40 + sfb * 3 + win];
+            let is i64 as use_int with mut = 0;
+            if (ins != 0 && sfb > nz) { use_int = 1; }
+            if (use_int != 0 && _illegal_pos(ispos, mpeg1) == 0) {
+                let is f64 as kl with mut = 0.0;
+                let is f64 as kr with mut = 0.0;
+                _intensity_gains(m, ispos, mpeg1, iscale, &kl, &kr);
+                _apply_intensity(m, pos, w, kl, kr);
+            } else if (ms != 0) {
+                _apply_ms(m, pos, w);
+            }
+            pos = pos + w;
+            win = win + 1;
+        }
+        sfb = sfb + 1;
+    }
+
+    if (mixed != 0 && (ms != 0 || ins != 0)) {
+        let is i64 as max_long with mut = 0 - 1;
+        if (nz_any == 0) {
+            let is i64 as p with mut = 0;
+            sfb = 0;
+            while (sfb < long_count) {
+                let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+                let is i64 as i with mut = 0;
+                while (i < w) {
+                    if (m.spec[1 * 576 + p + i] != 0.0) { max_long = sfb; }
+                    i = i + 1;
+                }
+                p = p + w;
+                sfb = sfb + 1;
+            }
+        }
+        let is i64 as p with mut = 0;
+        sfb = 0;
+        while (sfb < long_count) {
+            let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+            let is i64 as use_int with mut = 0;
+            if (ins != 0 && nz_any == 0 && sfb > max_long) { use_int = 1; }
+            let is i64 as ispos = m.scfl[1 * 22 + sfb];
+            if (use_int != 0 && _illegal_pos(ispos, mpeg1) == 0) {
+                let is f64 as kl with mut = 0.0;
+                let is f64 as kr with mut = 0.0;
+                _intensity_gains(m, ispos, mpeg1, iscale, &kl, &kr);
+                _apply_intensity(m, p, w, kl, kr);
+            } else if (ms != 0) {
+                _apply_ms(m, p, w);
+            }
+            p = p + w;
+            sfb = sfb + 1;
+        }
+    }
+    return errno.I_OK;
+}
+
+// ── frame driver ──────────────────────────────────────────────────
+
+fn _save_reservoir(m as *Mp3Decode, total as i64) as void {
+    let is i64 as keep with mut = total;
+    if (keep > MP3_RESERVOIR_MAX) { keep = MP3_RESERVOIR_MAX; }
+    if (keep < 0) { keep = 0; }
+    let is i64 as from = total - keep;
+    let is i64 as i with mut = 0;
+    while (i < keep) {
+        m.reservoir[i] = m.main[from + i];
+        i = i + 1;
+    }
+    m.reservoir_len = keep;
+}
+
+fn mp3_decode_frame(m as *Mp3Decode, f as *base.Mp3Frame,
+                    pcm as *u8, cap as i64) as i64 {
+    if (m.initialized == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, f) == 0 || cast(i64, pcm) == 0) { return errno.I_BADPARAM; }
+    if (f.header.layer != 3) { return errno.I_UNSUPPORTED; }
+    if (f.header.bitrate_kbps <= 0) { return errno.I_UNSUPPORTED; }
+    if (f.header.sample_rate <= 0) { return errno.I_UNSUPPORTED; }
+    if (f.header.channels != 1 && f.header.channels != 2) {
+        return errno.I_UNSUPPORTED;
+    }
+    let is i64 as frames = f.header.samples_per_frame;
+    if (frames != 1152 && frames != 576) { return errno.I_UNSUPPORTED; }
+    let is i64 as chans = f.header.channels;
+    let is i64 as need = frames * chans * 2;
+    if (cap < 0) { return errno.I_BADPARAM; }
+    if (cap < need) { return errno.I_NOMEM; }
+
+    let is i64 as mdo = f.main_data_offset;
+    let is i64 as mdl = f.main_data_len;
+    if (mdo < 0 || mdl < 0) { return errno.I_CORRUPT; }
+    if (mdl > 0) {
+        if (cast(i64, m.stream.src) == 0) { return errno.I_BADPARAM; }
+        if (mdo > m.stream.len || mdl > m.stream.len - mdo) {
+            return errno.I_EOF;
+        }
+    }
+
+    let is i64 as back = f.side.main_data_begin;
+    if (back < 0) { return errno.I_CORRUPT; }
+    if (back > m.reservoir_len) { return errno.I_EOF; }
+    if (back > MP3_RESERVOIR_MAX) { return errno.I_CORRUPT; }
+    let is i64 as total = back + mdl;
+    if (total < 0 || total > MP3_MAIN_MAX) { return errno.I_DIMS; }
+
+    // Assemble [saved tail][current main data] into m.main.
+    let is i64 as from = m.reservoir_len - back;
+    let is i64 as i with mut = 0;
+    while (i < back) {
+        m.main[i] = m.reservoir[from + i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < mdl) {
+        m.main[back + i] = m.stream.src[mdo + i];
+        i = i + 1;
+    }
+
+    let is i64 as mpeg1 = tbl.mp3_is_mpeg1(f.header.version);
+    let is i64 as row = tbl.mp3_sfb_row(f.header.version,
+                                         f.header.sample_rate_index);
+    if (row < 0 || row > 8) { return errno.I_CORRUPT; }
+    let is i64 as ngr with mut = 1;
+    if (mpeg1 != 0) { ngr = 2; }
+
+    // Scalefactors from an earlier frame must not leak into a granule1
+    // scfsi copy; zero them before the frame's granules fill them.
+    i = 0;
+    while (i < 44) { m.scfl[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 80) { m.scfs[i] = 0; i = i + 1; }
+
+    let is bits.BitsMsb as rd;
+    let is i64 as st = bits.bits_msb_init(&rd, cast(*u8, &m.main), total);
+    if (st < 0) {
+        _save_reservoir(m, total);
+        return st;
+    }
+
+    let is i64 as gr with mut = 0;
+    while (gr < ngr) {
+        let is i64 as ch with mut = 0;
+        while (ch < chans) {
+            let is i64 as dst = _decode_part(m, &rd, f, gr, ch, row, mpeg1);
+            if (dst < 0) {
+                _save_reservoir(m, total);
+                return dst;
+            }
+            ch = ch + 1;
+        }
+
+        let is i64 as sst = _stereo(m, f, gr, chans, row, mpeg1);
+        if (sst < 0) {
+            _save_reservoir(m, total);
+            return sst;
+        }
+
+        ch = 0;
+        while (ch < chans) {
+            let is *base.Mp3Granule as gc = &f.side.granule[gr][ch];
+            let is i64 as mixed = gc.mixed_block_flag;
+            let is i64 as bt = gc.block_type;
+            let is i64 as long_lines with mut = 0;
+            if (mixed != 0) {
+                let is i64 as lc with mut = 6;
+                if (mpeg1 != 0) { lc = 8; }
+                let is i64 as sf with mut = 0;
+                while (sf < lc) {
+                    long_lines = long_lines + tbl.mp3_sfb_long_width(row, sf);
+                    sf = sf + 1;
+                }
+            }
+            if (long_lines % 18 != 0) { return errno.I_CORRUPT; }
+            let is i64 as n_long = long_lines / 18;
+            let is i64 as alias_bands with mut = 0;
+            if (bt != 2) {
+                alias_bands = 32;
+            } else if (mixed != 0) {
+                alias_bands = 2;
+                if (f.header.version == tbl.MP3_VER_25 &&
+                    f.header.sample_rate_index == 2) {
+                    alias_bands = 4;
+                }
+            }
+
+            let is i64 as rst = syn.syn_reconstruct(&m.synth,
+                cast(*f64, &m.spec[ch * 576]), ch, row, bt, mixed,
+                n_long, alias_bands, cast(*f64, &m.subband[ch * 576]));
+            if (rst < 0) {
+                _save_reservoir(m, total);
+                return rst;
+            }
+            syn.syn_synthesize(&m.synth,
+                cast(*f64, &m.subband[ch * 576]),
+                ch, pcm, gr * 576, chans);
+            ch = ch + 1;
+        }
+        gr = gr + 1;
+    }
+
+    _save_reservoir(m, total);
+    return frames;
+}
