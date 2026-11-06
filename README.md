@@ -388,7 +388,9 @@ is a passing result.
 The checks the original briefs call for, all **NOT RUN**:
 
 - Build and run the example: `caustic-mk build decode` and
-  `./build/decode <file>` on the committed WebM, Ogg and MP3 vectors.
+  `./build/decode <file>` on the committed WebM and Ogg vectors in
+  `tests/vectors/small/`. No MP3 vector is committed; an MP3 file must be
+  generated with FFmpeg and libmp3lame for that check.
 - VP9: decoded-frame MD5 against the libvpx `vp90-2-*` vectors,
   `trace_headers` field comparison and `ffprobe` metadata.
 - Opus: `opus_compare` against the RFC 6716 vectors, including Hybrid
