@@ -1,14 +1,15 @@
 # VP9 inter prediction and motion-vector prediction
 
 Status: **WRITTEN, NOT VERIFIED.** Nothing in this directory has been
-compiled, run or compared against a decoded frame. No table is pending
-generation.
+compiled, run or compared against a decoded frame. This module needs no
+generated table of its own, but the whole decoder still has pending blobs
+(see the table-provenance section below).
 
 This directory holds the inter-prediction half of the VP9 decoder: the
 motion-vector prediction syntax of section 6.5 and the sample prediction of
 section 8.5.2. It reads no bitstream, allocates nothing, and owns no state
-between calls. The block decoder (a later stage) drives both modules from the
-mode-info grid it already keeps.
+between calls. `block.cst` drives both modules from the mode-info grid it
+already keeps.
 
 | file | spec sections | contents |
 |---|---|---|
@@ -273,9 +274,14 @@ admits 0.
 
 ## Table provenance and pending values
 
-Nothing is generated and nothing is pending. Every table in
-`inter_tables.cst` was typed in source from the specification and re-read row
-by row against it when this module was completed:
+No generated blob belongs to `inter_tables.cst`; every table there was typed
+in source from the specification and re-read row by row against it when this
+module was completed. That says nothing about the rest of the decoder: tile
+decoding is still blocked by the three probability blobs in
+`vp9_tables_data.cst` (`VP9_TABLES_GENERATED = 0`) and the residual table
+blobs in `residual_tables_data.cst`
+(`VP9_RESIDUAL_TABLES_GENERATED = 0`). `vp9.md` and `residual.md` record
+what each generator must produce.
 
 - `subpel_filters[4][16][8]` (8.5.2.4) as four comma-separated blobs, 128
   entries each; negative taps are kept as printed, so the source can be

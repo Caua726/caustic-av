@@ -9,13 +9,23 @@ Status: **WRITTEN, NOT VERIFIED.** Nothing in this directory has been
 compiled or run. The MD5 / `ffprobe` / `trace_headers` checks named by the
 stage briefs are recorded for the test phase and have not been executed.
 
+> **Stage 4 record.** This note describes the stage 4 driver commit, not the
+> merged stage 5 decoder. `decode.cst` has since gained the inter path: it
+> no longer rejects inter frames, takes no per-call `mem`/`cap` (it selects
+> a buffer registered with `vp9_decoder_add_buffer`), stores two
+> `RefFrames` per mode-info unit, and publishes pixels through `refs.cst`
+> instead of `vp9_state_publish` plus `vp9_state_save_probs`. Read `vp9.md`
+> for the current driver, ownership and per-slice order. Statements below
+> about inter rejection, the caller's single output surface and the
+> one-byte `RefFrames` apply only to the stage 4 commit.
+
 ## Files
 
 | File | Holds |
 |---|---|
 | `video/vp9/block.cst` | Block geometry helpers not in recon_tables (partition subsize, log2 of a count, plane block size), the partition tree of 6.4.3, intra-frame mode info 6.4.4-6.4.10, residual orchestration 6.4.21, coefficient-context clearing and writing. |
 | `video/vp9/tile.cst` | Tile offsets 6.4.1, one Boolean decoder per tile, superblock traversal 6.4.2, per-tile error propagation. |
-| `video/vp9/decode.cst` | `Vp9Decoder`, the caller-owned work layout, coded-surface allocation, keyframe driver through the loop filter, segment-map update, `vp9_state_publish` and `refresh_frame_context` save. |
+| `video/vp9/decode.cst` | Stage 4 record: `Vp9Decoder`, the caller-owned work layout, coded-surface allocation, keyframe driver through the loop filter, segment-map update, `vp9_state_publish` and `refresh_frame_context` save. The merged driver adds the inter path and the pixel pool; see `vp9.md`. |
 | `video/vp9/residual.cst`, `residual_tables*.cst` | Adopted from the stage 4 residual slice (spec 6.4.24-6.4.26); table blobs are still pending. |
 | `video/vp9/{transforms,predict,loopfilter,recon_tables}.cst`, `recon.md` | Fixed reconstruction kernels adopted from `stage4-recon-fix` HEAD `54dd904`. |
 
@@ -71,7 +81,10 @@ surfaces and the frame order.
   `vp9_work_size(width, height)` gives
   the bytes for a decoder that will see frames up to that visible size; it
   is a pure layout computation, no allocation. The block must be 8-byte
-  aligned. The largest layout for 8192x8192 mode-info units is under 1 GiB.
+  aligned. The stage 4 layout was under 1 GiB; once stage 5's `Mvs`,
+  `SubMvs` and `PrevMvs` arrays are included the 8192x8192 ceiling is about
+  6.9 GiB (7,449,243,936 bytes), with those three arrays alone accounting
+  for 6 GiB and the per-mode-info byte arrays about 0.94 GiB.
 - The output surface is caller-provided per `vp9_decoder_decode` call.
   `frame.frame_size(coded_w, coded_h)` bytes are required; when the buffer
   is short the return is `I_NOMEM` and `d.frame_need` holds the requirement.
@@ -87,9 +100,11 @@ surfaces and the frame order.
 ## Per-frame arrays
 
 All per-mode-info arrays are one byte per 8x8 unit, row-major with stride
-`MiCols`: `MiSizes`, `TxSizes`, `Skips`, `SegmentIds`, `RefFrames`,
-`YModes`, plus four sub-modes per unit (`SubModes`). Writes for a block that
-overhangs the frame are clipped to `MiCols`/`MiRows`, exactly like libvpx's
+`MiCols`: `MiSizes`, `TxSizes`, `Skips`, `SegmentIds`, `YModes`, plus four
+sub-modes per unit (`SubModes`). This stage 4 note predates the two-list
+`RefFrames` of stage 5, which carries two bytes per unit; see `vp9.md`.
+Writes for a block that overhangs the frame are clipped to
+`MiCols`/`MiRows`, exactly like libvpx's
 `x_mis`/`y_mis`; every later reader only indexes valid mode-info units.
 
 Partition and segment-prediction contexts are padded to the superblock grid
@@ -140,17 +155,18 @@ parsing the header and before allocating the surface or touching tile data.
 Regenerate with the specification text and commit the produced files; see
 `vp9.md` and `residual.md` for the exact commands.
 
-## What stage 5 and stage 6 add
+## What stage 5 added and what stage 6 still adds
 
-- Stage 5: `inter_frame_mode_info`/`inter_block_mode_info`, ref frames,
-  motion vectors, inter prediction, `read_is_inter`, segment-id prediction
-  with `PrevSegmentIds`, `adapt_coef_probs`/`adapt_noncoef_probs` and the
-  `refresh_probs` load/adapt/save order, plus `load_probs2` after
-  adaptation. `block.cst` already refuses an inter block with
-  `I_UNSUPPORTED` and keeps the per-mi arrays the loop filter needs.
-- Stage 6: `show_existing_frame`, stored reference frames (this driver
-  publishes only the metadata slots, not pixels), display order for
-  superframes, and the public CLI/container integration.
+Stage 5 is merged: `block.cst` now decodes `inter_frame_mode_info`/
+`inter_block_mode_info`, reference frames, motion vectors, inter prediction
+and `read_is_inter`; `decode.cst` selects a pool buffer, publishes pixel
+views through `refs.cst`, and runs `adapt_bridge.cst`'s `refresh_probs`
+load/adapt/save order. The stage 4 description above is kept as the record
+of that slice; `vp9.md` describes the merged driver.
+
+Stage 6 still owns `show_existing_frame` through
+`refs.vp9_refs_show_existing`, a proper display queue for superframes, and
+the public CLI/container integration.
 
 ## UNCONFIRMED items
 
@@ -280,8 +296,11 @@ been confirmed by a decoded frame yet.
   replaced. Both cases are recoverable only through a key/intra-only frame,
   which is the documented taint rule.
 - `_work_carve` uses plain `i64` sums after capping dimensions at 8192; the
-  largest total is under 1 GiB, so no overflow check is needed, but the
-  invariant is only stated in a comment.
+  merged largest total is about 6.9 GiB (7,449,243,936 bytes, including
+  stage 5's motion arrays), far below the i64 range, so no overflow check is
+  needed, but the invariant is only stated in a comment. It also forms the
+  layout pointers before the capacity check; none is dereferenced until the
+  null-base, alignment and capacity checks pass.
 - `blk_log2` returns `BLK_INVALID` for counts other than 1/2/4/8/16; every
   caller checks. A reviewer may prefer distinct error codes.
 - The `i64 -> i32` copy before `tx_2d` exists because `residual.cst` returns

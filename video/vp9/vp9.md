@@ -83,7 +83,7 @@ pool and the work block. The caller allocates the decoder object, a persistent
 work block (`vp9_work_size`) and up to nine pixel buffers
 (`vp9_decoder_add_buffer`); the library allocates nothing. `Vp9Decoder` is
 large (the `Vp9State` probability contexts plus `adapt.cst`'s i64 working set
-and counts, roughly 140 KiB), so it belongs in caller storage, not on a small
+and counts, roughly 250 KiB), so it belongs in caller storage, not on a small
 stack.
 
 ### Reference pixel lifetime
@@ -130,11 +130,14 @@ for each frame in order. One slice:
    `scale.vp9_scale_ratio_ok`); the per-reference bound of 8.5.2.3 is
    enforced again by `inter.cst` at every prediction.
 3. Select a free pool buffer, form the coded frame view, zero it.
-4. Carve the per-frame work arrays. For an intra or error-resilient frame,
-   clear `PrevSegmentIds` (7.2), independently of the header's
-   `seg_map_clear`. Clear the current frame's `Mvs`/`SubMvs` (6.5 reads both
-   lists of a candidate before deciding, and 8.10 copies the field for the
-   next frame).
+4. Carve the per-frame work arrays. Clear `PrevSegmentIds` once, before any
+   tile block can read it, when `frame_is_intra == 1 || error_resilient_mode
+   == 1 || seg_map_clear == 1` (7.2's `setup_past_independence` plus 7.2.6's
+   size-change clear; the stage 4 and stage 5 forms are the same OR). Clear
+   the current frame's `Mvs`/`SubMvs` (6.5 reads both lists of a candidate
+   before deciding, and 8.10 copies the field for the next frame) and
+   `SubModes` (an inter block writes no sub-mode, and 9.3.2 must see
+   `DC_PRED` for an inter neighbour).
 5. `tile_decode_all` (6.4): one Boolean decoder per tile, above contexts
    once per frame, left contexts once per 8x8 row. For each block,
    `block.cst` decodes the partition tree, mode info, prediction and
@@ -148,8 +151,9 @@ for each frame in order. One slice:
    `FrameIsIntra`, `interpolation_filter`, `tx_mode` and
    `allow_high_precision_mv` all come from the parsed header. Counts were
    cleared per frame and were accumulated by the tiles.
-7. Loop filter (8.8), then 8.1 step 3 (`PrevSegmentIds`), then 8.10 step 2
-   (`PrevRefFrames`/`PrevMvs` from the current arrays).
+7. Loop filter (8.8), then 8.1 step 3 (`PrevSegmentIds`, with
+   `show_existing_frame == 0` guaranteed by the early rejection), then 8.10
+   step 2 (`PrevRefFrames`/`PrevMvs` from the current arrays).
 8. Publish (8.10 step 1). If `show_frame == 1`, the output view is the
    decoded frame; otherwise the output stays cleared.
 
@@ -427,15 +431,15 @@ checks the header does not perform.
    that `compute_image_size` performs when the frame size is first seen or
    changes (section 7.2.6). `setup_past_independence` (section 7.2) also
    clears `PrevSegmentIds` for the whole frame with no size condition and
-   does not touch `SegmentId` for the current frame. Stage 5's
-   `_decode_slice` now applies the latter when `frame_is_intra == 1 ||
-   error_resilient_mode == 1`, independently of `seg_map_clear`. The
-   stage-4 `_update_seg_map` also zeroes `PrevSegmentIds` on a size change
-   when segmentation did not update the map; the specification does not
-   explicitly ask for that, but indexing the old map at new dimensions would
-   be undefined, so it stays. Stage 5 additionally clears the current grid
-   of `PrevSegmentIds` at frame start when `h.seg_map_clear == 1`, before
-   any block reads it. Both are recorded as UNCONFIRMED.
+   does not touch `SegmentId` for the current frame. The merged
+   `_decode_slice` performs one clear before the tiles when
+   `frame_is_intra == 1 || error_resilient_mode == 1 || seg_map_clear == 1`;
+   `_update_seg_map` only performs the 8.1 step 3 copy. The stage 4 form and
+   the stage 5 form are the same predicate, so the merge resolution
+   preserved stage 4's semantics rather than introducing a new rule. The
+   size-change part is not spelled out as a `PrevSegmentIds` clear in the
+   specification, but indexing the old map at new dimensions would be
+   undefined, so it stays. Recorded as UNCONFIRMED.
 
 5. **Reference pool API changed.** `vp9_decoder_decode` no longer takes a
    per-call `mem`/`cap`: the output is a view into a pool buffer registered
@@ -461,6 +465,64 @@ checks the header does not perform.
    `MiCols*8`/`MiRows*8`, and `loopfilter.cst`'s `LfBlockInfo` gained
    `ref_stride`. These are documented at their definitions and in
    `inter.md`'s pending notes; they do not change valid-stream output.
+
+## Stage 5 review PENDING notes
+
+The read-only review of stage 5 approved the branch with these low-severity
+notes. They are recorded here so the next stage does not rediscover them;
+none changes valid-stream output or memory safety. P1, P3, P4, P7 and P10
+also carry the detailed correction in the named module note.
+
+- **P1 — `decode.md` is a stage 4 record.** It still describes inter
+  rejection, `vp9_state_publish`/`save_probs`, caller `mem`/`cap`, one-byte
+  `RefFrames` and the old output path. The note now says so at the top and
+  points here for the current driver; its "under 1 GiB" work-layout claim is
+  corrected (with stage 5's motion arrays the 8192x8192 ceiling is about
+  6.9 GiB).
+- **P2 — `Vp9Decoder` size.** Corrected from "roughly 140 KiB" to roughly
+  250 KiB in the ownership section above.
+- **P3 — `refs.md` is not a stage 6 slice.** Its header, integration steps
+  and the `publishable` versus `in_use` invariant were rewritten for the
+  stage 5 driver; see that file.
+- **P4 — `scale.cst` is mostly unused and duplicates `inter.cst`.** Only
+  `vp9_scale_ratio_ok` is called by `decode.cst`; `inter.cst` has its own
+  8.5.2.3 implementation (`inter_mv_scale`), and the rest of `scale.cst` is
+  a specification-shaped reference API. Documented in `refs.md`; no code
+  change.
+- **P5 — uninitialised `SubModes` on an inter frame.** `block.cst` reads the
+  neighbour sub-mode for an intra block, but 6.4.4 writes `SubModes` only
+  for an intra block, so an inter neighbour left the value undefined. The
+  driver now clears `SubModes` per frame; `MODE_DC` is 0, which is exactly
+  the `DC_PRED` the reference decoders return for an inter neighbour.
+- **P6 — `block.cst`'s `mctx`.** `mv_find_refs` requires a non-null
+  mode-context output, but `_inter_block_mode_info` computes the block's
+  inter-mode context separately; the scratch value is documented as
+  intentionally unconsumed.
+- **P7 — `adapt.cst`'s `clear_counts`/`setup_past_independence_probs` are
+  unused in production.** The decoder uses `vp9_tables.cst`'s
+  `vp9_state_clear_counts`/`vp9_state_setup_past_independence`; the
+  `adapt.cst` functions remain for standalone/layout-parity use. Documented
+  in `adapt.md`.
+- **P8 — layout pointers before the capacity check.** `_work_carve` forms
+  every pointer with base+offset arithmetic before checking `cap`; the
+  pointer values are never dereferenced until the null-base, alignment and
+  capacity checks pass. Documented in the function and here; moved no code.
+- **P9 — one held buffer.** `vp9_decoder_decode` keeps a single `held`
+  index for the last shown slice. A packet with several shown-but-
+  unpublished slices can reuse an earlier one as a later decode target; that
+  only costs an extra pool buffer, because the API returns only the final
+  shown view. Documented at the declaration.
+- **P10 — `inter.md`'s table sentence.** "Nothing is generated and nothing
+  is pending" is true of `inter_tables.cst` alone; the whole decoder still
+  has the three probability blobs and the residual table blobs pending. The
+  sentence now says so and points at the pending-blob sections.
+
+**Merge-resolution note.** The stage 5 merge onto stage 4 initially left
+two identical `PrevSegmentIds` clear sites. The duplicate stage 5 site was
+removed; the surviving clear is the stage 4 one, immediately before
+`tile_decode_all`, with the condition `frame_is_intra == 1 ||
+error_resilient_mode == 1 || seg_map_clear == 1`. Stage 4's semantics and
+`_update_seg_map`'s 8.1 step 3 copy are unchanged.
 
 ## Limitations and deferred work
 

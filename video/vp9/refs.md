@@ -1,10 +1,13 @@
 # VP9: reference frames, show-existing and scaled-reference geometry
 
-Stage 6 slice of the VP9 decoder. It owns the eight reference slots of
-section 5.10, the reference frame update process of section 8.10, the output
-path of section 8.9 for `show_existing_frame`, and the scaled-reference
-geometry of section 8.5.2.3. It does not decode a block, walk a tile, build
-an inter predictor or touch pixels.
+Reference-slot module used by the stage 5 frame driver; the stage 6 show-
+existing path will call the same slot map. It owns the eight reference slots
+of section 5.10, the reference frame update process of section 8.10, the
+output path of section 8.9 for `show_existing_frame`, and the scaled-
+reference geometry of section 8.5.2.3. It does not decode a block, walk a
+tile, build an inter predictor or touch pixels. `vp9_refs_show_existing` is
+implemented and validated here, but `decode.cst` still returns
+`I_UNSUPPORTED` for that frame type until stage 6 wires the output order.
 
 Nothing in this directory has been compiled or run. Everything here is
 **WRITTEN, NOT VERIFIED**.
@@ -168,10 +171,12 @@ current frame needs memory for its own size.
   caller may allocate a larger coded size, and any coded size at least as
   large as the grid is accepted.
 - `vp9_refs_frame_bytes(width, height)` returns the I420 byte count for
-  that coded size through `core/frame`, which bounds both dimensions by
-  65536 and checks every multiplication and addition. This is the only
-  number a caller should give its allocator; raw header fields are never
-  used as a size.
+  that 8-sample-grid coded size through `core/frame`, which bounds both
+  dimensions by 65536 and checks every multiplication and addition. It is
+  the geometry minimum, not the stage 5 driver's buffer size: `decode.cst`
+  pads the coded surface to `round64(MiCols*8) + 64` and reports the larger
+  `vp9_frame_size` in `d.frame_need`, because 6.4.21 writes the overhanging
+  edge block into that band. Raw header fields are never used as a size.
 - `vp9_refs_buffer_needs_resize(mem, cap, width, height)` returns 1 when a
   free buffer is absent (null `mem`, with a valid capacity) or too small
   for a frame of that visible size, 0 when its capacity suffices and the
@@ -182,22 +187,33 @@ current frame needs memory for its own size.
   (section 7.2.4 says the render size is a hint and has no effect on
   decoding). It never requires a new buffer.
 
-Before decoding a frame, the caller picks a **free/transient** buffer and
-checks both halves of the contract:
+Before decoding a frame, a buffer must satisfy two things: it must hold the
+coded frame size the driver reports in `d.frame_need`, and no published slot
+may still name its pixels. The stage 5 driver expresses this through its
+pool:
 
-1. `vp9_refs_buffer_publishable(slot_map, mem, cap)` must return 1: no
-   published slot may name that range. There is no refresh exception; a
-   slot the frame refreshes is still readable through `ref_frame_idx` while
-   the frame is decoded.
-2. `vp9_refs_buffer_needs_resize(mem, cap, width, height)` must return 0,
-   or the caller allocates `vp9_refs_frame_bytes(width, height)` bytes and
-   forms a view with `frame_alloc_coded`.
+- Up to nine non-overlapping ranges are registered with
+  `vp9_decoder_add_buffer`. Registration rejects overlaps, and the pool
+  index is the `Vp9RefFrame.id` passed to `vp9_refs_publish`, so
+  `vp9_refs_buffer_in_use(&refs, i) == 0` (slot names id `i`) and "no slot
+  overlaps this range" are the same statement for a registered buffer.
+  `_pick_buffer` chooses the first index that is not `held`,
+  `pool_cap[i] >= need`, and not in use.
+- `vp9_refs_buffer_publishable(map, mem, cap)` is the address-level form of
+  the same rule, for a caller managing memory outside that pool. It checks
+  every published slot's pixel range, including a slot this frame refreshes:
+  there is no refresh exception, because the frame may still predict from
+  the slot it overwrites.
+- `vp9_refs_buffer_needs_resize(mem, cap, width, height)` is the capacity
+  half for such a caller; the driver keeps the same capacity in `pool_cap`
+  and compares it against the size of the frame it is about to decode.
 
-Only then is the frame reconstructed and published. When a stream keeps
-eight distinct frames alive, decoding any next frame needs a transient
-ninth buffer; after publish, the buffers no refreshed slot names any more
-become free (`vp9_refs_buffer_in_use(id) == 0`) and may be reused for later
-frames. That is the same lifetime rule libvpx gets from its buffer pool.
+The publish step repeats the address check (`_conflict`); a source buffer
+named by any slot is rejected with `I_BADPARAM`. When a stream keeps eight
+distinct frames alive, decoding any next frame needs a transient ninth
+buffer; after publish, the buffers no refreshed slot names any more become
+free and may be reused for later frames. That is the same lifetime rule
+libvpx gets from its buffer pool.
 
 `vp9_refs_reset(state, slot_map)` clears all slots and the `Vp9State`
 reference mirror together, for decoder open or a resync path that discards
@@ -323,55 +339,39 @@ did not enforce it. `scale.cst` provides both levels:
   scale. With the bounds, `xScale` is in [1024, 32768] Q14 and the step is
   in [1, 32]; both are checked after the division.
 
-The stage 4/5 caller should run `vp9_scale_any_ratio_ok` when the frame size
-is known and `vp9_scale_setup` for every reference a block selects.
+The current driver uses `vp9_scale_ratio_ok` per listed reference in
+`_decode_slice` and `inter.cst`'s `inter_scale_ok` per reference a block
+actually predicts from; it does not call `vp9_scale_any_ratio_ok` or
+`vp9_scale_setup` (see "`scale.cst` status").
 
 ## Integration points
 
-### Stage 4 (key frame path)
+### Current driver (stage 4-5)
 
-1. `vp9_refs_init(&refs)` and `vp9_state_init(&st)` once per decoder.
-2. For a frame of visible `w`x`h`, take the coded size from
-   `vp9_refs_coded_size(w, h, &cw, &ch)` and pick a **free** buffer: its
-   range must pass `vp9_refs_buffer_publishable(&refs, mem, cap)` and its
-   capacity `vp9_refs_buffer_needs_resize(mem, cap, w, h)` must be 0.
-   Otherwise allocate `vp9_refs_frame_bytes(w, h)` bytes. Form the view
-   with `frame_alloc_coded(w, h, cw, ch, ...)`. The buffer must not be
-   named by any published slot, even though a key frame refreshes them
-   all.
-3. Decode and filter the frame in that buffer.
-4. Fill `Vp9RefFrame`: `valid = 1`, `key_frame = 1`,
-   `refresh_flags = h.refresh_frame_flags` (0xFF), the view, the header's
-   format, render size, the caller's `id` and `order`.
-5. `vp9_refs_publish(&st, &refs, &f)`. The buffer is now a published
-   reference and may not be reused until `vp9_refs_buffer_in_use(id) == 0`.
+1. `vp9_refs_init(&refs)` and `vp9_state_init(&st)` once per decoder;
+   register up to nine non-overlapping pixel ranges with
+   `vp9_decoder_add_buffer`. Registration rejects overlaps, so a pool
+   index not named by any slot cannot overlap a published reference.
+2. For each frame, `_pick_buffer` selects an index with `i != held`,
+   `pool_cap[i] >= frame_need`, and `vp9_refs_buffer_in_use(&refs, i) == 0`;
+   the driver then forms the padded coded view and zeroes it.
+3. For an inter frame: `vp9_refs_check_header(&refs, &h)`, then
+   `vp9_refs_get(&refs, idx, &v)` for each of the three indices. The driver
+   requires at least one reference to pass `vp9_scale_ratio_ok`; the
+   per-reference bound and the 8.5.2.3 arithmetic live in `inter.cst`
+   (`inter_scale_ok`/`inter_mv_scale`).
+4. Decode the tiles, adapt the probabilities, run the loop filter, update
+   the segment/motion maps, then publish.
+5. Fill `Vp9RefFrame` with `valid = 1`, `id = buf` (the pool index), the
+   view, header format and render size, the caller's `order`, and
+   `refresh_flags = h.refresh_frame_flags` (0..0xFF; a key frame must be
+   0xFF). `vp9_refs_publish` writes the slots and the `Vp9State` mirror.
+6. A buffer may be reused or freed once `vp9_refs_buffer_in_use(index) == 0`.
+   `held` keeps the last shown buffer of the current superframe out of
+   selection; earlier shown-but-unpublished slices are not individually
+   held (see `vp9.md`, P9).
 
-### Stage 5 (inter path)
-
-1. `vp9_refs_check_header(&refs, &h)` for the frame's three references.
-2. For each reference: `vp9_refs_get(&refs, idx, &v)`; keep `v.view` for the
-   predictor and `v.view.width/height` for the scale.
-3. `vp9_scale_setup(&sf, h.width, h.height, v.view.width, v.view.height,
-   h.subsampling_x, h.subsampling_y)` for each reference a block uses;
-   `vp9_scale_any_ratio_ok` once per frame.
-4. `vp9_scale_start` / `vp9_scale_mv` / `vp9_scale_last_x` /
-   `vp9_scale_last_y` / `vp9_scale_clip_x` / `vp9_scale_clip_y` feed the
-   inter predictor. The step is `sf.x_step`/`sf.y_step`; the intermediate
-   array height is `(((h - 1) * yStep + 15) >> 4) + 8`.
-5. Choose a **free/transient** buffer before decoding:
-   `vp9_refs_buffer_publishable(&refs, mem, cap)` must return 1 (no
-   published slot names it; refresh flags do not matter) and
-   `vp9_refs_buffer_needs_resize(mem, cap, h.width, h.height)` must return
-   0 (or allocate `vp9_refs_frame_bytes(h.width, h.height)` bytes). With
-   eight distinct live references, this is the ninth buffer. Decoding into
-   a slot's memory corrupts a reference that a block may still select.
-6. After reconstruction, publish with `key_frame = 0` and
-   `refresh_flags = h.refresh_frame_flags` (which may be 0 or 0xFF).
-7. Release or reuse a buffer only when `vp9_refs_buffer_in_use(id) == 0`.
-   The transient buffer itself must stay out of the pool from selection
-   through publish.
-
-### Stage 6 (tiles, show-existing, resizing)
+### Stage 6 (show-existing, output order)
 
 - Tile and block decoding reads reference views only through
   `vp9_refs_get` and must never index `slot_map.map` directly.
@@ -384,6 +384,20 @@ is known and `vp9_scale_setup` for every reference a block selects.
   `vp9_refs_buffer_publishable` confirms no slot names it.
 - `vp9_refs_reset` discards every reference on a resync path; reset the
   rest of `Vp9State` separately with `vp9_state_init`.
+
+## `scale.cst` status
+
+`decode.cst` calls only `vp9_scale_ratio_ok`, once per listed reference.
+The rest of `scale.cst` (`vp9_scale_setup`, the base/frac/start/mv/last/
+clip/end queries and `vp9_scale_any_ratio_ok`) is a specification-shaped
+reference API that the current driver does not call: `inter.cst` implements
+8.5.2.3 itself in `inter_mv_scale`/`inter_scale_ok`, and the frame-level
+"at least one reference" check is the loop in `_decode_slice`. The two
+implementations are deliberately kept separate for now, because rewiring
+`inter.cst` onto `scale.cst` is a code change with output risk and is not
+needed for the merge. A later cleanup can alias one to the other or delete
+the unused half; until then, `scale.cst` is a second, spec-shaped copy of
+the formulas and must be kept in step with `inter.cst`.
 
 ## UNCONFIRMED items
 
