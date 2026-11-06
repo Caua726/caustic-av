@@ -430,6 +430,11 @@ fn _emit_audio(s as *Session, ti as i64, out as *av.decode.Output) as i64 {
 
     if (s.sink_track != ti) { return av.errno.I_OK; }
 
+    // A track-based MP3 open can still publish 0 channels/rate before the
+    // first frame supplies them; adopt the first block's values.
+    if (s.sink_rate <= 0) { s.sink_rate = out.audio.rate; }
+    if (s.sink_channels <= 0) { s.sink_channels = out.audio.channels; }
+
     if (out.audio.rate != s.sink_rate
         || out.audio.channels != s.sink_channels) {
         io.write_str(io.STDERR,
