@@ -130,11 +130,11 @@ are correct without the blobs. `vp9_tables_ready()` reports the state, and
 
 ## Errata
 
-Both items are **UNCONFIRMED** until an external reference run confirms them.
-The reference decoders below were read (not copied) to settle the ambiguity;
-no test has been executed in this phase.
+All three items are **UNCONFIRMED** until an external reference run confirms
+them. The reference decoders below were read (not copied) to settle each
+ambiguity; no test has been executed in this phase.
 
-### E1. Partition probability selection is inverted in the prose
+### E1. Partition probability selection is inverted in the prose (UNCONFIRMED)
 
 Section 9.3.2 says:
 
@@ -162,7 +162,7 @@ single accessor for this decision so stages 4-6 cannot drift.
 `c3fbb7abbdb5bd4ed4a7e34768c17df1`. A wrong partition table changes the
 partition tree and the frame MD5. Stage 4's target.
 
-### E2. The `more_coefs` counting special case is missing
+### E2. The `more_coefs` counting special case is missing (UNCONFIRMED)
 
 Section 9.3.4 says "There is one special case (for `more_coefs`) that is
 described at the end of this section", but neither v0.6 nor v0.7 contains
@@ -196,7 +196,7 @@ default encoder settings) and compare every frame's MD5 with libvpx/FFmpeg.
 count changes the adapted probabilities and diverges by the second frame.
 Stage 5's target: every frame MD5 of that file.
 
-### E3. Superframe frame sizes are little-endian, not f() order
+### E3. Superframe frame sizes are little-endian, not f() order (UNCONFIRMED)
 
 Annex B writes `frame_sizes[i]` with the `f(SzBytes)` descriptor, and section
 4.9.1 defines `f(n)` as reading bits from high to low order, which would make
@@ -252,6 +252,11 @@ or transcribed.
   `libavcodec/vp9block.c` (block-level prob/count usage).
 - FFmpeg `n6.1`: `libavcodec/vp9_superframe_split_bsf.c` (superframe index
   byte order and split checks).
+- SerenityOS `master`, a third, from-scratch VP9 decoder:
+  `Userland/Libraries/LibMedia/Video/VP9/Parser.cpp` (the token loop),
+  `TreeParser.cpp` (counting `counts_more_coefs` once per read, by value)
+  and `SyntaxElementCounter.h`/`SyntaxElementCounter.cpp` (counter sizes).
+  Read to confirm the E2 rule; no code was copied.
 
 ## Status
 
