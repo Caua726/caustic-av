@@ -1,0 +1,108 @@
+// =======================================================
+// caustic-av/dsp/x86_64/vp9_idct.cst
+// SSE2 residual add for VP9 section 8.6.2 step 4: add the transformed block
+// to the prediction and clip each sample to 0..255.
+//
+// x86_64 System V only (args in rdi, rsi, rdx, rcx; result unused).
+//
+// Inputs: dst is the top-left sample of the n0 x n0 prediction block, stride
+// its row stride in bytes, dq the n0 x n0 transformed residual as i32 in
+// raster order. Preconditions are the caller's (video/vp9/transforms.cst):
+// n0 in { 4, 8, 16, 32 }, stride >= n0, dq has n0*n0 entries. Only 4 and 8
+// need different code paths; 16 and 32 run the 8-wide path more times.
+//
+// Exactness against the scalar reference
+// -------------------------------------
+// The scalar kernel computes Clip1(dst + dq) with i64 intermediates for any
+// i32 dq. The vector path is bit-identical for any i32 value:
+//   * packssdw saturates a 32-bit lane to signed 16 bits. That only changes a
+//     value whose sum is outside 0..32767 or below -32768 -- and such a value
+//     clips to 255 or 0 either way, which is what the saturation preserves.
+//   * paddsw then adds the predicted byte (0..255) with *signed saturation*,
+//     so a coefficient near 32767 cannot wrap into a negative lane the way a
+//     plain paddw would (255 + 32767 = 33022 wraps to -33014, and the
+//     following packuswb would then produce 0 instead of 255).
+//   * packuswb converts 16-bit lanes to bytes with unsigned saturation, which
+//     is Clip1: below 0 becomes 0, above 255 becomes 255.
+// The predicted byte is widened with punpcklbw against a zero register, i.e.
+// zero-extended to a 16-bit lane.
+//
+//   opcode legend used in this file (legacy 66 prefix, 128-bit operands):
+//     packssdw   66 0F 6B /r
+//     punpcklbw  66 0F 60 /r
+//     paddsw     66 0F ED /r
+//     packuswb   66 0F 67 /r
+//
+// No alignment is required: movdqu, movss and movsd are unaligned accesses.
+// =======================================================
+
+// x86_64 System V only. The target check is in `vp9_dsp_init_x86_64`
+// (vp9_dsp_x86.cst): a top-level `if (...) { ... }` is not part of the
+// grammar, and this kernel is reached only through the install pass.
+
+fn vp9_x86_add_residual(dst as *u8, stride as i64, dq as *i32,
+                        n0 as i64) as void with naked {
+    // rdi dst, rsi stride, rdx dq, rcx n0.
+    // r8 dst row, r9 dq row, r10 dq row bytes, r11 column sample offset,
+    // rax row index. xmm3 is the zero register for the widenings.
+    asm("pxor xmm3, xmm3\n");
+    asm("cmp rcx, 4\n");
+    asm("je .Lvp9dsp_ar4\n");
+
+    // n0 == 8, 16 or 32: eight samples per iteration.
+    asm("mov r8, rdi\n");
+    asm("mov r9, rdx\n");
+    asm("mov r10, rcx\n");
+    asm("shl r10, 2\n");
+    asm("xor eax, eax\n");
+    asm(".Lvp9dsp_ar_row:\n");
+    asm("xor r11d, r11d\n");
+    asm(".Lvp9dsp_ar_col:\n");
+    asm("movdqu xmm0, [r9 + r11*4]\n");
+    asm("movdqu xmm1, [r9 + r11*4 + 16]\n");
+    // packssdw xmm0, xmm1   66 0F 6B /r, modrm C1 (11 000 001)
+    asm(".byte 102,15,107,193\n");
+    asm("movsd xmm2, [r8 + r11]\n");
+    // punpcklbw xmm2, xmm3  66 0F 60 /r, modrm D3 (11 010 011)
+    asm(".byte 102,15,96,211\n");
+    // paddsw xmm0, xmm2     66 0F ED /r, modrm C2 (11 000 010)
+    asm(".byte 102,15,237,194\n");
+    // packuswb xmm0, xmm3   66 0F 67 /r, modrm C3 (11 000 011)
+    asm(".byte 102,15,103,195\n");
+    asm("movsd [r8 + r11], xmm0\n");
+    asm("add r11, 8\n");
+    asm("cmp r11, rcx\n");
+    asm("jb .Lvp9dsp_ar_col\n");
+    asm("add r8, rsi\n");
+    asm("add r9, r10\n");
+    asm("add rax, 1\n");
+    asm("cmp rax, rcx\n");
+    asm("jb .Lvp9dsp_ar_row\n");
+    asm("ret\n");
+
+    // n0 == 4: four samples per iteration. packssdw against itself leaves the
+    // four wanted words in lanes 0..3; the duplicated upper half is dropped by
+    // the 4-byte store.
+    asm(".Lvp9dsp_ar4:\n");
+    asm("mov r8, rdi\n");
+    asm("mov r9, rdx\n");
+    asm("xor eax, eax\n");
+    asm(".Lvp9dsp_ar4_row:\n");
+    asm("movdqu xmm0, [r9]\n");
+    // packssdw xmm0, xmm0   66 0F 6B /r, modrm C0 (11 000 000)
+    asm(".byte 102,15,107,192\n");
+    asm("movss xmm2, [r8]\n");
+    // punpcklbw xmm2, xmm3  66 0F 60 /r, modrm D3 (11 010 011)
+    asm(".byte 102,15,96,211\n");
+    // paddsw xmm0, xmm2     66 0F ED /r, modrm C2 (11 000 010)
+    asm(".byte 102,15,237,194\n");
+    // packuswb xmm0, xmm3   66 0F 67 /r, modrm C3 (11 000 011)
+    asm(".byte 102,15,103,195\n");
+    asm("movss [r8], xmm0\n");
+    asm("add r8, rsi\n");
+    asm("add r9, 16\n");
+    asm("add rax, 1\n");
+    asm("cmp rax, 4\n");
+    asm("jb .Lvp9dsp_ar4_row\n");
+    asm("ret\n");
+}

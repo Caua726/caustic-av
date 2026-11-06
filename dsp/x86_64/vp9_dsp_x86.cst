@@ -1,0 +1,45 @@
+// =======================================================
+// caustic-av/dsp/x86_64/vp9_dsp_x86.cst
+// Install the x86_64 VP9 kernels into a Vp9Dsp table.
+//
+// This module is the only entry point to dsp/x86_64/*: the kernels there are
+// plain asm functions whose addresses mean nothing until they are published
+// in the table, and they assume the System V argument registers. It is
+// imported only under `__target_is_x86_64 - __target_is_windows == 1`
+// (see dsp/vp9_dsp.cst), and the guard below stops a build that reached it
+// any other way.
+//
+// Installation rule: a kernel is published only when the CPU bit its
+// instruction set needs is present. Every kernel in this directory is SSE2,
+// which is part of the x86_64 baseline, so on any x86_64 CPU that passes the
+// CPUID check all of them are installed. The check still exists rather than
+// being assumed: the probe is what says what the CPU has, and a kernel that
+// needs SSE4.1 or AVX2 is gated on its own bit when it is written.
+//
+// A slot is written once with a value that never changes afterwards, which is
+// what makes the table safe to publish without a lock (dsp/vp9_dsp.cst).
+// =======================================================
+
+use "../vp9_dsp_abi.cst" as abi;
+use "vp9_cpu.cst" as cpu;
+use "vp9_intra.cst" as intra;
+use "vp9_idct.cst" as idct;
+use "vp9_interp.cst" as interp;
+
+fn vp9_dsp_init_x86_64(t as *abi.Vp9Dsp) as void {
+    // Dead on every other target, which is what keeps a direct import of this
+    // directory from producing SysV asm for a machine that calls differently.
+    if (abi.VP9_X86_SYSV == 0) {
+        __compile_error("dsp/x86_64 is x86_64 System V only");
+    }
+    if (cast(i64, t) == 0) { return; }
+    let is i64 as f = cpu.vp9_cpu_probe_x86_64();
+    t.features = f;
+    if ((f & abi.VP9_DSP_SSE2) == 0) { return; }
+
+    t.pred_v = fn_ptr(intra.vp9_x86_pred_v);
+    t.pred_h = fn_ptr(intra.vp9_x86_pred_h);
+    t.pred_tm = fn_ptr(intra.vp9_x86_pred_tm);
+    t.add_residual = fn_ptr(idct.vp9_x86_add_residual);
+    t.compound_avg = fn_ptr(interp.vp9_x86_compound_avg);
+}
