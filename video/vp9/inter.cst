@@ -98,6 +98,12 @@ struct InterPos {
 
 // ── validation ──────────────────────────────────────────────────────
 
+// A block's top-left must be inside the mode-info grid; the block itself may
+// overhang MiCols*8 / MiRows*8 at the frame edge, which the specification
+// allows (6.4.21 predicts the whole block and 8.5.2.2 clamps with a possibly
+// negative distance to the edge). The write stays inside the caller's padded
+// plane; the caller owns that guarantee. This is a stage 5 integration
+// change: the adopted inter slice required the block to fit.
 fn inter_frame_ok(f as *InterFrame) as i64 {
     if (cast(i64, f) == 0) { return 0; }
     if (f.width <= 0 || f.width > it.IT_MAX_DIM) { return 0; }
@@ -107,10 +113,7 @@ fn inter_frame_ok(f as *InterFrame) as i64 {
     if (f.mi_cols <= 0 || f.mi_cols > it.IT_MAX_MI) { return 0; }
     if (it.it_block_ok(f.mi_size) == 0) { return 0; }
     if (f.mi_row < 0 || f.mi_col < 0) { return 0; }
-    let is i64 as bh = it.it_num_8x8_high(f.mi_size);
-    let is i64 as bw = it.it_num_8x8_wide(f.mi_size);
-    if (f.mi_row + bh > f.mi_rows) { return 0; }
-    if (f.mi_col + bw > f.mi_cols) { return 0; }
+    if (f.mi_row >= f.mi_rows || f.mi_col >= f.mi_cols) { return 0; }
     if (f.filter < it.EIGHTTAP || f.filter > it.SWITCHABLE) { return 0; }
     return 1;
 }
@@ -146,6 +149,36 @@ fn inter_plane_max(f as *InterFrame, plane as i64,
     return errno.I_OK;
 }
 
+// Largest valid blockIdx for this plane and MiSize, from the plane block
+// get_plane_block_size selects (6.4.23). 6.4.21 predicts a luma block of
+// MiSize, and for MiSize < BLOCK_8X8 it predicts the enclosing 8x8 as 4x4
+// pieces; the same section raises MiSize to BLOCK_8X8 before asking for a
+// plane size. For a sub-8x8 MiSize that plane block holds four pieces on luma
+// or an unsubsampled chroma plane, two on an 8x4 or 4x8 chroma plane and one
+// on 4:2:0 chroma. A larger MiSize has more pieces, but 6.4.21 predicts it in
+// a single call with blockIdx 0.
+//
+// The index is capped at 3 because BlockMvs carries four luma pieces per
+// reference list. A bound of "0..3" alone would let a sub-8x8 call on a
+// subsampled chroma plane read blockIdx+1 or blockIdx+2 from the next 4x4
+// piece - or, for refList 1, from past the sixteen-entry array - and change
+// the motion vector of a conforming block.
+fn inter_block_idx_max(f as *InterFrame, plane as i64, out as *i64) as i64 {
+    if (cast(i64, f) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    let is i64 as pw with mut = 0;
+    let is i64 as ph with mut = 0;
+    let is i64 as rc = it.it_plane_block_dims(f.mi_size, plane, f.sub_x, f.sub_y,
+                                              &pw, &ph);
+    if (rc < 0) { return rc; }
+    let is i64 as limit = ((pw >> 2) * (ph >> 2)) - 1;
+    if (limit > 3) {
+        *out = 3;
+        return errno.I_OK;
+    }
+    *out = limit;
+    return errno.I_OK;
+}
+
 // 8.5.2.1's averaging functions. `/` truncates toward zero (specification
 // section 4.1), so the adjustment makes both signs round away from zero.
 fn inter_round_mv_q2(value as i64) as i64 {
@@ -176,11 +209,15 @@ fn inter_load_filter(filter as i64, taps as *i64) as i64 {
 // 1/8 luma samples. For luma, or for any block of BLOCK_8X8 or larger, the
 // block's own vector applies. Only a sub-8x8 block on a chroma plane averages
 // the four 4x4 vectors, and the averaging pattern is that plane's subsampling:
-//   (0,1) the two pieces of the left column, blockIdx and blockIdx + 2
-//   (1,0) the two pieces of the top row, blockIdx and blockIdx + 1
+//   (0,1) blockIdx and blockIdx + 2
+//   (1,0) blockIdx and blockIdx + 1
 //   (1,1) all four, regardless of blockIdx
 // The (0,0) case is the block's own vector. blockIdx is the 4x4 index inside
-// the plane block (0..3), exactly what 6.4.21 passes to predict_inter.
+// the plane block, exactly what 6.4.21 passes to predict_inter: a sub-8x8
+// luma block predicts the enclosing 8x8 in pieces 0..3, an 8x4 or 4x8 chroma
+// plane block has pieces 0..1, and a 4:2:0 chroma plane block has only piece
+// 0. Larger luma blocks are predicted in one call with blockIdx 0; the cap of
+// 3 is BlockMvs' four entries per reference list.
 fn inter_mv_select(f as *InterFrame, plane as i64, ref_list as i64,
                    block_idx as i64, block_mvs as *i32,
                    out_row as *i64, out_col as *i64) as i64 {
@@ -189,7 +226,10 @@ fn inter_mv_select(f as *InterFrame, plane as i64, ref_list as i64,
     if (cast(i64, out_row) == 0 || cast(i64, out_col) == 0) { return errno.I_BADPARAM; }
     if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
     if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
-    if (block_idx < 0 || block_idx > 3) { return errno.I_BADPARAM; }
+    let is i64 as max_idx with mut = 0;
+    let is i64 as rc = inter_block_idx_max(f, plane, &max_idx);
+    if (rc < 0) { return rc; }
+    if (block_idx < 0 || block_idx > max_idx) { return errno.I_BADPARAM; }
 
     let is i64 as base = (ref_list * 4 + block_idx) * 2;
     if (plane == 0 || f.mi_size >= it.BLOCK_8X8) {
@@ -462,16 +502,27 @@ fn inter_predict_taps(f as *InterFrame, plane as i64, refs as *InterRefPlane,
     let is i64 as maxh with mut = 0;
     let is i64 as rc with mut = inter_plane_max(f, plane, &maxw, &maxh);
     if (rc < 0) { return rc; }
-    if (x + w > maxw || y + h > maxh) { return errno.I_BADPARAM; }
-    if (block_idx < 0 || block_idx > 3) { return errno.I_BADPARAM; }
+    let is i64 as max_idx with mut = 0;
+    rc = inter_block_idx_max(f, plane, &max_idx);
+    if (rc < 0) { return rc; }
+    if (block_idx < 0 || block_idx > max_idx) { return errno.I_BADPARAM; }
 
-    // Check every reference list before predicting: a bad second reference
-    // must not leave the first prediction written into the frame. The stride
-    // test is the plane width inter_block_pred will read.
+    // Stage 5 integration change: the top-left sample must be inside the
+    // frame's mode-info grid, but the written block may extend past
+    // MiCols*8 / MiRows*8 by at most the caller's padding band (64 luma
+    // samples on each axis, halved for a subsampled plane). The caller
+    // allocated that band.
     let is i64 as psubx with mut = 0;
+    let is i64 as psuby with mut = 0;
     if (plane > 0) {
         psubx = f.sub_x;
+        psuby = f.sub_y;
     }
+    if (x < 0 || y < 0 || x >= maxw || y >= maxh) {
+        return errno.I_BADPARAM;
+    }
+    if (x + w > maxw + (64 >> psubx)) { return errno.I_BADPARAM; }
+    if (y + h > maxh + (64 >> psuby)) { return errno.I_BADPARAM; }
     if (inter_ref_fields_ok(refs[0].data, refs[0].stride,
                             refs[0].width, refs[0].height) == 0) {
         return errno.I_BADPARAM;
@@ -604,12 +655,18 @@ fn inter_predict_block(f as *InterFrame, plane as i64, refs as *InterRefPlane,
     if (rc < 0) { return rc; }
     if (out_stride < pw) { return errno.I_BADPARAM; }
 
-    // Same proof as inter_predict_taps, for the whole plane block.
+    // Stage 5 integration change, same proof as inter_predict_taps: start
+    // inside the grid, write into the caller's padded band.
     let is i64 as maxw with mut = 0;
     let is i64 as maxh with mut = 0;
     rc = inter_plane_max(f, plane, &maxw, &maxh);
     if (rc < 0) { return rc; }
-    if (x + pw > maxw || y + ph > maxh) { return errno.I_BADPARAM; }
+    if (x >= maxw || y >= maxh) { return errno.I_BADPARAM; }
+    let is i64 as psubx with mut = 0;
+    let is i64 as psuby with mut = 0;
+    if (plane > 0) { psubx = f.sub_x; psuby = f.sub_y; }
+    if (x + pw > maxw + (64 >> psubx)) { return errno.I_BADPARAM; }
+    if (y + ph > maxh + (64 >> psuby)) { return errno.I_BADPARAM; }
 
     let is [128]i64 as taps;
     rc = inter_load_filter(f.filter, cast(*i64, &taps));

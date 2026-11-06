@@ -50,6 +50,13 @@ struct type, which the Caustic reference calls out as a limitation. A caller
 that wants the pair type can hold it as a local variable under whatever
 alias it gave `inter_tables.cst`.
 
+`MvSet.best_row`/`best_col` have one producer: `mv_find_best_ref_mvs`
+(6.5.12), which sets all six fields. `mv_append_sub8x8_mvs` (6.5.14) writes
+only `nearest_*` and `near_*` and leaves `best_*` exactly as it found it,
+because 6.5.14 defines neither BestMv nor a replacement for it. BestMv for
+`read_mv` (6.4.19) is therefore always the whole-block 6.5.12 value; an
+append call must never be allowed to move it.
+
 Public entry points, all returning `I_OK` or a negative code:
 
 ```cst
@@ -76,6 +83,7 @@ mv_get_block_mv(ctx, r, c, ref_list, use_prev,
 mv_get_sub_block_mv(ctx, r, c, ref_list, delta_col, block,
                     &row, &col)                                  // 6.5.11
 mv_use_hp(delta_row, delta_col)                                  // 6.5.13
+mv_store_block_mvs(ctx, r, c, ref_list, block_mvs)               // 6.4.4
 ```
 
 `block` is the 4x4 index 0..3 inside a sub-8x8 luma block, or -1 for the
@@ -83,10 +91,16 @@ whole-block `find_mv_refs(ref_frame[j], -1)` call of 6.4.16. `ref_frame` is
 LAST_FRAME, GOLDEN_FRAME or ALTREF_FRAME.
 
 The helpers are exposed for callers and for isolated checks of one step.
-`mv_clamp_row`, `mv_clamp_col`, `mv_clamp_ref`, `mv_add_ref_list` and
-`mv_scale_mv` assume a context that `mv_ctx_ok` has already accepted (the
-three entry points run that check and validate their own arguments); every
-other public function validates whatever it is given.
+Only the three entry points above run `mv_ctx_ok` and validate the whole
+context; every helper here assumes a context and neighbour arrays that one of
+them has already accepted. `mv_clamp_row`, `mv_clamp_col`, `mv_clamp_ref` and
+`mv_scale_mv` read context fields (`mi_size`, `mi_row`, `mi_col`, `mi_rows`,
+`mi_cols`, `ref_sign_bias`) without a null check, and
+`mv_store_block_mvs` assumes the arrays are sized for `mi_rows`/`mi_cols`.
+The helpers still check the indices, flags and output pointers they are
+given; `mv_inside` and `mv_add_ref_list` additionally return 0 on a null
+context instead of dereferencing it. Passing a null context to any other
+helper is outside the contract.
 
 `mv_find_refs` always fills both candidate slots (unused ones stay at zero)
 and reports the real count in `list.count`; `mode_ctx` is
@@ -95,6 +109,34 @@ inter mode. Both candidates are clamped with `MV_BORDER` before return.
 
 `block_mvs` in `mv_append_sub8x8_mvs` is the current block's `BlockMvs`,
 laid out `[refList][4][2]`, row then column, i32.
+
+#### 6.4.4 write-back
+
+After the block decoder has chosen `BlockMvs[refList][0..3]` for a block, it
+stores that block's vectors into every mode-info cell the block covers, once
+per reference list:
+
+```
+Mvs[cell][refList]       = BlockMvs[refList][3]
+SubMvs[cell][refList][b] = BlockMvs[refList][b]    for b = 0..3
+```
+
+`mv_store_block_mvs(ctx, r, c, ref_list, block_mvs)` performs the write for
+one cell and one list. It is not optional bookkeeping: `find_mv_refs` reads
+these arrays back through `mv_get_sub_block_mv` for the first two neighbours
+and through `mv_get_block_mv` for the other six and for the previous frame's
+field, so a cell left unwritten makes the next block's candidate list differ
+from the specification's. 6.4.4 writes both reference lists of an inter
+block even when it is single-reference, which means the caller must present a
+zeroed `BlockMvs[1]` in that case. Intra cells are never passed to this
+helper: they keep the zeros of the frame-start clear, with
+`RefFrames[cell][0] = INTRA_FRAME` and `RefFrames[cell][1] = NONE` (6.4.15;
+both are numerically 0). `RefFrames` for the inter
+lists is written by the mode-info path, because it does not come from
+`BlockMvs`.
+
+The helper assumes a context accepted by one of the three entry points and
+checks the cell, the reference list and the pointer before writing.
 
 ### inter
 
@@ -111,6 +153,7 @@ struct InterRefPlane { data as *u8; stride, width, height as i64; }
 struct InterPos      { start_x, start_y, step_x, step_y as i64; }
 
 inter_load_filter(filter, taps)                                  // 128 i64
+inter_block_idx_max(f, plane, &max_idx)                          // 6.4.21/6.4.23
 inter_mv_select(f, plane, ref_list, block_idx, block_mvs,
                 &row, &col)                                      // 8.5.2.1
 inter_mv_clamp(f, plane, mv_row, mv_col, &row, &col)             // 8.5.2.2
@@ -157,6 +200,20 @@ provides exactly this separation through `coded_width`/`coded_height`.
 `x`/`y` are the plane coordinates of the block's top-left sample
 (`baseX`/`baseY` in 6.4.21).
 
+`block_idx` is validated against the plane block, not against the
+`BlockMvs` array alone. `inter_block_idx_max` derives the piece count
+`(pw/4)*(ph/4)` from the same `it_plane_block_dims` call and caps it at 3;
+`inter_mv_select` and `inter_predict_taps` both reject any other index. A
+sub-8x8 block therefore accepts 0..3 for luma or an unsubsampled chroma
+plane, 0..1 for an 8x4/4x8 chroma plane (subsampling 0,1 or 1,0) and 0 for
+4:2:0 chroma, so the `blockIdx+1` (subsampling 1,0) and `blockIdx+2`
+(subsampling 0,1) averages of 8.5.2.1 stay within the same reference list's
+four `BlockMvs` entries and can never read the next reference list. For
+`MiSize >= BLOCK_8X8`, 6.4.21 predicts the whole plane block in one call with
+`blockIdx` 0, whatever the number of 4x4 pieces the plane block holds (a
+subsampled chroma plane block may hold fewer than four), and the cap always
+admits 0.
+
 ## Conventions
 
 - **Units.** A stored MV component is 1/8 luma sample (7.4.13), including the
@@ -199,8 +256,9 @@ provides exactly this separation through `coded_width`/`coded_height`.
 ## Error contracts
 
 - `I_BADPARAM`: null pointer, a block or tile index outside its array, a
-  plane outside 0..2, a block size outside `BLOCK_4X4..BLOCK_64X64`, a region
-  that does not fit the mode-info grid, or a stride narrower than the region.
+  plane outside 0..2, a block size outside `BLOCK_4X4..BLOCK_64X64`, a
+  `block_idx` beyond the plane block's 4x4 pieces (see above), a region that
+  does not fit the mode-info grid, or a stride narrower than the region.
 - `I_DIMS`: a region wider/taller than 64 samples, or a scaling step above
   the specification's maximum of 80.
 - `I_UNSUPPORTED`: `SWITCHABLE` passed as a tap set.
@@ -313,19 +371,55 @@ decoders named above. Until a decoded frame is compared they remain
     (`h <= 64`, `yStep <= 80`). A larger step or block is rejected with
     `I_DIMS` rather than overrunning the caller's buffer.
 
-## Open review notes
+## Pending review notes
 
-- This branch is based on `main` and does not carry stage 4's
-  `recon_tables.cst`, so `inter_tables.cst` repeats `Round2`, `Clip3`,
-  `Clip1`, `Abs` (section 4.6) rather than importing them. When the branch is
-  rebased onto the reconstruction stage, decide whether to keep that
-  self-contained copy or alias `rt.recon_*`; the definitions are identical,
-  but having two copies is a style question, not a behavioural one.
+These are documentation, naming and minor-robustness items that do not change
+valid-stream output or memory safety. None was applied in this fix round.
+
+- Dead code and unused constants: `it_block_w` and `it_block_h` in
+  `inter_tables.cst`, and `REFS_PER_FRAME`, `MAX_REF_FRAMES`, `NONE`,
+  `GOLDEN_FRAME` and `SWITCHABLE_FILTERS` there, are not referenced by this
+  slice (`MAX_REF_FRAMES` appears only in a comment). They may be wanted by
+  the block decoder (stage 5-full) or by stage 4; a later pass should either
+  use or delete each one.
+- Stage 4 duplication is broader than "four section 4.6 helpers":
+  `inter_tables.cst` also repeats the `BLOCK_*` ids and the `num_8x8_*`
+  lookups that the reconstruction branch owns. When this branch is rebased
+  onto stage 4, decide the ownership of each group and alias `rt.recon_*`
+  for the arithmetic helpers instead of keeping two copies.
+- UNCONFIRMED item 8 is inaccurate as written. libvpx's
+  `vp9_append_sub8x8_mvs_for_idx` and FFmpeg's `find_ref_mvs` with `sb`
+  both scan the candidates in the same order as 6.5.14 - block 3 takes
+  `bmi[2]`/`mv[2]` first, then `bmi[1]`/`mv[1]`, `bmi[0]`/`mv[0]`, then the
+  reference-list candidates - so the sentence about a "slightly different
+  candidate scan" should be removed. The item stays a conformance-vector
+  note, not a disagreement between the specification and the references.
+- UNCONFIRMED item 1 is moot. `2 * mv` is even for every integer `mv`, so
+  the following `>> sy` is exact and there is no floor-versus-truncate
+  question; the item can be dropped or reduced to a sentence.
+- `inter_tables.cst`'s provenance note says the subsample-and-shift
+  derivation "reproduces every valid ss_size_lookup entry", but it also
+  returns a size for the `BLOCK_INVALID` entries (for example `BLOCK_8X16`
+  with subsampling 1,0). Section 7.4.3 makes those shapes non-conforming for
+  profile 1 and above, and profile 0 never reaches them, but the wording
+  should say the derivation does not detect `BLOCK_INVALID` rather than
+  implying table equivalence.
+- Public `inter_mv_scale` checks only `x >= 0` and `y >= 0`; it has no upper
+  bound tying `x`/`y` to the plane block, and the MV inputs are assumed to
+  be the already clamped output of 8.5.2.2. `inter_predict_taps` bounds the
+  region (`x + w <= maxw`, `y + h <= maxh`), but the scale/clamp arithmetic
+  is not independently bounded: the i64 products keep a conforming stream
+  exact, while a corrupt MV far outside the 1/8-sample range is not
+  re-validated here.
+- Negative-literal style: `mvpred.cst` writes `block < -1` in
+  `mv_get_sub_block_mv` and `mv_find_refs`, while the rest of the tree
+  spells negative constants as `0 - 1`. A style pass should make the two
+  spellings agree.
+- `inter_block_pred` checks `ref.stride >= last_x + 1` but neither it nor its
+  callers verify that the buffer holds `last_y + 1` rows of that stride. The
+  contract is the caller's (a reference plane is a full frame plane); a
+  reviewer may prefer to pass or check the row extent explicitly.
 - Function names follow the specification (`find_mv_refs`, `clamp_mv_ref`,
   ...) with a module prefix; the codec's house style elsewhere prefixes the
   module (`pred_`, `lf_`, `tx_`). A reviewer may prefer `mvpred_*` or
   `inter_*` throughout.
-- `MvSet.best_row`/`best_col` are set from the first slot by
-  `mv_append_sub8x8_mvs`, which 6.5.14 does not define. It lets one struct
-  travel through the caller; a reviewer may prefer a separate type for the
-  append result.
