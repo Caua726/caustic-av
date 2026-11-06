@@ -1,0 +1,147 @@
+// =======================================================
+// caustic-av/core/codec.cst
+// Codec identifiers shared by the demuxers, the decoders and the hub, plus
+// the neutral track description a demuxer fills.
+//
+// These identifiers belong to this library, not to a container. A container's
+// own CodecID string is carried separately in Track.codec_id exactly as the
+// file stores it (Matroska "V_VP9", "A_OPUS", "A_MPEG/L3"), while
+// Track.codec is the value decode.open dispatches on. The names reported by
+// codec_name use the Matroska spelling where one exists, so a diagnostic reads
+// the same as the codec tag a Matroska file carries and as the stage briefs.
+//
+// The values are append-only: they cross a module boundary, a caller may
+// store one, and an existing value never changes meaning.
+//
+// A Track is what demux.cst publishes and decode.cst consumes. It is all
+// scalars and borrowed pointers, so it copies by value and owns nothing. The
+// lifetime of codec_id and priv is the lifetime of the demuxer's source
+// bytes; a caller does not free them.
+//
+// Timebases: packet timestamps are in the track's own timebase, the pair
+// (timebase_num / timebase_den) seconds per tick, as core/packet.cst defines.
+// Matroska tracks use 1/1,000,000,000 (nanoseconds), raw MP3 uses
+// 1/sample_rate, and Ogg Opus uses 1/48000 (the granule rate RFC 7845
+// defines). A zero denominator means the container did not state a timebase
+// that this stage can interpret (an Ogg stream of a codec whose granule unit
+// is not parsed here); the timestamp is then whatever that module reported
+// and must not be converted.
+// =======================================================
+
+// ── Media types ─────────────────────────────────────────────────────
+
+let is i64 as TRACK_UNKNOWN  with imut = 0;
+let is i64 as TRACK_VIDEO    with imut = 1;
+let is i64 as TRACK_AUDIO    with imut = 2;
+let is i64 as TRACK_SUBTITLE with imut = 3;
+
+// ── Codec identifiers ───────────────────────────────────────────────
+
+let is i64 as CODEC_UNKNOWN with imut = 0;
+let is i64 as CODEC_VP8     with imut = 1;
+let is i64 as CODEC_VP9     with imut = 2;
+let is i64 as CODEC_AV1     with imut = 3;
+let is i64 as CODEC_H264    with imut = 4;   // V_MPEG4/ISO/AVC
+let is i64 as CODEC_H265    with imut = 5;   // V_MPEGH/ISO/HEVC
+let is i64 as CODEC_OPUS    with imut = 6;
+let is i64 as CODEC_VORBIS  with imut = 7;
+let is i64 as CODEC_FLAC    with imut = 8;
+let is i64 as CODEC_MP3     with imut = 9;   // A_MPEG/L3
+let is i64 as CODEC_AAC     with imut = 10;
+let is i64 as CODEC_PCM     with imut = 11;
+let is i64 as CODEC_THEORA  with imut = 12;
+
+// ── Track description ───────────────────────────────────────────────
+
+struct Track {
+    codec          as i64;   // CODEC_*, the value decode.open dispatches on
+    kind           as i64;   // TRACK_*, from the container where it says so
+    codec_id       as *u8;   // container CodecID, borrowed, not NUL-terminated
+    codec_id_len   as i64;   // bytes, 0 when the container has no id string
+    priv           as *u8;   // codec private bytes, borrowed, or null with 0
+    priv_len       as i64;   // bytes
+
+    width          as i64;   // video: coded pixel width, 0 otherwise
+    height         as i64;   // video: coded pixel height, 0 otherwise
+    rate           as i64;   // audio: output sample rate in Hz, 0 otherwise
+    channels       as i64;   // audio: interleaved channel count, 0 otherwise
+
+    pre_skip       as i64;   // >0 overrides the codec's own start skip; 0 keeps it
+    default_duration as i64; // container frame duration in ns, 0 when absent
+    codec_delay    as i64;   // container CodecDelay in ns, 0 when absent
+    seek_pre_roll  as i64;   // container SeekPreRoll in ns, 0 when absent
+
+    timebase_num   as i64;   // seconds per packet timestamp tick = num/den
+    timebase_den   as i64;   // 0 with num 0 means "container did not say"
+
+    number         as i64;   // container track id: TrackNumber, serial, or 1
+}
+
+// Zero every field, so a caller can build a Track without stale values.
+fn track_clear(t as *Track) as void {
+    if (cast(i64, t) == 0) { return; }
+    t.codec = CODEC_UNKNOWN;
+    t.kind = TRACK_UNKNOWN;
+    t.codec_id = cast(*u8, 0);
+    t.codec_id_len = 0;
+    t.priv = cast(*u8, 0);
+    t.priv_len = 0;
+    t.width = 0;
+    t.height = 0;
+    t.rate = 0;
+    t.channels = 0;
+    t.pre_skip = 0;
+    t.default_duration = 0;
+    t.codec_delay = 0;
+    t.seek_pre_roll = 0;
+    t.timebase_num = 0;
+    t.timebase_den = 0;
+    t.number = 0;
+}
+
+// ── Names ───────────────────────────────────────────────────────────
+
+// Canonical name for a codec identifier. The spelling is the Matroska
+// CodecID where one exists, because that is the identifier a file and this
+// library's notes both use. The pointer is static and NUL-terminated.
+fn codec_name(codec_id as i64) as *u8 {
+    if (codec_id == CODEC_VP8)    { return "V_VP8"; }
+    if (codec_id == CODEC_VP9)    { return "V_VP9"; }
+    if (codec_id == CODEC_AV1)    { return "V_AV1"; }
+    if (codec_id == CODEC_H264)   { return "V_MPEG4/ISO/AVC"; }
+    if (codec_id == CODEC_H265)   { return "V_MPEGH/ISO/HEVC"; }
+    if (codec_id == CODEC_OPUS)   { return "A_OPUS"; }
+    if (codec_id == CODEC_VORBIS) { return "A_VORBIS"; }
+    if (codec_id == CODEC_FLAC)   { return "A_FLAC"; }
+    if (codec_id == CODEC_MP3)    { return "A_MPEG/L3"; }
+    if (codec_id == CODEC_AAC)    { return "A_AAC"; }
+    if (codec_id == CODEC_PCM)    { return "A_PCM"; }
+    if (codec_id == CODEC_THEORA) { return "V_THEORA"; }
+    return "unknown";
+}
+
+// Media type a codec's decoder produces, independent of what a container's
+// TrackType field says. An unknown codec is TRACK_UNKNOWN.
+fn codec_kind(codec_id as i64) as i64 {
+    if (codec_id == CODEC_VP8)    { return TRACK_VIDEO; }
+    if (codec_id == CODEC_VP9)    { return TRACK_VIDEO; }
+    if (codec_id == CODEC_AV1)    { return TRACK_VIDEO; }
+    if (codec_id == CODEC_H264)   { return TRACK_VIDEO; }
+    if (codec_id == CODEC_H265)   { return TRACK_VIDEO; }
+    if (codec_id == CODEC_THEORA) { return TRACK_VIDEO; }
+    if (codec_id == CODEC_OPUS)   { return TRACK_AUDIO; }
+    if (codec_id == CODEC_VORBIS) { return TRACK_AUDIO; }
+    if (codec_id == CODEC_FLAC)   { return TRACK_AUDIO; }
+    if (codec_id == CODEC_MP3)    { return TRACK_AUDIO; }
+    if (codec_id == CODEC_AAC)    { return TRACK_AUDIO; }
+    if (codec_id == CODEC_PCM)    { return TRACK_AUDIO; }
+    return TRACK_UNKNOWN;
+}
+
+// Name of a media type, for diagnostics. Static and NUL-terminated.
+fn kind_name(kind as i64) as *u8 {
+    if (kind == TRACK_VIDEO)    { return "video"; }
+    if (kind == TRACK_AUDIO)    { return "audio"; }
+    if (kind == TRACK_SUBTITLE) { return "subtitle"; }
+    return "unknown";
+}
