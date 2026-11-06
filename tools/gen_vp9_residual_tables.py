@@ -299,8 +299,14 @@ def read_tokens(text):
     if rows[0] != [0] * 14:
         fail("cat_probs[0] is not the unused all-zero row")
     for cat in range(1, 7):
+        # Rows are right-padded with 0 to width 14; only the real values
+        # (the spec prints cat 1..5 with fewer than 14) must be probabilities.
+        seen_pad = False
         for e, v in enumerate(rows[cat]):
-            if v < 1 or v > 255:
+            if v == 0:
+                seen_pad = True
+                continue
+            if seen_pad or v < 1 or v > 255:
                 fail("cat_probs[%d][%d] = %d outside 1..255" % (cat, e, v))
     for row in rows:
         cat_probs.extend(row)
