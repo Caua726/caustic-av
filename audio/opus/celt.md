@@ -461,6 +461,10 @@ where stated.
     `e_prob_model` and the caps are named only in the reference. Reconcile
     the header wording when the generator is next edited; the values are
     unaffected.
+12. **`CELT_TBL_ALLOC_TEXT` joined into one literal for the compiler.**
+    Caustic has no implicit adjacent-string concatenation, so the eleven
+    pieces became a single line; the text is unchanged (717 characters, 231
+    values, same order and single spaces), no data change.
 
 Other low-severity notes carried over, no effect on valid-stream parsing or
 memory safety:
