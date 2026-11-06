@@ -1,0 +1,174 @@
+// =======================================================
+// caustic-av/video/vp9/bool.cst
+// The VP9 Boolean decoder of specification section 9.2.
+//
+// The specification describes the decoder one bit at a time: BoolValue is a
+// small integer, BoolRange starts at 255, and after each decision the range
+// is doubled while it is below 128, shifting a new bit into BoolValue each
+// time. This implementation keeps the same arithmetic in a 64-bit window
+// instead: the top byte of the window is BoolValue and the bits below it are
+// the lookahead already loaded from the byte stream. A decision is therefore
+// a compare and a subtract, and renormalisation shifts the whole window by
+// the number of leading zeros of the range (at most seven) in one step.
+//
+// Bounds: BoolMaxBits is 8*sz - 8 and is consumed eight bits at a time; the
+// window never loads a byte past the caller's slice. Renormalisation needs
+// at most seven lookahead bits, and those bits must have been coded, so a
+// request beyond the slice means the frame or header is truncated: the call
+// returns I_CORRUPT without having read past the end.
+//
+// Every failure is a negative i64. vp9_bool_read returns 0 or 1 on success;
+// vp9_bool_read_literal returns the value (0 or positive). A decoder may not
+// use either after vp9_bool_exit.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+struct Vp9Bool {
+    ptr      as *u8;   // caller-owned slice
+    len      as i64;   // slice length in bytes
+    pos      as i64;   // next byte to append to the window
+    win      as i64;   // 64-bit window, read as u64; top byte is BoolValue
+    win_bits as i64;   // valid bits at the top of the window
+    range    as i64;   // BoolRange, 1..255
+    budget   as i64;   // bits not yet appended to the window
+    exited   as i64;   // 1 after exit_bool
+}
+
+// Shifts needed to bring range into 128..255.
+fn _norm_shift(range as i64) as i64 {
+    let is i64 as r with mut = range;
+    let is i64 as s with mut = 0;
+    while (r < 128) { r = r << 1; s = s + 1; }
+    return s;
+}
+
+// Append bytes until at least `need` lookahead bits exist below the top
+// byte, or fail. `need` is at most seven (the largest renormalisation).
+fn _fill(b as *Vp9Bool, need as i64) as i64 {
+    while (b.win_bits - 8 < need) {
+        if (b.budget < 8) { return errno.I_CORRUPT; }
+        if (b.pos >= b.len) { return errno.I_CORRUPT; }
+        let is i64 as shift = 64 - b.win_bits - 8;
+        if (shift < 0) { return errno.I_CORRUPT; }
+        let is u64 as w with mut = cast(u64, b.win);
+        w = w | (cast(u64, b.ptr[b.pos]) << cast(u64, shift));
+        b.win = cast(i64, w);
+        b.win_bits = b.win_bits + 8;
+        b.budget = b.budget - 8;
+        b.pos = b.pos + 1;
+    }
+    return errno.I_OK;
+}
+
+// Initialisation (section 9.2.1): the first byte is BoolValue, the range is
+// 255, BoolMaxBits is 8*sz - 8, and the marker read with read_bool(128) must
+// be 0. sz must be at least 1.
+fn vp9_bool_init(b as *Vp9Bool, ptr as *u8, len as i64) as i64 {
+    if (cast(i64, b) == 0) { return errno.I_BADPARAM; }
+    b.ptr = ptr;
+    b.len = 0;
+    b.pos = 0;
+    b.win = 0;
+    b.win_bits = 0;
+    b.range = 0;
+    b.budget = 0;
+    b.exited = 0;
+
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len == 0) { return errno.I_CORRUPT; }
+    if (cast(i64, ptr) == 0) { return errno.I_BADPARAM; }
+
+    b.ptr = ptr;
+    b.len = len;
+    b.win = cast(i64, cast(u64, ptr[0]) << cast(u64, 56));
+    b.win_bits = 8;
+    b.pos = 1;
+    b.range = 255;
+    b.budget = 8 * (len - 1);
+
+    let is i64 as marker = vp9_bool_read(b, 128);
+    if (marker < 0) { return marker; }
+    if (marker != 0) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+// One arithmetic-coded bit with probability p (the chance of 0 is p/256).
+// Returns 0 or 1, or a negative code.
+fn vp9_bool_read(b as *Vp9Bool, p as i64) as i64 {
+    if (b.exited != 0) { return errno.I_CORRUPT; }
+    if (p < 1 || p > 255) { return errno.I_BADPARAM; }
+    if (b.win_bits < 8) { return errno.I_CORRUPT; }
+
+    let is i64 as split = 1 + (((b.range - 1) * p) >> 8);
+    let is i64 as top = cast(i64, cast(u64, b.win) >> cast(u64, 56));
+    let is i64 as bit with mut = 0;
+
+    if (top < split) {
+        b.range = split;
+        bit = 0;
+    } else {
+        let is u64 as w with mut = cast(u64, b.win);
+        w = w - (cast(u64, split) << cast(u64, 56));
+        b.win = cast(i64, w);
+        b.range = b.range - split;
+        bit = 1;
+    }
+
+    let is i64 as s = _norm_shift(b.range);
+    if (s > 0) {
+        let is i64 as r = _fill(b, s);
+        if (r < 0) { return r; }
+        let is u64 as w = cast(u64, b.win) << cast(u64, s);
+        b.win = cast(i64, w);
+        b.win_bits = b.win_bits - s;
+        b.range = b.range << s;
+    }
+    return bit;
+}
+
+// read_literal(n) (section 9.2.4): n bits, each read with p = 128, MSB first.
+fn vp9_bool_read_literal(b as *Vp9Bool, n as i64) as i64 {
+    if (n < 0 || n > 31) { return errno.I_BADPARAM; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as bit = vp9_bool_read(b, 128);
+        if (bit < 0) { return bit; }
+        v = (v << 1) | bit;
+        i = i + 1;
+    }
+    return v;
+}
+
+// Bits that have been coded but not yet consumed: the lookahead in the
+// window plus everything still in the slice.
+fn vp9_bool_remaining(b as *Vp9Bool) as i64 {
+    if (b.win_bits < 8) { return 0; }
+    return (b.win_bits - 8) + b.budget;
+}
+
+// Exit (section 9.2.3). Every remaining coded bit is padding and must be 0.
+// Nothing is read past the slice: loaded lookahead is inspected as a mask and
+// the bytes still in the slice are checked in place.
+fn vp9_bool_exit(b as *Vp9Bool) as i64 {
+    if (b.exited != 0) { return errno.I_CORRUPT; }
+    b.exited = 1;
+
+    if (b.budget != (b.len - b.pos) * 8) { return errno.I_CORRUPT; }
+
+    let is i64 as look = b.win_bits - 8;
+    if (look > 0) {
+        let is u64 as one = 1;
+        let is u64 as mask = ((one << cast(u64, look)) - 1)
+                             << cast(u64, 64 - b.win_bits);
+        if ((cast(u64, b.win) & mask) != 0) { return errno.I_CORRUPT; }
+    }
+
+    let is i64 as p with mut = b.pos;
+    while (p < b.len) {
+        if (b.ptr[p] != 0) { return errno.I_CORRUPT; }
+        p = p + 1;
+    }
+    return errno.I_OK;
+}
