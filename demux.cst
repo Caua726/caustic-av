@@ -103,8 +103,7 @@ let is i64 as DEMUX_PTS_LIMIT with imut = 4611686018427387904;
 
 struct Demux {
     kind  as i64;    // DEMUX_*, DEMUX_NONE after a failed open
-    src   as *u8;    // borrowed, for the whole Demux lifetime
-    len   as i64;
+    src   as *u8;    // borrowed source base, for raw MP3 packet views
     tracks as [64]codec.Track;
     track_count as i64;
 
@@ -120,7 +119,6 @@ struct Demux {
 fn _demux_clear(d as *Demux) as void {
     d.kind = DEMUX_NONE;
     d.src = cast(*u8, 0);
-    d.len = 0;
     d.track_count = 0;
     d.mp3_pts = 0;
 }
@@ -444,7 +442,6 @@ fn demux_open(d as *Demux, src as *u8, len as i64) as i64 {
 
     d.kind = kind;
     d.src = src;
-    d.len = len;
 
     let is i64 as r with mut = errno.I_OK;
     if (kind == DEMUX_MATROSKA) {
