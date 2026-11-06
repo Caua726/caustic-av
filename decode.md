@@ -158,7 +158,8 @@ struct Output {
   converted from samples at the output rate to the track timebase.
 
 `decode_receive` clears `out` before every attempt, so a zeroed view from a
-0-return is not mistaken for a frame.
+0-return is not mistaken for a frame. It only writes the record's fields, so an
+uninitialised `Output` is safe to pass.
 
 ## Timestamps
 
