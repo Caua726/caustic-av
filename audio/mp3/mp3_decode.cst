@@ -759,6 +759,7 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
         let is i64 as sfb with mut = 0;
         while (sfb < 22) {
             let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+            if (w < 0 || pos + w > 576) { return errno.I_CORRUPT; }
             let is i64 as i with mut = 0;
             while (i < w) {
                 if (m.spec[1 * 576 + pos + i] != 0.0) { max_band = sfb; }
@@ -771,6 +772,7 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
         sfb = 0;
         while (sfb < 22) {
             let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+            if (w < 0 || pos + w > 576) { return errno.I_CORRUPT; }
             let is i64 as use_int with mut = 0;
             if (ins != 0 && sfb > max_band) { use_int = 1; }
             let is i64 as ispos = m.scfl[1 * 22 + sfb];
@@ -812,6 +814,7 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
     sfb = short_start;
     while (sfb < 13) {
         let is i64 as w = tbl.mp3_sfb_short_width(row, sfb);
+        if (w < 0 || pos + 3 * w > 576) { return errno.I_CORRUPT; }
         let is i64 as win with mut = 0;
         while (win < 3) {
             let is i64 as i with mut = 0;
@@ -838,6 +841,7 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
     sfb = short_start;
     while (sfb < 13) {
         let is i64 as w = tbl.mp3_sfb_short_width(row, sfb);
+        if (w < 0 || pos + 3 * w > 576) { return errno.I_CORRUPT; }
         let is i64 as win with mut = 0;
         while (win < 3) {
             let is i64 as nz with mut = nz0;
@@ -867,6 +871,7 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
             sfb = 0;
             while (sfb < long_count) {
                 let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+                if (w < 0 || p + w > long_lines) { return errno.I_CORRUPT; }
                 let is i64 as i with mut = 0;
                 while (i < w) {
                     if (m.spec[1 * 576 + p + i] != 0.0) { max_long = sfb; }
@@ -880,6 +885,7 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
         sfb = 0;
         while (sfb < long_count) {
             let is i64 as w = tbl.mp3_sfb_long_width(row, sfb);
+            if (w < 0 || p + w > long_lines) { return errno.I_CORRUPT; }
             let is i64 as use_int with mut = 0;
             if (ins != 0 && nz_any == 0 && sfb > max_long) { use_int = 1; }
             let is i64 as ispos = m.scfl[1 * 22 + sfb];
