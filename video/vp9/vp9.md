@@ -44,6 +44,7 @@ guessing would be worse than refusing: `vp9_header_parse` returns
 | `video/vp9/adapt_bridge.cst` | Copies between `vp9_tables.cst`'s u8/byte layout and `adapt.cst`'s i64 layout and runs one `refresh_probs` (6.1.2). |
 | `video/vp9/loopfilter.cst` | The loop filter of 8.8. |
 | `video/vp9/decode.cst` | The frame driver: packet split and send/receive handoff, pool selection, tile walk, adaptation, loop filter, segment/mv bookkeeping, show_existing output, publish. |
+| `dsp/vp9_dsp.cst`, `dsp/vp9_dsp_abi.cst`, `dsp/x86_64/*` | The stage 9 acceleration table, its x86_64 kernels and the runtime dispatch. `dsp/vp9_dsp.md` is the design note. Scalar code stays in the video modules above and runs whenever a slot is null. |
 | `tools/gen_vp9_tables.py` | Reads the specification text, validates every table's dimension and value range, and writes `vp9_tables_data.cst`. |
 
 The specification used is `.work/vp9/spec/clean.txt` (VP9 Bitstream &
@@ -749,21 +750,31 @@ notes; none changes valid-stream output or memory safety.
   written**: the coordinator removed the test phase and instructed that no
   new test suites or oracle scripts be added. `tests/run.cst` is untouched.
   No stage 4-6 tests were added for the same reason.
-- Multi-threaded tile decoding, row-mt, SIMD/`dsp/` kernels and lossless
-  encoder support are not part of this stage.
+- Multi-threaded tile decoding, row-mt and lossless encoder support are not
+  part of this stage. The SIMD kernels live in `dsp/` from stage 9 on; see
+  the Stage 9 section below and `dsp/vp9_dsp.md`.
 
-### Stage 9/10 scope (not this stage)
+### Stage 9 scope (written, not this note's stages)
 
-Stage 6 stops at a correct single-threaded profile-0 frame decoder with the
-send/receive handoff. The plan's later stages own:
+Stage 9 adds `dsp/`: a runtime dispatch table and SSE2 kernels for
+intra V/H/TM, the residual add and the compound average, with the scalar
+kernels of `predict.cst`, `transforms.cst` and `inter.cst` left in place as
+the reference and as the fallback for every other mode, target and CPU. No
+public signature changed. The DC and directional predictors, the inverse
+transforms, the 8-tap interp filter and the loop filter stay scalar, and no
+AVX2 kernel exists because caustic's assembler has no AVX mnemonics; the
+reasons and the pending list are in `dsp/vp9_dsp.md`. Nothing was measured.
 
-- **Stage 9 (`stage9-perf`):** SIMD in `dsp/` and threads, written with no
-  fps measurement. The hot kernels are already isolated in `block.cst`,
-  `residual.cst`, `transforms.cst`, `predict.cst`, `inter.cst` and
-  `loopfilter.cst`; a threaded path must either keep the above/left context
-  lifetimes of 7.4 per tile row or serialise them, and must sum the
-  per-tile counts before `vp9_adapt_frame`. None of that changes the
-  bitstream semantics documented here.
+### Stage 10 scope (not this stage)
+
+Stage 10 owns the decode example and the public `decode` hub. The threaded
+path is the separate stage 9 slice: the hot kernels are already isolated in
+`block.cst`, `residual.cst`, `transforms.cst`, `predict.cst`, `inter.cst` and
+`loopfilter.cst`; a threaded path must either keep the above/left context
+lifetimes of 7.4 per tile row or serialise them, and must sum the
+per-tile counts before `vp9_adapt_frame`. None of that changes the
+bitstream semantics documented here.
+
 - **Stage 10 (`examples/decode.cst`):** the `.webm`/`.ogg`/`.opus`/`.mp3`
   decode example and the public `decode` hub. That layer maps
   `Vp9Output` to the shared `frame.Frame` plus color metadata, passes the
