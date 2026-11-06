@@ -173,8 +173,8 @@ One track, index 0:
 `demux_next` fills a `core/packet.Packet` whose `data` is a borrowed view:
 
 - **Matroska:** points into the source buffer. `pts`, `dts` and `duration`
-  are nanoseconds; `discard_padding` is nanoseconds; `keyframe` is the block
-  key flag.
+  are nanoseconds; `discard_padding` is nanoseconds and is present only on the
+  last lace of a BlockGroup; `keyframe` is the block key flag.
 - **Ogg:** points into the source buffer, or for a packet that spans pages
   into `Ogg.pktbuf`, the demuxer's own 64 KiB assembly buffer. `pts`/`dts`
   are the completing page's granule (for Opus, 48 kHz samples; granule -1 is
@@ -312,10 +312,10 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
    ceiling is not applied to an Ogg rate because Ogg Opus is fixed at 48000
    and the other mappings publish 0.
 6. `container/matroska.cst` attaches a BlockGroup's DiscardPadding to every
-   lace packet of that block. The demuxer forwards the field unchanged; a
-   consumer that applies it per packet trims a multi-lace block more than
-   once. Marking only the last lace belongs in the container module, which
-   this stage does not change.
+   lace packet of that block. `demux_next` clears it on all but the last lace
+   using `Mk.lace_index`/`Mk.lace_count`; that is a hub-side correction of a
+   container detail, and a future matroska change could mark the last lace
+   itself and let this wrapper disappear.
 
 ## Checks NOT RUN
 

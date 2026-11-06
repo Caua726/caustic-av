@@ -413,12 +413,11 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
   pts, so the error does not accumulate across blocks.
 - **Discard padding and lacing.** `container/matroska.cst` copies a
   BlockGroup's DiscardPadding onto every lace packet of that block, because a
-  lace packet is a view of the same block metadata. The decoder applies the
-  value to the last frame of each packet it receives, so a block that carries
-  several laces and a non-zero DiscardPadding would trim each lace. Valid
-  files put the padding at the end of the block, so only the last lace should
-  carry it. This is a container-level limitation, recorded as PENDING; fixing
-  it belongs in `container/matroska.cst` (marking the last lace), not here.
+  lace packet is a view of the same block metadata. `demux_next` clears it on
+  every lace except the block's last (`Mk.lace_index == Mk.lace_count`), so a
+  consumer sees the padding once, on the packet that really ends the block.
+  This matches the Matroska definition of the element and avoids trimming a
+  multi-lace block more than once.
 - **VP9 superframe timestamps.** Only the first output of a packet carries the
   container pts. A caller that needs per-frame times must derive them from
   `order` and the stream's frame rate, which this layer does not know.

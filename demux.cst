@@ -465,6 +465,16 @@ fn _next_matroska(d as *Demux, pkt as *packet.Packet) as i64 {
     if (pkt.track < 0 || cast(i64, pkt.track) >= d.track_count) {
         return errno.I_CORRUPT;
     }
+    // A BlockGroup's DiscardPadding is padding at the end of the block, but
+    // matroska.mk_next exposes the same block value on every lace packet.
+    // Only the last lace of a block may carry it; earlier laces are not the
+    // block's end. mk.lace_index is already past the returned lace and
+    // mk.lace_count is the block's lace count, so the comparison identifies
+    // the last one without re-parsing anything.
+    if (d.mk.lace_index < d.mk.lace_count) {
+        let is i64 as cr = packet.packet_set_discard_padding(pkt, 0);
+        if (cr < 0) { return cr; }
+    }
     return 1;
 }
 
