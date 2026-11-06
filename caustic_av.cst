@@ -3,6 +3,13 @@
 // The hub: one import that names the demuxer, the decoder dispatch and the
 // shared codec/track vocabulary, plus the shortest path through them.
 //
+// Importing this file also makes the imported aliases reachable through it,
+// as std/os.cst does: with `use "caustic_av.cst" as av;` a caller can write
+// av.demux.Demux, av.decode.Decoder, av.decode.Output, av.codec.CODEC_VP9,
+// av.codec.Track and av.errno.I_OK as well as the av_* wrappers below. The
+// wrappers are only a convenience; the modules keep their own names and
+// negative-i64 errors.
+//
 //   av_sniff(src, len)                 container kind by content
 //   av_open(d, src, len)               bind a demuxer
 //   av_next(d, pkt)                    next packet
