@@ -182,11 +182,14 @@ fn opus_decoder_skip_remaining(d as *OpusDecoder) as i64 {
     return d.skip_remaining;
 }
 
-// Replace the pre-skip and re-arm it. Used by a caller that crops a stream
-// (RFC 7845 Section 4.2) or reuses a decoder on a new logical stream.
+// Replace the pre-skip and re-arm it. It is a stream-start control: set it
+// before the first packet (or when cropping a stream). Calling it after
+// decoding has started begins a new skip at the current output position,
+// and it updates the stored OpusHead value so every getter agrees.
 fn opus_decoder_set_pre_skip(d as *OpusDecoder, samples as i64) as i64 {
     if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
     if (samples < 0) { return errno.I_BADPARAM; }
+    d.head.pre_skip = samples;
     d.pre_skip = samples;
     d.skip_remaining = samples;
     return errno.I_OK;
@@ -309,14 +312,22 @@ fn _opus_skip_redundancy(r as *rc.OpusRange, mode as i64) as i64 {
     if (bytes < 0) { return errno.I_CORRUPT; }
 
     // The reference disables a redundancy whose size does not leave the
-    // main frame at least as long as the bits already consumed. Such a
-    // packet is malformed; reject it rather than decode a desynchronised
-    // main frame.
+    // main frame at least as long as the bits already consumed. That is
+    // equivalent to redundancy_bytes > (8*len - tell) >> 3, the whole bytes
+    // remaining after the size symbol. Such a packet is malformed; reject
+    // it rather than decode a desynchronised main frame.
     let is i64 as main = len - bytes;
     if (main < 0) { return errno.I_CORRUPT; }
     let is i64 as now = rc.opus_range_tell(r);
     if (now < 0) { return now; }
     if (main * 8 < now) { return errno.I_CORRUPT; }
+
+    // Shrinking len redirects both cursors: the forward zero-fill boundary
+    // and the raw-bit reader at ptr[len - end_offs]. That is valid only if
+    // no raw bit has been read yet. SILK uses none, and uint(256) stays on
+    // the range-coded path, so this holds; a future change that reads raw
+    // bits before this point must reset end_offs and nend_bits as well.
+    if (r.end_offs != 0 || r.nend_bits != 0) { return errno.I_CORRUPT; }
 
     r.len = main;
     return errno.I_OK;

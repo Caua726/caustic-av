@@ -184,6 +184,12 @@ opus_decoder_set_end_trim(d, n)       // for the next packet
 opus_decoder_end_trim(d)
 ```
 
+`opus_decoder_set_pre_skip` is a stream-start control. It updates the
+stored `OpusHead` value, the reported pre-skip and `skip_remaining`, so
+there is one source of truth. Calling it after decoding has started begins
+a new skip at the current output position; a decoder reused for a new
+logical stream should call `opus_decoder_reset` or re-init instead.
+
 Output gain is the signed Q7.8 dB value from `OpusHead` (Section 5.1).
 RFC 7845 leaves applying it to the player, so the decoder stores the raw
 value and computes the linear factor `10^(gain/5120)` but leaves it off by
@@ -221,11 +227,19 @@ the SILK part of a SILK-only or Hybrid frame, the decoder checks the same
 bit budget as the reference: SILK-only assumes a redundancy header when at
 least 17 bits remain, and Hybrid reads the 12-bit probability flag when at
 least 37 bits remain. When redundancy is present, the decoder reads
-`celt_to_silk` and the size, then shrinks the range slice so the main CELT
-frame's raw bits stop before the redundant tail and its bit budget excludes
-it. The `celt_to_silk` flag is read so the header stays aligned but is not
-otherwise used, and the redundant frame itself is skipped. The main audio
-is therefore correct, but a stream that relies on redundancy for a clean
+`celt_to_silk` and the size, checks that the size fits in the whole bytes
+remaining after the size symbol (`(8*len - tell) >> 3`; a larger Hybrid
+size is `I_CORRUPT`), then shrinks the range slice so the main CELT frame's
+raw bits stop before the redundant tail and its bit budget excludes it. The
+shrink is safe at that point because no raw bit has been read yet
+(`end_offs == 0`, `nend_bits == 0`): SILK uses no raw bits, and
+`opus_range_uint(r, 256)` stays on the range-coded path. In `OpusRange`,
+`len` bounds both the forward zero-fill cursor and the raw-bit reader, so
+after the shrink every CELT budget and comparison uses `r.len * 8`, not the
+original frame length; `tell`/`tell_frac` are unaffected. The
+`celt_to_silk` flag is read so the header stays aligned but is not otherwise
+used, and the redundant frame itself is skipped. The main audio is
+therefore correct, but a stream that relies on redundancy for a clean
 transition will have a discontinuity rather than the reference's cross-faded
 redundant frame.
 
@@ -240,7 +254,14 @@ There is no PLC and no FEC output:
 
 - A zero-length frame (DTX or a lost frame, Section 3.2.1) is refused with
   `I_UNSUPPORTED` before any frame is decoded. The decoder never fills the
-  gap with silence, noise or a repeated frame.
+  gap with silence, noise or a repeated frame. The check walks every entry
+  in the parser's frame table, so a code-3 VBR packet with a zero-length
+  last frame is also refused before the first frame advances the range
+  state. A zero-octet *packet* is different: `opus_packet_parse` returns
+  `I_CORRUPT` for it under [R1].
+- `I_UNSUPPORTED` from a zero-length frame is a policy refusal, not a
+  corruption signal: a valid transition stream that uses DTX will not
+  decode at all with this decoder.
 - `opus_decode_lost(d)` always returns `I_UNSUPPORTED`.
 - `opus_decode_fec(...)` always returns `I_UNSUPPORTED`.
 - LBRR (low-bitrate redundancy) frames inside a SILK payload are parsed so
