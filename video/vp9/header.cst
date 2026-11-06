@@ -1,0 +1,1405 @@
+// =======================================================
+// caustic-av/video/vp9/header.cst
+// VP9 superframe split (Annex B), uncompressed header (section 6.2) and
+// compressed header (section 6.3). Tiles and frames are not decoded here:
+// the module stops at the byte offset where tile data begins and at the
+// per-tile size table.
+//
+// Only profile 0 is accepted. Profiles 1, 2 and 3 exist in the syntax, but
+// supporting them means 4:2:2/4:4:4 or 10/12-bit output, which this library
+// does not produce yet; a frame that announces one returns I_UNSUPPORTED
+// rather than being guessed at.
+//
+// The uncompressed header is parsed with core/bits (most-significant bit
+// first, every read bounds-checked). The compressed header is parsed with
+// video/vp9/bool over exactly header_size_in_bytes, so a malformed header
+// cannot make the decoder read into the tile data.
+//
+// Persistent state lives in video/vp9/vp9_tables.cst (Vp9State): reference
+// geometry and format, the loop-filter deltas, the segmentation data and the
+// four probability contexts. This module reads and updates that state; the
+// caller owns it. vp9_header_parse never calls vp9_state_publish, because a
+// frame may only be referenced after its tiles have been reconstructed.
+//
+// Note on the probability blobs: until tools/gen_vp9_tables.py has written
+// them, Vp9State.probs_pending is 1. Header parsing still succeeds and every
+// field below is valid, but the probability context is zeroed and must not
+// be used to decode tiles. vp9_header_parse returns 0 either way; callers
+// check st.probs_pending.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "../../core/bits.cst" as bits;
+use "bool.cst" as vb;
+use "vp9_tables.cst" as t;
+
+// Largest dimension a 16-bit frame_width_minus_1 can express.
+let is i64 as VP9_MAX_DIM with imut = 65536;
+
+// ── result structures ───────────────────────────────────────────────
+
+// One tile's byte range inside the frame slice. The last tile has no size
+// field and extends to the end of the slice (section 6.4).
+struct Vp9Tiles {
+    count as i64;
+    off   as [256]i64;
+    len   as [256]i64;
+}
+
+struct Vp9Superframe {
+    count      as i64;          // 1..8
+    ptr        as [8]*u8;       // each coded frame
+    len        as [8]i64;
+    index_size as i64;          // 0 when the chunk is a single frame
+}
+
+struct Vp9Header {
+    // Frame sync and general flags.
+    profile               as i64;
+    show_existing_frame   as i64;
+    frame_to_show_map_idx as i64;
+    frame_type            as i64;
+    show_frame            as i64;
+    error_resilient_mode  as i64;
+    intra_only            as i64;
+    reset_frame_context   as i64;
+    refresh_frame_flags   as i64;
+    refresh_frame_context as i64;
+    frame_parallel_decoding_mode as i64;
+    frame_context_idx     as i64;
+    frame_is_intra        as i64;
+
+    // Color configuration (profile 0: 8-bit 4:2:0).
+    bit_depth     as i64;
+    color_space   as i64;
+    color_range   as i64;
+    subsampling_x as i64;
+    subsampling_y as i64;
+
+    // Frame and render size, and the derived image dimensions.
+    width         as i64;
+    height        as i64;
+    render_width  as i64;
+    render_height as i64;
+    mi_cols       as i64;
+    mi_rows       as i64;
+    sb64_cols     as i64;
+    sb64_rows     as i64;
+
+    // Inter frame reference selection.
+    ref_frame_idx        as [3]i64;
+    ref_frame_sign_bias  as [4]i64;
+    allow_high_precision_mv as i64;
+    interpolation_filter as i64;
+
+    // Loop filter.
+    lf_level         as i64;
+    lf_sharpness     as i64;
+    lf_delta_enabled as i64;
+    lf_delta_update  as i64;
+    lf_ref_delta     as [4]i64;
+    lf_mode_delta    as [2]i64;
+
+    // Quantization.
+    base_q_idx    as i64;
+    delta_q_y_dc  as i64;
+    delta_q_uv_dc as i64;
+    delta_q_uv_ac as i64;
+    lossless      as i64;
+
+    // Segmentation.
+    seg_enabled         as i64;
+    seg_update_map      as i64;
+    seg_tree_prob       as [7]u8;
+    seg_temporal_update as i64;
+    seg_pred_prob       as [3]u8;
+    seg_update_data     as i64;
+    seg_abs_or_delta    as i64;
+    seg_feature_enabled as [8][4]i64;
+    seg_feature_data    as [8][4]i64;
+
+    // Tiles.
+    tile_cols_log2       as i64;
+    tile_rows_log2       as i64;
+    header_size_in_bytes as i64;   // compressed header size, 0 for show-existing
+    uncompressed_bytes   as i64;   // byte offset just past the uncompressed header
+    tile_data_off        as i64;   // first tile byte
+    has_compressed_header as i64;
+    tiles as Vp9Tiles;
+
+    // Compressed header state stages 4-6 use.
+    tx_mode        as i64;
+    reference_mode as i64;
+    comp_fixed_ref as i64;
+    comp_var_ref   as [2]i64;
+
+    // Frame-level bookkeeping for the next frame.
+    last_frame_type    as i64;
+    probs_pending      as i64;
+    use_prev_frame_mvs as i64;
+    seg_map_clear      as i64;
+}
+
+// ── small helpers ───────────────────────────────────────────────────
+
+fn _zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+fn _header_zero(h as *Vp9Header) as void {
+    _zero(cast(*u8, h), sizeof(Vp9Header));
+}
+
+fn _u8_at(data as *u8, off as i64) as i64 {
+    return cast(i64, data[off]);
+}
+
+// s(n) (section 4.9.2): n value bits then one sign bit.
+fn _read_s(b as *bits.BitsMsb, n as i64) as i64 {
+    let is i64 as v = bits.bits_msb_read(b, n);
+    if (v < 0) { return v; }
+    let is i64 as s = bits.bits_msb_bit(b);
+    if (s < 0) { return s; }
+    if (s == 1) { return 0 - v; }
+    return v;
+}
+
+// read_prob (section 6.2.12): coded flag, then eight bits, else 255.
+fn _read_prob(b as *bits.BitsMsb) as i64 {
+    let is i64 as coded = bits.bits_msb_bit(b);
+    if (coded < 0) { return coded; }
+    if (coded == 0) { return 255; }
+    let is i64 as p = bits.bits_msb_read(b, 8);
+    if (p < 0) { return p; }
+    if (p == 0) { return errno.I_CORRUPT; }
+    return p;
+}
+
+// Trailing bits (section 6.1.1): zero bits to a byte boundary.
+fn _skip_trailing(b as *bits.BitsMsb) as i64 {
+    while ((bits.bits_msb_consumed(b) & 7) != 0) {
+        let is i64 as bit = bits.bits_msb_bit(b);
+        if (bit < 0) { return bit; }
+        if (bit != 0) { return errno.I_CORRUPT; }
+    }
+    return errno.I_OK;
+}
+
+fn _read_sync(b as *bits.BitsMsb) as i64 {
+    let is i64 as b0 = bits.bits_msb_read(b, 8);
+    if (b0 < 0) { return b0; }
+    let is i64 as b1 = bits.bits_msb_read(b, 8);
+    if (b1 < 0) { return b1; }
+    let is i64 as b2 = bits.bits_msb_read(b, 8);
+    if (b2 < 0) { return b2; }
+    if (b0 != t.VP9_SYNC_0 || b1 != t.VP9_SYNC_1 || b2 != t.VP9_SYNC_2) {
+        return errno.I_BADMAGIC;
+    }
+    return errno.I_OK;
+}
+
+// ── superframe split (Annex B) ──────────────────────────────────────
+
+// Split one chunk into 1..8 coded frames. A chunk that does not end with a
+// valid superframe index is a single frame (B.4), so this only fails when an
+// index is present and inconsistent with the chunk: a zero-sized frame, a
+// size running past the frame area, or sizes whose sum leaves a gap.
+fn vp9_superframe_split(data as *u8, len as i64,
+                        sf as *Vp9Superframe) as i64 {
+    if (cast(i64, sf) == 0) { return errno.I_BADPARAM; }
+    sf.count = 0;
+    sf.index_size = 0;
+    let is i64 as i with mut = 0;
+    while (i < 8) { sf.ptr[i] = cast(*u8, 0); sf.len[i] = 0; i = i + 1; }
+
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len == 0) { return errno.I_EOF; }
+    if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
+
+    // The fallback is always the whole chunk as one frame.
+    sf.count = 1;
+    sf.ptr[0] = data;
+    sf.len[0] = len;
+
+    let is i64 as last = _u8_at(data, len - 1);
+    if (t.vp9_is_superframe_marker(last) == 0) { return errno.I_OK; }
+
+    let is i64 as sz_bytes = ((last >> 3) & 3) + 1;
+    let is i64 as n = (last & 7) + 1;
+    let is i64 as index_size = 2 + n * sz_bytes;
+    if (index_size > len) { return errno.I_OK; }   // too short to be an index
+
+    let is i64 as start = len - index_size;
+    if (_u8_at(data, start) != last) { return errno.I_OK; }
+
+    let is [8]i64 as sizes;
+    let is i64 as pos with mut = start + 1;
+    let is i64 as total with mut = 0;
+    i = 0;
+    while (i < n) {
+        let is i64 as v with mut = 0;
+        let is i64 as k with mut = 0;
+        // Annex B writes frame_sizes with the f() descriptor, but the
+        // reference encoder stores them least-significant byte first and
+        // both reference decoders read them that way. See errata E3.
+        while (k < sz_bytes) {
+            v = v | (_u8_at(data, pos) << (k * 8));
+            pos = pos + 1;
+            k = k + 1;
+        }
+        if (v <= 0) { return errno.I_CORRUPT; }
+        sizes[i] = v;
+        total = total + v;
+        i = i + 1;
+    }
+    if (pos != len - 1) { return errno.I_CORRUPT; }
+    if (total != start) { return errno.I_CORRUPT; }
+
+    pos = 0;
+    i = 0;
+    while (i < n) {
+        sf.ptr[i] = cast(*u8, cast(i64, data) + pos);
+        sf.len[i] = sizes[i];
+        pos = pos + sizes[i];
+        i = i + 1;
+    }
+    sf.count = n;
+    sf.index_size = index_size;
+    return errno.I_OK;
+}
+
+// ── uncompressed header ─────────────────────────────────────────────
+
+// Color config for profile 0 (section 6.2.2). Profile 0 allows only 8-bit
+// 4:2:0; an RGB color space is a conformance violation.
+fn _color_config(b as *bits.BitsMsb, h as *Vp9Header) as i64 {
+    h.bit_depth = 8;
+    h.subsampling_x = 1;
+    h.subsampling_y = 1;
+    let is i64 as cs = bits.bits_msb_read(b, 3);
+    if (cs < 0) { return cs; }
+    if (cs == 7) { return errno.I_CORRUPT; }   // CS_RGB in profile 0
+    h.color_space = cs;
+    let is i64 as r = bits.bits_msb_bit(b);
+    if (r < 0) { return r; }
+    h.color_range = r;
+    return errno.I_OK;
+}
+
+fn _compute_image_size(st as *t.Vp9State, h as *Vp9Header) as void {
+    h.mi_cols = (h.width + 7) >> 3;
+    h.mi_rows = (h.height + 7) >> 3;
+    h.sb64_cols = (h.mi_cols + 7) >> 3;
+    h.sb64_rows = (h.mi_rows + 7) >> 3;
+
+    let is i64 as first with mut = 0;
+    if (st.have_last_frame == 0) { first = 1; }
+
+    if (first == 1 || h.width != st.last_width
+        || h.height != st.last_height) {
+        h.seg_map_clear = 1;
+    } else {
+        h.seg_map_clear = 0;
+    }
+
+    h.use_prev_frame_mvs = 0;
+    if (first == 0 && h.width == st.last_width
+        && h.height == st.last_height && st.last_show_frame == 1
+        && h.error_resilient_mode == 0 && h.frame_is_intra == 0) {
+        h.use_prev_frame_mvs = 1;
+    }
+}
+
+// frame_size (section 6.2.3).
+fn _frame_size(st as *t.Vp9State, b as *bits.BitsMsb,
+               h as *Vp9Header) as i64 {
+    let is i64 as w = bits.bits_msb_read(b, 16);
+    if (w < 0) { return w; }
+    let is i64 as hh = bits.bits_msb_read(b, 16);
+    if (hh < 0) { return hh; }
+    h.width = w + 1;
+    h.height = hh + 1;
+    if (h.width > VP9_MAX_DIM || h.height > VP9_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    _compute_image_size(st, h);
+    return errno.I_OK;
+}
+
+// render_size (section 6.2.4).
+fn _render_size(b as *bits.BitsMsb, h as *Vp9Header) as i64 {
+    let is i64 as diff = bits.bits_msb_bit(b);
+    if (diff < 0) { return diff; }
+    if (diff == 0) {
+        h.render_width = h.width;
+        h.render_height = h.height;
+        return errno.I_OK;
+    }
+    let is i64 as w = bits.bits_msb_read(b, 16);
+    if (w < 0) { return w; }
+    let is i64 as hh = bits.bits_msb_read(b, 16);
+    if (hh < 0) { return hh; }
+    h.render_width = w + 1;
+    h.render_height = hh + 1;
+    if (h.render_width > VP9_MAX_DIM || h.render_height > VP9_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    return errno.I_OK;
+}
+
+// The selected reference must agree with this frame in profile, bit depth,
+// chroma subsampling and color space (section 7.2).
+fn _ref_format_ok(st as *t.Vp9State, h as *Vp9Header, idx as i64) as i64 {
+    if (st.ref_profile[idx] != h.profile) { return 0; }
+    if (st.ref_bit_depth[idx] != h.bit_depth) { return 0; }
+    if (st.ref_ss_x[idx] != h.subsampling_x) { return 0; }
+    if (st.ref_ss_y[idx] != h.subsampling_y) { return 0; }
+    if (st.ref_color_space[idx] != h.color_space) { return 0; }
+    return 1;
+}
+
+// frame_size_with_refs (section 6.2.5). Only a frame published by
+// vp9_state_publish may be referenced.
+fn _frame_size_with_refs(st as *t.Vp9State, b as *bits.BitsMsb,
+                         h as *Vp9Header) as i64 {
+    let is i64 as found with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 3 && found == 0) {
+        let is i64 as f = bits.bits_msb_bit(b);
+        if (f < 0) { return f; }
+        if (f == 1) {
+            let is i64 as idx = h.ref_frame_idx[i];
+            if (idx < 0 || idx >= 8) { return errno.I_CORRUPT; }
+            if (st.ref_valid[idx] == 0) { return errno.I_CORRUPT; }
+            if (_ref_format_ok(st, h, idx) == 0) { return errno.I_CORRUPT; }
+            h.width = st.ref_width[idx];
+            h.height = st.ref_height[idx];
+            found = 1;
+        }
+        i = i + 1;
+    }
+    if (found == 0) {
+        let is i64 as r = _frame_size(st, b, h);
+        if (r < 0) { return r; }
+    } else {
+        _compute_image_size(st, h);
+    }
+    return _render_size(b, h);
+}
+
+// read_interpolation_filter (section 6.2.7).
+fn _read_interp_filter(b as *bits.BitsMsb, h as *Vp9Header) as i64 {
+    let is i64 as sw = bits.bits_msb_bit(b);
+    if (sw < 0) { return sw; }
+    if (sw == 1) {
+        h.interpolation_filter = t.VP9_SWITCHABLE;
+        return errno.I_OK;
+    }
+    let is i64 as raw = bits.bits_msb_read(b, 2);
+    if (raw < 0) { return raw; }
+    h.interpolation_filter = t.vp9_literal_to_type(raw);
+    return errno.I_OK;
+}
+
+// Loop filter (section 6.2.8). Deltas not updated in this frame keep the
+// value the state carried in, which setup_past_independence may have reset.
+fn _loop_filter(st as *t.Vp9State, b as *bits.BitsMsb,
+                h as *Vp9Header) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 4) {
+        h.lf_ref_delta[i] = st.lf_ref_delta[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        h.lf_mode_delta[i] = st.lf_mode_delta[i];
+        i = i + 1;
+    }
+
+    let is i64 as level = bits.bits_msb_read(b, 6);
+    if (level < 0) { return level; }
+    let is i64 as sharp = bits.bits_msb_read(b, 3);
+    if (sharp < 0) { return sharp; }
+    let is i64 as enabled = bits.bits_msb_bit(b);
+    if (enabled < 0) { return enabled; }
+    h.lf_level = level;
+    h.lf_sharpness = sharp;
+    h.lf_delta_enabled = enabled;
+    h.lf_delta_update = 0;
+
+    if (enabled == 1) {
+        let is i64 as update = bits.bits_msb_bit(b);
+        if (update < 0) { return update; }
+        h.lf_delta_update = update;
+        if (update == 1) {
+            i = 0;
+            while (i < 4) {
+                let is i64 as u = bits.bits_msb_bit(b);
+                if (u < 0) { return u; }
+                if (u == 1) {
+                    let is i64 as v = _read_s(b, 6);
+                    if (v < 0) { return v; }
+                    h.lf_ref_delta[i] = v;
+                    st.lf_ref_delta[i] = v;
+                }
+                i = i + 1;
+            }
+            i = 0;
+            while (i < 2) {
+                let is i64 as u = bits.bits_msb_bit(b);
+                if (u < 0) { return u; }
+                if (u == 1) {
+                    let is i64 as v = _read_s(b, 6);
+                    if (v < 0) { return v; }
+                    h.lf_mode_delta[i] = v;
+                    st.lf_mode_delta[i] = v;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return errno.I_OK;
+}
+
+// Quantization (sections 6.2.9 and 6.2.10).
+fn _quantization(b as *bits.BitsMsb, h as *Vp9Header) as i64 {
+    let is i64 as base = bits.bits_msb_read(b, 8);
+    if (base < 0) { return base; }
+    h.base_q_idx = base;
+
+    let is i64 as i with mut = 0;
+    let is [3]i64 as out;
+    while (i < 3) {
+        let is i64 as coded = bits.bits_msb_bit(b);
+        if (coded < 0) { return coded; }
+        let is i64 as v with mut = 0;
+        if (coded == 1) {
+            v = _read_s(b, 4);
+            if (v < 0) { return v; }
+        }
+        out[i] = v;
+        i = i + 1;
+    }
+    h.delta_q_y_dc = out[0];
+    h.delta_q_uv_dc = out[1];
+    h.delta_q_uv_ac = out[2];
+    h.lossless = 0;
+    if (base == 0 && out[0] == 0 && out[1] == 0 && out[2] == 0) {
+        h.lossless = 1;
+    }
+    return errno.I_OK;
+}
+
+fn _seg_copy_from_state(st as *t.Vp9State, h as *Vp9Header) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    while (i < 7) {
+        h.seg_tree_prob[i] = st.seg_tree_prob[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        h.seg_pred_prob[i] = st.seg_pred_prob[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8) {
+        j = 0;
+        while (j < 4) {
+            h.seg_feature_enabled[i][j] = st.seg_feature_enabled[i][j];
+            h.seg_feature_data[i][j] = st.seg_feature_data[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn _seg_store_to_state(st as *t.Vp9State, h as *Vp9Header) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    while (i < 7) {
+        st.seg_tree_prob[i] = h.seg_tree_prob[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        st.seg_pred_prob[i] = h.seg_pred_prob[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8) {
+        j = 0;
+        while (j < 4) {
+            st.seg_feature_enabled[i][j] = h.seg_feature_enabled[i][j];
+            st.seg_feature_data[i][j] = h.seg_feature_data[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Segmentation params (section 6.2.11). Values not updated persist; a
+// segment feature update with a sign bit set is a conformance violation
+// when segmentation_abs_or_delta_update is 1.
+fn _segmentation(st as *t.Vp9State, b as *bits.BitsMsb,
+                 h as *Vp9Header) as i64 {
+    _seg_copy_from_state(st, h);
+
+    let is i64 as enabled = bits.bits_msb_bit(b);
+    if (enabled < 0) { return enabled; }
+    h.seg_enabled = enabled;
+    h.seg_update_map = 0;
+    h.seg_temporal_update = 0;
+    h.seg_update_data = 0;
+    h.seg_abs_or_delta = st.seg_abs_or_delta;
+
+    if (enabled == 1) {
+        let is i64 as um = bits.bits_msb_bit(b);
+        if (um < 0) { return um; }
+        h.seg_update_map = um;
+        if (um == 1) {
+            let is i64 as i with mut = 0;
+            while (i < 7) {
+                let is i64 as p = _read_prob(b);
+                if (p < 0) { return p; }
+                h.seg_tree_prob[i] = cast(u8, p);
+                i = i + 1;
+            }
+            let is i64 as tmp = bits.bits_msb_bit(b);
+            if (tmp < 0) { return tmp; }
+            h.seg_temporal_update = tmp;
+            i = 0;
+            while (i < 3) {
+                if (tmp == 1) {
+                    let is i64 as p = _read_prob(b);
+                    if (p < 0) { return p; }
+                    h.seg_pred_prob[i] = cast(u8, p);
+                } else {
+                    h.seg_pred_prob[i] = cast(u8, 255);
+                }
+                i = i + 1;
+            }
+        }
+
+        let is i64 as ud = bits.bits_msb_bit(b);
+        if (ud < 0) { return ud; }
+        h.seg_update_data = ud;
+        if (ud == 1) {
+            let is i64 as absolute = bits.bits_msb_bit(b);
+            if (absolute < 0) { return absolute; }
+            h.seg_abs_or_delta = absolute;
+
+            let is i64 as i with mut = 0;
+            let is i64 as j with mut = 0;
+            while (i < 8) {
+                j = 0;
+                while (j < 4) {
+                    let is i64 as fe = bits.bits_msb_bit(b);
+                    if (fe < 0) { return fe; }
+                    h.seg_feature_enabled[i][j] = fe;
+                    let is i64 as v with mut = 0;
+                    if (fe == 1) {
+                        let is i64 as nb = t.vp9_segmentation_feature_bits(j);
+                        if (nb > 0) {
+                            v = bits.bits_msb_read(b, nb);
+                            if (v < 0) { return v; }
+                        }
+                        if (t.vp9_segmentation_feature_signed(j) == 1) {
+                            let is i64 as s = bits.bits_msb_bit(b);
+                            if (s < 0) { return s; }
+                            if (s == 1) {
+                                if (absolute == 1) { return errno.I_CORRUPT; }
+                                v = 0 - v;
+                            }
+                        }
+                    }
+                    h.seg_feature_data[i][j] = v;
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+        }
+    }
+
+    _seg_store_to_state(st, h);
+    return errno.I_OK;
+}
+
+// calc_min_log2_tile_cols (section 6.2.14).
+fn _min_log2_tile_cols(sb64_cols as i64) as i64 {
+    let is i64 as min with mut = 0;
+    while ((t.VP9_MAX_TILE_WIDTH_B64 << min) < sb64_cols) { min = min + 1; }
+    return min;
+}
+
+// calc_max_log2_tile_cols (section 6.2.14).
+fn _max_log2_tile_cols(sb64_cols as i64) as i64 {
+    let is i64 as max with mut = 1;
+    while ((sb64_cols >> max) >= t.VP9_MIN_TILE_WIDTH_B64) { max = max + 1; }
+    return max - 1;
+}
+
+fn _tile_info(b as *bits.BitsMsb, h as *Vp9Header) as i64 {
+    let is i64 as min = _min_log2_tile_cols(h.sb64_cols);
+    let is i64 as max = _max_log2_tile_cols(h.sb64_cols);
+    let is i64 as cols with mut = min;
+    while (cols < max) {
+        let is i64 as inc = bits.bits_msb_bit(b);
+        if (inc < 0) { return inc; }
+        if (inc == 1) { cols = cols + 1; }
+        else { break; }
+    }
+    let is i64 as rows0 = bits.bits_msb_bit(b);
+    if (rows0 < 0) { return rows0; }
+    let is i64 as rows with mut = rows0;
+    if (rows0 == 1) {
+        let is i64 as inc = bits.bits_msb_bit(b);
+        if (inc < 0) { return inc; }
+        rows = rows + inc;
+    }
+    if (cols > t.VP9_MAX_TILE_COLS_LOG2) { return errno.I_CORRUPT; }
+    if (rows > t.VP9_MAX_TILE_ROWS_LOG2) { return errno.I_CORRUPT; }
+    h.tile_cols_log2 = cols;
+    h.tile_rows_log2 = rows;
+    return errno.I_OK;
+}
+
+// The uncompressed header, up to and including header_size_in_bytes.
+fn _uncompressed(st as *t.Vp9State, b as *bits.BitsMsb,
+                 h as *Vp9Header) as i64 {
+    let is i64 as marker = bits.bits_msb_read(b, 2);
+    if (marker < 0) { return marker; }
+    if (marker != 2) { return errno.I_BADMAGIC; }
+
+    let is i64 as low = bits.bits_msb_bit(b);
+    if (low < 0) { return low; }
+    let is i64 as high = bits.bits_msb_bit(b);
+    if (high < 0) { return high; }
+    h.profile = (high << 1) + low;
+    if (h.profile != 0) { return errno.I_UNSUPPORTED; }
+
+    h.last_frame_type = st.last_frame_type;
+
+    let is i64 as show_existing = bits.bits_msb_bit(b);
+    if (show_existing < 0) { return show_existing; }
+    h.show_existing_frame = show_existing;
+    if (show_existing == 1) {
+        let is i64 as idx = bits.bits_msb_read(b, 3);
+        if (idx < 0) { return idx; }
+        if (st.ref_valid[idx] == 0) { return errno.I_CORRUPT; }
+        h.frame_to_show_map_idx = idx;
+        h.frame_type = st.last_frame_type;
+        h.intra_only = st.last_intra_only;
+        h.show_frame = 1;
+        h.refresh_frame_flags = 0;
+        h.lf_level = 0;
+        h.header_size_in_bytes = 0;
+        return errno.I_OK;
+    }
+
+    // Inter frames do not code the color configuration; it carries over
+    // from the last key or intra-only frame.
+    h.bit_depth = st.cur_bit_depth;
+    h.color_space = st.cur_color_space;
+    h.color_range = st.cur_color_range;
+    h.subsampling_x = st.cur_subsampling_x;
+    h.subsampling_y = st.cur_subsampling_y;
+
+    let is i64 as ft = bits.bits_msb_bit(b);
+    if (ft < 0) { return ft; }
+    let is i64 as sf = bits.bits_msb_bit(b);
+    if (sf < 0) { return sf; }
+    let is i64 as er = bits.bits_msb_bit(b);
+    if (er < 0) { return er; }
+    h.frame_type = ft;
+    h.show_frame = sf;
+    h.error_resilient_mode = er;
+    h.intra_only = 0;
+    h.reset_frame_context = 0;
+    h.frame_is_intra = 0;
+
+    if (h.frame_type == t.VP9_KEY_FRAME) {
+        let is i64 as r with mut = _read_sync(b);
+        if (r < 0) { return r; }
+        r = _color_config(b, h);
+        if (r < 0) { return r; }
+        // FrameIsIntra must be set before compute_image_size, which uses it
+        // for UsePrevFrameMvs.
+        h.frame_is_intra = 1;
+        r = _frame_size(st, b, h);
+        if (r < 0) { return r; }
+        r = _render_size(b, h);
+        if (r < 0) { return r; }
+        h.refresh_frame_flags = 0xFF;
+    } else {
+        if (h.show_frame == 0) {
+            let is i64 as io = bits.bits_msb_bit(b);
+            if (io < 0) { return io; }
+            h.intra_only = io;
+        }
+        h.frame_is_intra = h.intra_only;
+
+        if (h.error_resilient_mode == 0) {
+            let is i64 as rc = bits.bits_msb_read(b, 2);
+            if (rc < 0) { return rc; }
+            h.reset_frame_context = rc;
+        }
+
+        if (h.intra_only == 1) {
+            let is i64 as r with mut = _read_sync(b);
+            if (r < 0) { return r; }
+            // Profile 0 does not code the color config for intra-only
+            // frames; the defaults are normative (section 6.2).
+            h.bit_depth = 8;
+            h.color_space = 1;    // CS_BT_601
+            h.color_range = 0;
+            h.subsampling_x = 1;
+            h.subsampling_y = 1;
+            let is i64 as rf = bits.bits_msb_read(b, 8);
+            if (rf < 0) { return rf; }
+            h.refresh_frame_flags = rf;
+            r = _frame_size(st, b, h);
+            if (r < 0) { return r; }
+            r = _render_size(b, h);
+            if (r < 0) { return r; }
+        } else {
+            let is i64 as rf = bits.bits_msb_read(b, 8);
+            if (rf < 0) { return rf; }
+            h.refresh_frame_flags = rf;
+
+            let is i64 as i with mut = 0;
+            while (i < 3) {
+                let is i64 as ri = bits.bits_msb_read(b, 3);
+                if (ri < 0) { return ri; }
+                let is i64 as sb = bits.bits_msb_bit(b);
+                if (sb < 0) { return sb; }
+                h.ref_frame_idx[i] = ri;
+                h.ref_frame_sign_bias[t.VP9_LAST_FRAME + i] = sb;
+                i = i + 1;
+            }
+
+            let is i64 as r with mut = _frame_size_with_refs(st, b, h);
+            if (r < 0) { return r; }
+            let is i64 as hp = bits.bits_msb_bit(b);
+            if (hp < 0) { return hp; }
+            h.allow_high_precision_mv = hp;
+            r = _read_interp_filter(b, h);
+            if (r < 0) { return r; }
+        }
+    }
+
+    if (h.error_resilient_mode == 0) {
+        let is i64 as rc = bits.bits_msb_bit(b);
+        if (rc < 0) { return rc; }
+        let is i64 as pd = bits.bits_msb_bit(b);
+        if (pd < 0) { return pd; }
+        h.refresh_frame_context = rc;
+        h.frame_parallel_decoding_mode = pd;
+    } else {
+        h.refresh_frame_context = 0;
+        h.frame_parallel_decoding_mode = 1;
+    }
+
+    let is i64 as fci = bits.bits_msb_read(b, 2);
+    if (fci < 0) { return fci; }
+    h.frame_context_idx = fci;
+
+    if (h.frame_is_intra == 1 || h.error_resilient_mode == 1) {
+        t.vp9_state_setup_past_independence(st);
+        let is i64 as i with mut = 0;
+        while (i < 4) { h.ref_frame_sign_bias[i] = 0; i = i + 1; }
+
+        if (h.frame_type == t.VP9_KEY_FRAME
+            || h.error_resilient_mode == 1
+            || h.reset_frame_context == 3) {
+            i = 0;
+            while (i < 4) {
+                let is i64 as r = t.vp9_state_save_probs(st, i);
+                if (r < 0) { return r; }
+                i = i + 1;
+            }
+        } else if (h.reset_frame_context == 2) {
+            let is i64 as r = t.vp9_state_save_probs(st,
+                                                     h.frame_context_idx);
+            if (r < 0) { return r; }
+        }
+        h.frame_context_idx = 0;
+    }
+
+    let is i64 as r with mut = _loop_filter(st, b, h);
+    if (r < 0) { return r; }
+    r = _quantization(b, h);
+    if (r < 0) { return r; }
+    r = _segmentation(st, b, h);
+    if (r < 0) { return r; }
+    r = _tile_info(b, h);
+    if (r < 0) { return r; }
+
+    let is i64 as hsz = bits.bits_msb_read(b, 16);
+    if (hsz < 0) { return hsz; }
+    h.header_size_in_bytes = hsz;
+    if (hsz == 0) { return errno.I_CORRUPT; }
+
+    st.cur_bit_depth = h.bit_depth;
+    st.cur_color_space = h.color_space;
+    st.cur_color_range = h.color_range;
+    st.cur_subsampling_x = h.subsampling_x;
+    st.cur_subsampling_y = h.subsampling_y;
+    st.seg_abs_or_delta = h.seg_abs_or_delta;
+    return errno.I_OK;
+}
+
+// ── compressed header ───────────────────────────────────────────────
+
+fn _decode_term_subexp(b as *vb.Vp9Bool) as i64 {
+    let is i64 as bit with mut = vb.vp9_bool_read(b, 128);
+    if (bit < 0) { return bit; }
+    if (bit == 0) { return vb.vp9_bool_read_literal(b, 4); }
+
+    bit = vb.vp9_bool_read(b, 128);
+    if (bit < 0) { return bit; }
+    if (bit == 0) {
+        let is i64 as v0 = vb.vp9_bool_read_literal(b, 4);
+        if (v0 < 0) { return v0; }
+        return v0 + 16;
+    }
+
+    bit = vb.vp9_bool_read(b, 128);
+    if (bit < 0) { return bit; }
+    if (bit == 0) {
+        let is i64 as v1 = vb.vp9_bool_read_literal(b, 5);
+        if (v1 < 0) { return v1; }
+        return v1 + 32;
+    }
+
+    let is i64 as v = vb.vp9_bool_read_literal(b, 7);
+    if (v < 0) { return v; }
+    if (v < 65) { return v + 64; }
+    let is i64 as low = vb.vp9_bool_read(b, 128);
+    if (low < 0) { return low; }
+    return (v << 1) - 1 + low;
+}
+
+// diff_update_prob (section 6.3.3). When the tables are not generated the
+// update is consumed but not applied, so the bit position stays correct and
+// the context stays marked pending.
+fn _diff_update(b as *vb.Vp9Bool, p as *u8, ready as i64) as i64 {
+    let is i64 as update = vb.vp9_bool_read(b, 252);
+    if (update < 0) { return update; }
+    if (update == 0) { return errno.I_OK; }
+
+    let is i64 as delta = _decode_term_subexp(b);
+    if (delta < 0) { return delta; }
+    if (ready == 0) { return errno.I_OK; }
+
+    let is i64 as np = t.vp9_inv_remap_prob(delta, cast(i64, *p));
+    if (np < 0) { return np; }
+    *p = cast(u8, np);
+    return errno.I_OK;
+}
+
+// update_mv_prob (section 6.3.17).
+fn _update_mv(b as *vb.Vp9Bool, p as *u8, ready as i64) as i64 {
+    let is i64 as update = vb.vp9_bool_read(b, 252);
+    if (update < 0) { return update; }
+    if (update == 0) { return errno.I_OK; }
+    let is i64 as v = vb.vp9_bool_read_literal(b, 7);
+    if (v < 0) { return v; }
+    if (ready == 0) { return errno.I_OK; }
+    *p = cast(u8, (v << 1) | 1);
+    return errno.I_OK;
+}
+
+fn _tx_mode_probs(b as *vb.Vp9Bool, st as *t.Vp9State,
+                  ready as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 1) {
+            let is i64 as r = _diff_update(b, &st.probs.tx[1][i][j], ready);
+            if (r < 0) { return r; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) {
+            let is i64 as r = _diff_update(b, &st.probs.tx[2][i][j], ready);
+            if (r < 0) { return r; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 3) {
+            let is i64 as r = _diff_update(b, &st.probs.tx[3][i][j], ready);
+            if (r < 0) { return r; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+fn _coef_probs(b as *vb.Vp9Bool, st as *t.Vp9State,
+               max_tx as i64, ready as i64) as i64 {
+    let is i64 as tx with mut = 0;
+    while (tx <= max_tx) {
+        let is i64 as update = vb.vp9_bool_read(b, 128);
+        if (update < 0) { return update; }
+        if (update == 1) {
+            let is i64 as blk with mut = 0;
+            while (blk < 2) {
+                let is i64 as ref with mut = 0;
+                while (ref < 2) {
+                    let is i64 as band with mut = 0;
+                    while (band < 6) {
+                        let is i64 as max_l with mut = 6;
+                        if (band == 0) { max_l = 3; }
+                        let is i64 as ctx with mut = 0;
+                        while (ctx < max_l) {
+                            let is i64 as node with mut = 0;
+                            while (node < 3) {
+                                let is i64 as r = _diff_update(
+                                    b,
+                                    &st.probs.coef[tx][blk][ref][band][ctx][node],
+                                    ready);
+                                if (r < 0) { return r; }
+                                node = node + 1;
+                            }
+                            ctx = ctx + 1;
+                        }
+                        band = band + 1;
+                    }
+                    ref = ref + 1;
+                }
+                blk = blk + 1;
+            }
+        }
+        tx = tx + 1;
+    }
+    return errno.I_OK;
+}
+
+// setup_compound_reference_mode (section 6.3.18).
+fn _setup_compound(h as *Vp9Header) as void {
+    if (h.ref_frame_sign_bias[t.VP9_LAST_FRAME]
+        == h.ref_frame_sign_bias[t.VP9_GOLDEN_FRAME]) {
+        h.comp_fixed_ref = t.VP9_ALTREF_FRAME;
+        h.comp_var_ref[0] = t.VP9_LAST_FRAME;
+        h.comp_var_ref[1] = t.VP9_GOLDEN_FRAME;
+    } else if (h.ref_frame_sign_bias[t.VP9_LAST_FRAME]
+               == h.ref_frame_sign_bias[t.VP9_ALTREF_FRAME]) {
+        h.comp_fixed_ref = t.VP9_GOLDEN_FRAME;
+        h.comp_var_ref[0] = t.VP9_LAST_FRAME;
+        h.comp_var_ref[1] = t.VP9_ALTREF_FRAME;
+    } else {
+        h.comp_fixed_ref = t.VP9_LAST_FRAME;
+        h.comp_var_ref[0] = t.VP9_GOLDEN_FRAME;
+        h.comp_var_ref[1] = t.VP9_ALTREF_FRAME;
+    }
+}
+
+// frame_reference_mode (section 6.3.12).
+fn _frame_reference_mode(b as *vb.Vp9Bool, h as *Vp9Header) as i64 {
+    let is i64 as allowed with mut = 0;
+    let is i64 as i with mut = 1;
+    while (i < 3) {
+        if (h.ref_frame_sign_bias[i + 1]
+            != h.ref_frame_sign_bias[t.VP9_LAST_FRAME]) {
+            allowed = 1;
+        }
+        i = i + 1;
+    }
+
+    if (allowed == 0) {
+        h.reference_mode = t.VP9_SINGLE_REFERENCE;
+        return errno.I_OK;
+    }
+
+    let is i64 as non_single = vb.vp9_bool_read(b, 128);
+    if (non_single < 0) { return non_single; }
+    if (non_single == 0) {
+        h.reference_mode = t.VP9_SINGLE_REFERENCE;
+        return errno.I_OK;
+    }
+
+    let is i64 as select = vb.vp9_bool_read(b, 128);
+    if (select < 0) { return select; }
+    if (select == 0) { h.reference_mode = t.VP9_COMPOUND_REFERENCE; }
+    else { h.reference_mode = t.VP9_REFERENCE_MODE_SELECT; }
+    _setup_compound(h);
+    return errno.I_OK;
+}
+
+fn _frame_reference_mode_probs(b as *vb.Vp9Bool, h as *Vp9Header,
+                               st as *t.Vp9State, ready as i64) as i64 {
+    let is i64 as i with mut = 0;
+    if (h.reference_mode == t.VP9_REFERENCE_MODE_SELECT) {
+        while (i < 5) {
+            let is i64 as r = _diff_update(b, &st.probs.comp_mode[i], ready);
+            if (r < 0) { return r; }
+            i = i + 1;
+        }
+    }
+    if (h.reference_mode != t.VP9_COMPOUND_REFERENCE) {
+        i = 0;
+        while (i < 5) {
+            let is i64 as r with mut = _diff_update(b, &st.probs.single_ref[i][0],
+                                           ready);
+            if (r < 0) { return r; }
+            r = _diff_update(b, &st.probs.single_ref[i][1], ready);
+            if (r < 0) { return r; }
+            i = i + 1;
+        }
+    }
+    if (h.reference_mode != t.VP9_SINGLE_REFERENCE) {
+        i = 0;
+        while (i < 5) {
+            let is i64 as r = _diff_update(b, &st.probs.comp_ref[i], ready);
+            if (r < 0) { return r; }
+            i = i + 1;
+        }
+    }
+    return errno.I_OK;
+}
+
+fn _mv_probs(b as *vb.Vp9Bool, h as *Vp9Header,
+             st as *t.Vp9State, ready as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as k with mut = 0;
+
+    i = 0;
+    while (i < 3) {
+        let is i64 as r = _update_mv(b, &st.probs.mv_joint[i], ready);
+        if (r < 0) { return r; }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < 2) {
+        let is i64 as r with mut = _update_mv(b, &st.probs.mv_sign[i], ready);
+        if (r < 0) { return r; }
+        j = 0;
+        while (j < 10) {
+            r = _update_mv(b, &st.probs.mv_class[i][j], ready);
+            if (r < 0) { return r; }
+            j = j + 1;
+        }
+        r = _update_mv(b, &st.probs.mv_class0_bit[i], ready);
+        if (r < 0) { return r; }
+        j = 0;
+        while (j < 10) {
+            r = _update_mv(b, &st.probs.mv_bits[i][j], ready);
+            if (r < 0) { return r; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 3) {
+                let is i64 as r = _update_mv(
+                    b, &st.probs.mv_class0_fr[i][j][k], ready);
+                if (r < 0) { return r; }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        k = 0;
+        while (k < 3) {
+            let is i64 as r = _update_mv(b, &st.probs.mv_fr[i][k], ready);
+            if (r < 0) { return r; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    if (h.allow_high_precision_mv == 1) {
+        i = 0;
+        while (i < 2) {
+            let is i64 as r with mut = _update_mv(
+                b, &st.probs.mv_class0_hp[i], ready);
+            if (r < 0) { return r; }
+            r = _update_mv(b, &st.probs.mv_hp[i], ready);
+            if (r < 0) { return r; }
+            i = i + 1;
+        }
+    }
+    return errno.I_OK;
+}
+
+fn _compressed_header(b as *vb.Vp9Bool, h as *Vp9Header,
+                      st as *t.Vp9State, ready as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+
+    // read_tx_mode (section 6.3.1).
+    if (h.lossless == 1) {
+        h.tx_mode = t.VP9_ONLY_4X4;
+    } else {
+        let is i64 as m = vb.vp9_bool_read_literal(b, 2);
+        if (m < 0) { return m; }
+        h.tx_mode = m;
+        if (m == t.VP9_ALLOW_32X32) {
+            let is i64 as bit = vb.vp9_bool_read(b, 128);
+            if (bit < 0) { return bit; }
+            h.tx_mode = m + bit;
+        }
+    }
+    if (h.tx_mode < 0 || h.tx_mode >= t.VP9_TX_MODES) {
+        return errno.I_CORRUPT;
+    }
+
+    if (h.tx_mode == t.VP9_TX_MODE_SELECT) {
+        let is i64 as r = _tx_mode_probs(b, st, ready);
+        if (r < 0) { return r; }
+    }
+
+    let is i64 as max_tx = t.vp9_tx_mode_to_biggest_tx_size(h.tx_mode);
+    if (max_tx < 0) { return max_tx; }
+    let is i64 as r0 = _coef_probs(b, st, max_tx, ready);
+    if (r0 < 0) { return r0; }
+
+    i = 0;
+    while (i < 3) {
+        let is i64 as r = _diff_update(b, &st.probs.skip[i], ready);
+        if (r < 0) { return r; }
+        i = i + 1;
+    }
+
+    if (h.frame_is_intra == 0) {
+        i = 0;
+        while (i < 7) {
+            j = 0;
+            while (j < 3) {
+                let is i64 as r = _diff_update(b,
+                                               &st.probs.inter_mode[i][j],
+                                               ready);
+                if (r < 0) { return r; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        if (h.interpolation_filter == t.VP9_SWITCHABLE) {
+            i = 0;
+            while (i < 4) {
+                j = 0;
+                while (j < 2) {
+                    let is i64 as r = _diff_update(
+                        b, &st.probs.interp_filter[i][j], ready);
+                    if (r < 0) { return r; }
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+        }
+
+        i = 0;
+        while (i < 4) {
+            let is i64 as r = _diff_update(b, &st.probs.is_inter[i], ready);
+            if (r < 0) { return r; }
+            i = i + 1;
+        }
+
+        let is i64 as r with mut = _frame_reference_mode(b, h);
+        if (r < 0) { return r; }
+        r = _frame_reference_mode_probs(b, h, st, ready);
+        if (r < 0) { return r; }
+
+        i = 0;
+        while (i < 4) {
+            j = 0;
+            while (j < 9) {
+                let is i64 as q = _diff_update(b, &st.probs.y_mode[i][j],
+                                               ready);
+                if (q < 0) { return q; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < 16) {
+            j = 0;
+            while (j < 3) {
+                let is i64 as q = _diff_update(b,
+                                               &st.probs.partition[i][j],
+                                               ready);
+                if (q < 0) { return q; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        r = _mv_probs(b, h, st, ready);
+        if (r < 0) { return r; }
+    }
+    return errno.I_OK;
+}
+
+// ── tile sizes (section 6.4, sizes only) ────────────────────────────
+
+// Walk the tile size table without decoding any tile. The sizes are
+// interleaved: [size][tile][size][tile]..., and the last tile takes the
+// remainder. Each tile must be at least one byte, because a Boolean decoder
+// cannot be initialised with sz < 1.
+fn vp9_tile_layout(data as *u8, len as i64, start as i64,
+                   cols_log2 as i64, rows_log2 as i64,
+                   tiles as *Vp9Tiles) as i64 {
+    if (cast(i64, tiles) == 0) { return errno.I_BADPARAM; }
+    tiles.count = 0;
+    if (cols_log2 < 0 || cols_log2 > t.VP9_MAX_TILE_COLS_LOG2) {
+        return errno.I_BADPARAM;
+    }
+    if (rows_log2 < 0 || rows_log2 > t.VP9_MAX_TILE_ROWS_LOG2) {
+        return errno.I_BADPARAM;
+    }
+    if (start < 0 || start > len) { return errno.I_EOF; }
+
+    let is i64 as count = (1 << cols_log2) * (1 << rows_log2);
+    if (count < 1 || count > t.VP9_MAX_TILES) { return errno.I_DIMS; }
+
+    let is i64 as pos with mut = start;
+    let is i64 as i with mut = 0;
+    while (i < count) {
+        let is i64 as size with mut = 0;
+        if (i == count - 1) {
+            size = len - pos;
+        } else {
+            if (len - pos < 4) { return errno.I_EOF; }
+            size = (_u8_at(data, pos) << 24)
+                 | (_u8_at(data, pos + 1) << 16)
+                 | (_u8_at(data, pos + 2) << 8)
+                 | _u8_at(data, pos + 3);
+            pos = pos + 4;
+        }
+        if (size < 1) { return errno.I_CORRUPT; }
+        if (size > len - pos) { return errno.I_CORRUPT; }
+        tiles.off[i] = pos;
+        tiles.len[i] = size;
+        pos = pos + size;
+        i = i + 1;
+    }
+    tiles.count = count;
+    return errno.I_OK;
+}
+
+// ── entry point ─────────────────────────────────────────────────────
+
+// Parse one coded frame slice: superframes must already be split. On success
+// h describes the frame, h.tile_data_off is the first tile byte and
+// h.tiles gives every tile's range. show_existing_frame returns with
+// header_size_in_bytes 0, no compressed header and no tiles; its padding bits
+// are checked here.
+fn vp9_header_parse(st as *t.Vp9State, h as *Vp9Header,
+                    data as *u8, len as i64) as i64 {
+    if (cast(i64, st) == 0 || cast(i64, h) == 0) {
+        return errno.I_BADPARAM;
+    }
+    _header_zero(h);
+
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len == 0) { return errno.I_EOF; }
+    if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
+
+    let is bits.BitsMsb as b;
+    let is i64 as r with mut = bits.bits_msb_init(&b, data, len);
+    if (r < 0) { return r; }
+
+    r = _uncompressed(st, &b, h);
+    if (r < 0) { return r; }
+
+    if (h.show_existing_frame == 1) {
+        while (bits.bits_msb_consumed(&b) < len * 8) {
+            let is i64 as bit = bits.bits_msb_bit(&b);
+            if (bit < 0) { return bit; }
+            if (bit != 0) { return errno.I_CORRUPT; }
+        }
+        h.uncompressed_bytes = (bits.bits_msb_consumed(&b) + 7) / 8;
+        h.tile_data_off = h.uncompressed_bytes;
+        h.has_compressed_header = 0;
+        h.probs_pending = st.probs_pending;
+        h.tiles.count = 0;
+        return errno.I_OK;
+    }
+
+    r = _skip_trailing(&b);
+    if (r < 0) { return r; }
+    h.uncompressed_bytes = bits.bits_msb_consumed(&b) / 8;
+    if (h.header_size_in_bytes < 1) { return errno.I_CORRUPT; }
+
+    h.tile_data_off = h.uncompressed_bytes + h.header_size_in_bytes;
+    if (h.tile_data_off > len) { return errno.I_EOF; }
+
+    let is i64 as idx = h.frame_context_idx;
+    r = t.vp9_state_load_probs(st, idx);
+    if (r < 0) { return r; }
+    r = t.vp9_state_load_probs2(st, idx);
+    if (r < 0) { return r; }
+    t.vp9_state_clear_counts(st);
+
+    let is vb.Vp9Bool as bb;
+    r = vb.vp9_bool_init(&bb,
+                         cast(*u8, cast(i64, data) + h.uncompressed_bytes),
+                         h.header_size_in_bytes);
+    if (r < 0) { return r; }
+
+    let is i64 as ready with mut = 1;
+    if (st.probs_pending == 1) { ready = 0; }
+    r = _compressed_header(&bb, h, st, ready);
+    if (r < 0) { return r; }
+    r = vb.vp9_bool_exit(&bb);
+    if (r < 0) { return r; }
+    h.has_compressed_header = 1;
+    h.probs_pending = st.probs_pending;
+
+    r = vp9_tile_layout(data, len, h.tile_data_off,
+                        h.tile_cols_log2, h.tile_rows_log2, &h.tiles);
+    if (r < 0) { return r; }
+
+    st.have_last_frame = 1;
+    st.last_frame_type = h.frame_type;
+    st.last_intra_only = h.intra_only;
+    st.last_show_frame = h.show_frame;
+    st.last_width = h.width;
+    st.last_height = h.height;
+    return errno.I_OK;
+}
+
+// ── errata E1: partition probability ────────────────────────────────
+
+// Specification section 9.3.2 says that a frame with FrameIsIntra == 0 uses
+// kf_partition_probs and a frame with FrameIsIntra == 1 uses partition_probs.
+// That is inverted: an intra key frame is the one coded with the fixed
+// keyframe table. The reference decoders confirm it (FFmpeg's
+// libavcodec/vp9.c decode_sb selects ff_vp9_default_kf_partition_probs for
+// keyframe/intraonly, and libvpx resets frame contexts with the keyframe
+// table in vp9_setup_past_independence). This helper is the one place stages
+// 4-6 obtain a partition probability, so the adopted rule cannot drift.
+fn vp9_partition_prob(h as *Vp9Header, p as *t.Vp9ProbCtx,
+                      ctx as i64, node as i64) as i64 {
+    if (h.frame_is_intra == 1) {
+        return t.vp9_kf_partition_prob(ctx, node);
+    }
+    if (ctx < 0 || ctx >= t.VP9_PARTITION_CONTEXTS) {
+        return errno.I_BADPARAM;
+    }
+    if (node < 0 || node >= t.VP9_PARTITION_TYPES - 1) {
+        return errno.I_BADPARAM;
+    }
+    return cast(i64, p.partition[ctx][node]);
+}
