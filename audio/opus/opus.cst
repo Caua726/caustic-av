@@ -61,10 +61,10 @@ let is i64 as OPUS_OUTPUT_RATE with imut = 48000;
 let is f64 as OPUS_GAIN_DIVISOR with imut = 5120.0;
 
 struct OpusDecoder {
-    head           as opus_head.OpusHead; // parsed OpusHead
+    head           as opus_head.OpusHead; // parsed OpusHead; its pre_skip is the packet value
     channels       as i64;                // 1 or 2
     sample_rate    as i64;                // 48000
-    pre_skip       as i64;                // samples at 48 kHz to discard at the start
+    pre_skip       as i64;                // effective samples at 48 kHz to discard at the start
     skip_remaining as i64;                // pre-skip not yet dropped
     end_trim       as i64;                // samples to drop from the end of the next output
     apply_gain     as i64;                // 1 when output_gain is applied
@@ -182,14 +182,14 @@ fn opus_decoder_skip_remaining(d as *OpusDecoder) as i64 {
     return d.skip_remaining;
 }
 
-// Replace the pre-skip and re-arm it. It is a stream-start control: set it
-// before the first packet (or when cropping a stream). Calling it after
-// decoding has started begins a new skip at the current output position,
-// and it updates the stored OpusHead value so every getter agrees.
+// Replace the effective pre-skip and re-arm it. It is a stream-start
+// control: set it before the first packet (or when cropping a stream).
+// Calling it after decoding has started begins a new skip at the current
+// output position. head.pre_skip keeps the value parsed from the packet;
+// pre_skip and skip_remaining are the effective controls.
 fn opus_decoder_set_pre_skip(d as *OpusDecoder, samples as i64) as i64 {
     if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
     if (samples < 0) { return errno.I_BADPARAM; }
-    d.head.pre_skip = samples;
     d.pre_skip = samples;
     d.skip_remaining = samples;
     return errno.I_OK;

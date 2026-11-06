@@ -185,10 +185,12 @@ opus_decoder_end_trim(d)
 ```
 
 `opus_decoder_set_pre_skip` is a stream-start control. It updates the
-stored `OpusHead` value, the reported pre-skip and `skip_remaining`, so
-there is one source of truth. Calling it after decoding has started begins
-a new skip at the current output position; a decoder reused for a new
-logical stream should call `opus_decoder_reset` or re-init instead.
+effective `pre_skip` and `skip_remaining`; `head.pre_skip` keeps the value
+parsed from the packet, so the header stays a faithful record and the
+effective controls are the only mutable copy. Calling it after decoding has
+started begins a new skip at the current output position; a decoder reused
+for a new logical stream should call `opus_decoder_reset` or re-init
+instead.
 
 Output gain is the signed Q7.8 dB value from `OpusHead` (Section 5.1).
 RFC 7845 leaves applying it to the player, so the decoder stores the raw
