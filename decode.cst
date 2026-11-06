@@ -43,17 +43,20 @@
 // Packet handoff
 // --------------
 // send arms one packet; receive consumes it. A packet is either one VP9
-// superframe (up to eight coded frames), one Opus packet, or one MP3 frame.
-// VP9 yields 0..8 displayed frames in bitstream order; Opus and MP3 yield one
-// block or, when pre-skip/trim consumes the whole packet, none. send refuses a
-// second packet while the previous one is undrained (VP9 enforces it itself;
-// the audio paths use the pending flag), so no packet is skipped or handed out
-// twice. Receive returning 0 means the armed packet has no further output; for
-// audio, whose single output also finishes the packet, the next send is
-// allowed as soon as receive returns 1.
+// superframe (up to eight coded frames), one Opus packet, or one MP3 packet
+// (a raw demuxer frame, or a container block that may hold several Layer III
+// frames). VP9 yields 0..8 displayed frames in bitstream order; Opus yields
+// one block or, when pre-skip/trim consumes the whole packet, none; MP3 yields
+// one block per Layer III frame in the packet. send refuses a second packet
+// while the previous one is undrained (VP9 enforces it itself; the audio paths
+// use the pending flag), so no packet is skipped or handed out twice. Receive
+// returning 0 means the armed packet has no further output; for Opus, whose
+// single output also finishes the packet, the next send is allowed as soon as
+// receive returns 1. An MP3 packet finishes when its last frame has been
+// returned (or trimmed away).
 //
-// The packet bytes stay the caller's. For VP9 they must remain valid and
-// unchanged until receive returns 0; for Opus and MP3 until receive returns.
+// The packet bytes stay the caller's. For VP9 and MP3 they must remain valid
+// and unchanged until receive returns 0; for Opus until receive returns.
 // Nothing is copied except the decoded PCM, which lands in the Decoder's own
 // scratch block.
 //
@@ -93,9 +96,9 @@
 //                  and added to the decoder's pending end trim, so a trim that
 //                  spans a packet boundary keeps working. For MP3 it is
 //                  converted at the frame's sample rate and subtracted from
-//                  the decoded block; a value that covers the whole block
-//                  yields no output (the excess is not carried, because a
-//                  valid block padding never exceeds the block).
+//                  the last Layer III frame of the packet; a value that covers
+//                  that frame yields no output (the excess is not carried,
+//                  because a valid block padding never exceeds the block).
 //
 // Errors
 // ------
@@ -189,6 +192,8 @@ struct Decoder {
     pending_len    as i64;
     pending_pts    as i64;
     pending_padding as i64;
+    pending_off    as i64;   // next MP3 frame's byte offset in the packet
+    pending_pts_off as i64;  // that frame's pts offset, in track ticks
     video_shown    as i64;   // one video output already used the packet pts
 
     mp3_frame as mp3.Mp3Frame;  // parsed at send, decoded at receive
@@ -213,6 +218,8 @@ fn _decoder_clear(d as *Decoder) as void {
     d.pending_len = 0;
     d.pending_pts = 0;
     d.pending_padding = 0;
+    d.pending_off = 0;
+    d.pending_pts_off = 0;
     d.video_shown = 0;
 }
 
@@ -241,6 +248,8 @@ fn _set_pending(d as *Decoder, pkt as *packet.Packet) as void {
     d.pending_len = pkt.len;
     d.pending_pts = pkt.pts;
     d.pending_padding = pkt.discard_padding;
+    d.pending_off = 0;
+    d.pending_pts_off = 0;
     d.pending = 1;
 }
 
@@ -279,23 +288,30 @@ fn _samples_to_ticks(d as *Decoder, count as i64, rate as i64) as i64 {
     return (a + b / 2) / b;
 }
 
-// Parse one MP3 packet into d.mp3_frame. The packet is a complete frame, as
-// demux_next hands it out; offsets stay relative to the packet and are made
-// absolute against m.stream.src at receive time. Returns 0 or the parser's
-// error, or I_UNSUPPORTED when the frame's rate/channels disagree with the
-// track the decoder was opened for.
-fn _mp3_prepare(d as *Decoder, pkt as *packet.Packet) as i64 {
+// Parse one MP3 frame at off bytes into the pending packet. A packet from a
+// container may hold more than one Layer III frame; each one is parsed here as
+// its turn comes. Offsets stored in d.mp3_frame are relative to the packet
+// base, and *frame_len reports how far the packet cursor advances. Returns 0
+// or the parser's error, or I_UNSUPPORTED when the frame's rate/channels
+// disagree with the track the decoder was opened for.
+fn _mp3_prepare(d as *Decoder, pkt as *packet.Packet, off as i64,
+                frame_len as *i64) as i64 {
+    if (off < 0 || off > pkt.len) { return errno.I_EOF; }
+    if (cast(i64, frame_len) == 0) { return errno.I_BADPARAM; }
+    let is i64 as avail = pkt.len - off;
+    if (avail < 4) { return errno.I_EOF; }
+
     let is mp3.Mp3Header as h;
-    let is i64 as r with mut = mp3.mp3_header_parse(pkt.data, pkt.len, &h);
+    let is i64 as r with mut = mp3.mp3_header_parse(pkt.data + off, avail, &h);
     if (r < 0) { return r; }
-    if (h.frame_len > pkt.len) { return errno.I_EOF; }
+    if (h.frame_len > avail) { return errno.I_EOF; }
     if (h.side_info_offset < 0 || h.side_info_len < 0) {
         return errno.I_CORRUPT;
     }
-    if (h.side_info_end > pkt.len) { return errno.I_CORRUPT; }
+    if (h.side_info_end > h.frame_len) { return errno.I_CORRUPT; }
 
     let is mp3.Mp3SideInfo as side;
-    r = mp3.mp3_side_info_parse(pkt.data + h.side_info_offset,
+    r = mp3.mp3_side_info_parse(pkt.data + off + h.side_info_offset,
                                 h.side_info_len, h.version, h.channels, &side);
     if (r < 0) { return r; }
 
@@ -306,16 +322,17 @@ fn _mp3_prepare(d as *Decoder, pkt as *packet.Packet) as i64 {
 
     d.mp3_frame.header = h;
     d.mp3_frame.side = side;
-    d.mp3_frame.offset = 0;
+    d.mp3_frame.offset = off;
     d.mp3_frame.length = h.frame_len;
     d.mp3_frame.index = 0;
-    d.mp3_frame.side_info_offset = h.side_info_offset;
+    d.mp3_frame.side_info_offset = off + h.side_info_offset;
     d.mp3_frame.side_info_len = h.side_info_len;
-    d.mp3_frame.main_data_offset = h.side_info_end;
+    d.mp3_frame.main_data_offset = off + h.side_info_end;
     d.mp3_frame.main_data_len = h.frame_len - h.side_info_end;
     d.mp3_frame.reservoir_back = side.main_data_begin;
     d.mp3_frame.reservoir_len = side.main_data_begin
         + d.mp3_frame.main_data_len;
+    *frame_len = h.frame_len;
     return errno.I_OK;
 }
 
@@ -409,9 +426,9 @@ fn decode_open_codec(d as *Decoder, codec_id as i64, priv as *u8,
 // ── Send ────────────────────────────────────────────────────────────
 
 // Arm one packet. VP9 validates and stores the Annex B split; Opus stores the
-// packet for receive; MP3 parses the header and side information now, so a
-// malformed frame fails here. A second packet while one is pending is
-// I_BADPARAM. Returns 0 or a negative code.
+// packet for receive; MP3 stores it for receive, which parses one Layer III
+// frame at a time. A second packet while one is pending is I_BADPARAM.
+// Returns 0 or a negative code.
 fn decode_send(d as *Decoder, pkt as *packet.Packet) as i64 {
     if (cast(i64, d) == 0 || cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
     if (d.opened == 0) { return errno.I_BADPARAM; }
@@ -429,9 +446,10 @@ fn decode_send(d as *Decoder, pkt as *packet.Packet) as i64 {
 
     if (d.codec == codec.CODEC_OPUS || d.codec == codec.CODEC_MP3) {
         if (d.pending != 0) { return errno.I_BADPARAM; }
-        if (d.codec == codec.CODEC_MP3) {
-            let is i64 as r = _mp3_prepare(d, pkt);
-            if (r < 0) { return r; }
+        // An MP3 packet may hold several frames; the parse happens one frame
+        // at a time in receive. A zero-byte packet cannot hold one.
+        if (d.codec == codec.CODEC_MP3 && pkt.len == 0) {
+            return errno.I_EOF;
         }
         _set_pending(d, pkt);
         return errno.I_OK;
@@ -528,60 +546,115 @@ fn _receive_opus(d as *Decoder, out as *Output) as i64 {
     return 1;
 }
 
+// Decode one MP3 frame and return it; a packet may hold several. Each frame's
+// timestamp is the block pts plus the duration of the frames already consumed
+// from the same packet. DiscardPadding belongs to the end of the block, so it
+// is applied only to the last frame.
 fn _receive_mp3(d as *Decoder, out as *Output) as i64 {
-    if (d.pending == 0) { return 0; }
+    while (d.pending != 0) {
+        if (d.pending_off >= d.pending_len) {
+            d.pending = 0;
+            return 0;
+        }
 
-    let is i64 as pts = d.pending_pts;
-    let is i64 as pad = d.pending_padding;
+        let is i64 as flen with mut = 0;
+        let is i64 as r = _mp3_prepare(d, d.pending_data, d.pending_len,
+                                       d.pending_off, &flen);
+        if (r < 0) {
+            d.pending = 0;
+            return r;
+        }
+        if (flen <= 0 || flen > d.pending_len - d.pending_off) {
+            d.pending = 0;
+            return errno.I_CORRUPT;
+        }
 
-    // mp3_decode_frame reads main data through m.stream.src, so the packet
-    // that was parsed at send is bound again here. Its offsets are relative
-    // to this packet.
-    d.mp3_dec.stream.src = d.pending_data;
-    d.mp3_dec.stream.len = d.pending_len;
+        let is i64 as rate = d.mp3_frame.header.sample_rate;
+        let is i64 as ch = d.mp3_frame.header.channels;
 
-    let is i64 as got = mp3dec.mp3_decode_frame(&d.mp3_dec, &d.mp3_frame,
-        cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
-    d.pending = 0;
-    if (got < 0) { return got; }
+        // A codec-only open has no track fields; the first frame supplies
+        // them, before the timestamp conversion needs a timebase.
+        if (d.rate <= 0) { d.rate = rate; }
+        if (d.channels <= 0) { d.channels = ch; }
+        if (d.timebase_num <= 0 || d.timebase_den <= 0) {
+            d.timebase_num = 1;
+            d.timebase_den = rate;
+        }
 
-    let is i64 as rate = d.mp3_frame.header.sample_rate;
-    let is i64 as ch = d.mp3_frame.header.channels;
-    let is i64 as count with mut = got;
+        if (d.pending_pts_off > 0
+            && d.pending_pts > DECODE_LIMIT - d.pending_pts_off) {
+            d.pending = 0;
+            return errno.I_DIMS;
+        }
+        let is i64 as frame_pts = d.pending_pts + d.pending_pts_off;
 
-    // A codec-only open has no track fields; the first frame supplies them.
-    if (d.rate <= 0) { d.rate = rate; }
-    if (d.channels <= 0) { d.channels = ch; }
-    if (d.timebase_num <= 0 || d.timebase_den <= 0) {
-        d.timebase_num = 1;
-        d.timebase_den = rate;
+        // mp3_decode_frame reads main data through m.stream.src, so the
+        // packet is bound with its full length; the frame's offsets are
+        // relative to that base.
+        d.mp3_dec.stream.src = d.pending_data;
+        d.mp3_dec.stream.len = d.pending_len;
+        let is i64 as got = mp3dec.mp3_decode_frame(&d.mp3_dec,
+            &d.mp3_frame, cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
+
+        // Advance past the frame even when the output is trimmed away; the
+        // next receive continues with the next frame of the same packet.
+        d.pending_off = d.pending_off + flen;
+        let is i64 as adv = _samples_to_ticks(
+            d, d.mp3_frame.header.samples_per_frame, rate);
+        if (adv < 0) {
+            d.pending = 0;
+            return adv;
+        }
+        if (d.pending_pts_off > DECODE_LIMIT - adv) {
+            d.pending = 0;
+            return errno.I_DIMS;
+        }
+        d.pending_pts_off = d.pending_pts_off + adv;
+
+        if (got < 0) {
+            d.pending = 0;
+            return got;
+        }
+
+        let is i64 as count with mut = got;
+        let is i64 as last with mut = 0;
+        if (d.pending_off >= d.pending_len) { last = 1; }
+
+        if (last != 0 && d.pending_padding > 0) {
+            let is i64 as cut = _ns_to_samples(d.pending_padding, rate);
+            if (cut < 0) {
+                d.pending = 0;
+                return cut;
+            }
+            // A DiscardPadding that covers the whole frame leaves no output.
+            // A valid block padding does not exceed the final frame; the
+            // excess is not carried into another packet.
+            if (cut >= count) { count = 0; } else { count = count - cut; }
+        }
+        if (last != 0) { d.pending = 0; }
+
+        if (count == 0) {
+            if (d.pending == 0) { return 0; }
+            continue;
+        }
+
+        let is i64 as dur = _samples_to_ticks(d, count, rate);
+        if (dur < 0) { return dur; }
+
+        let is i64 as sr = samples.samples_init(&out.audio,
+            samples.SAMPLE_FMT_S16, rate, ch, count,
+            cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
+        if (sr < 0) { return sr; }
+
+        out.kind = OUTPUT_AUDIO;
+        out.pts = frame_pts;
+        out.pts_valid = 1;
+        out.duration = dur;
+        out.timebase_num = d.timebase_num;
+        out.timebase_den = d.timebase_den;
+        return 1;
     }
-
-    if (pad > 0) {
-        let is i64 as cut = _ns_to_samples(pad, rate);
-        if (cut < 0) { return cut; }
-        // A DiscardPadding that covers the whole block leaves no output. A
-        // valid block padding does not exceed the block; the excess is not
-        // carried into the next packet.
-        if (cut >= count) { count = 0; } else { count = count - cut; }
-    }
-    if (count == 0) { return 0; }
-
-    let is i64 as dur = _samples_to_ticks(d, count, rate);
-    if (dur < 0) { return dur; }
-
-    let is i64 as sr = samples.samples_init(&out.audio,
-        samples.SAMPLE_FMT_S16, rate, ch, count,
-        cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
-    if (sr < 0) { return sr; }
-
-    out.kind = OUTPUT_AUDIO;
-    out.pts = pts;
-    out.pts_valid = 1;
-    out.duration = dur;
-    out.timebase_num = d.timebase_num;
-    out.timebase_den = d.timebase_den;
-    return 1;
+    return 0;
 }
 
 // Hand out the next decoded item: 1 with *out filled, 0 when the armed packet

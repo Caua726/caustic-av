@@ -113,15 +113,20 @@ size.
   the previous one is undrained. The output view points into a pool buffer and
   is valid until the next receive or send; if the frame was also published as
   a reference, its pixels stay valid while a slot names that buffer.
-- **Opus / MP3.** `decode_send` stores the packet (MP3 also parses the header
-  and side information now), and `decode_receive` decodes once. A second
-  packet while one is pending is `I_BADPARAM`. Receive returns 0 when
-  pre-skip/end-trim consumes the whole packet, or when there was no pending
-  packet.
+- **Opus.** `decode_send` stores the packet and `decode_receive` decodes it
+  once. A second packet while one is pending is `I_BADPARAM`. Receive returns
+  0 when pre-skip/end-trim consumes the whole packet, or when there was no
+  pending packet.
+- **MP3.** `decode_send` stores the packet; `decode_receive` parses and
+  decodes one Layer III frame per call and advances a byte cursor inside the
+  packet. A raw demuxer packet holds one frame; a container block may hold
+  several, and all of them are returned before the packet is finished. A
+  second packet while one is pending is `I_BADPARAM`; receive returns 0 when
+  the packet's bytes are exhausted or the last frame is trimmed away.
 
-One packet therefore yields 0..8 outputs for VP9 and 0..1 for audio, never a
-placeholder. The packet bytes stay the caller's: VP9 holds their addresses
-until the packet is drained; Opus and MP3 use them only inside the receive
+One packet therefore yields 0..8 outputs for VP9, 0..1 for Opus and 0..N for
+MP3, never a placeholder. The packet bytes stay the caller's: VP9 and MP3 hold
+their addresses until the packet is drained; Opus uses them inside the receive
 call. Nothing is copied except decoded PCM, which lands in the `Decoder`'s
 scratch and is valid until the next receive.
 
@@ -198,10 +203,10 @@ range-checked before multiplication. For Matroska Opus, 120-sample frames at
     whatever end trim the decoder still carries from the previous packet, and
     passed to `opus_decoder_set_end_trim`. The decoder's own cross-packet
     carry then applies. This is the WebM/Matroska path.
-  - MP3: converted at the frame's sample rate and subtracted from the decoded
-    block's length. A value that covers the whole block yields no output; a
-    valid block padding never exceeds the block, and the excess is not carried
-    into the next packet.
+  - MP3: converted at the frame's sample rate and subtracted from the last
+    Layer III frame of the packet. A value that covers that frame yields no
+    output; a valid block padding never exceeds the block, and the excess is
+    not carried into the next packet.
   - VP9: ignored, because end padding is not a video concept.
 - **Ogg EOS trim.** Ogg has no DiscardPadding element. RFC 7845 puts the end
   trim in the final granule, which the caller can turn into a sample count and
@@ -214,28 +219,37 @@ conversion. The rounding choice (nearest, half up) is UNCONFIRMED.
 
 ## MP3 packet reconstruction
 
-The hub's demuxer publishes one complete MP3 frame per packet. `decode_send`
-parses it:
+A raw demuxer packet is one complete MP3 frame. A Matroska block may legally
+hold more than one Layer III frame, so the decoder consumes frames from the
+packet one at a time. `decode_receive` parses the frame at the packet cursor:
 
 1. `mp3_header_parse` validates the 4-byte header, derives frame length and
    side-information offsets, and rejects reserved/free-format/Layer I-II
    values.
-2. The frame length must fit the packet (`I_EOF` otherwise), and the side
-   information must fit both the frame and the packet.
+2. The frame length must fit the remaining packet bytes (`I_EOF` otherwise),
+   and the side information must fit both the frame and the packet.
 3. `mp3_side_info_parse` validates and decodes the fixed Table 13 block.
 4. A frame whose sample rate or channel count disagrees with the track opened
    with `decode_open` is `I_UNSUPPORTED`.
-5. The `Mp3Frame` is reconstructed with offsets relative to the packet:
-   `main_data_offset = side_info_end`, `main_data_len = frame_len -
+5. The `Mp3Frame` is reconstructed with offsets relative to the packet base:
+   `main_data_offset = cursor + side_info_end`, `main_data_len = frame_len -
    side_info_end`, `reservoir_back = side.main_data_begin`.
 
-`decode_receive` binds the packet again as `mp3_dec.stream.src`/`.len`, because
-`mp3_decode_frame` reads main data through the parser state it embeds. The
-reservoir tail is kept inside `Mp3Decode` across packets, so a frame whose
-`main_data_begin` reaches into earlier frames decodes as long as the packets
+The packet is bound as `mp3_dec.stream.src`/`.len` because `mp3_decode_frame`
+reads main data through the parser state it embeds. The reservoir tail is kept
+inside `Mp3Decode` across frames and packets, so a frame whose
+`main_data_begin` reaches into earlier frames decodes as long as the frames
 arrive in decode order from the demuxer. A seek that starts mid-stream with a
 non-zero backpointer has no history and returns the decoder's `I_EOF`; the
 demuxer always starts at frame 0, so the normal path is unaffected.
+
+After a frame decodes, the cursor advances by its frame length and the
+timestamp offset advances by `samples_per_frame` converted to the track
+timebase. The next receive decodes the next frame, if any. A frame that
+returns `I_CORRUPT` abandons the rest of the packet; the caller may call the
+MP3 module's reset or re-open. DiscardPadding is applied only when the cursor
+reaches the end of the packet, because it describes padding at the end of the
+block, not of every frame.
 
 `mp3_decode_frame` writes little-endian S16 into the `Decoder` scratch and
 returns frames per channel (1152 for MPEG-1, 576 for MPEG-2/2.5). The hub
@@ -244,7 +258,7 @@ checks the returned count against the scratch before building the
 
 MP3 output rate/channels are the frame's header values. A codec-only open
 fills `Decoder.rate/channels` from the first decoded frame; a track-based open
-already has them and `decode_send` rejects a later frame that differs.
+already has them and the per-frame parse rejects a later frame that differs.
 
 ## VP9 caller-memory wrappers
 
@@ -352,6 +366,12 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
 - **MP3 frame independence.** `keyframe` in the demuxer is 0 when a frame's
   main data reaches into the reservoir. The decoder still needs the preceding
   frames; a caller that treats every packet as seekable would be wrong.
+- **Multi-frame MP3 timestamps.** A container block with several Layer III
+  frames gets each frame's pts by adding the previous frames' durations in
+  the track timebase. For Matroska that conversion is rounded to whole
+  nanoseconds, so the second and later frames of a block can differ by a
+  nanosecond from the exact product. Each new packet resets to the container
+  pts, so the error does not accumulate across blocks.
 - **VP9 superframe timestamps.** Only the first output of a packet carries the
   container pts. A caller that needs per-frame times must derive them from
   `order` and the stream's frame rate, which this layer does not know.
@@ -373,9 +393,9 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
 3. `decode_codec_delay` is informational. A future API could return a
    shifted `pts` and let the caller choose, instead of documenting the
    subtraction outside the module.
-4. `_receive_mp3` drops a whole block when `DiscardPadding` covers it instead
-   of carrying the excess. Valid files do not hit this; the alternative would
-   match the Opus decoder's carry semantics.
+4. `_receive_mp3` drops the packet's last frame when `DiscardPadding` covers
+   it instead of carrying the excess. Valid files do not hit this; the
+   alternative would match the Opus decoder's carry semantics.
 5. `decode_set_end_trim` has no upper bound beyond the Opus decoder's
    non-negative check; a caller can ask to trim more than the stream holds,
    which simply drops everything.
