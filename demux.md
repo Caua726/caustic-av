@@ -307,6 +307,11 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
 5. `demux.cst` documents `I_DIMS` for an oversized Matroska rate; the same
    ceiling is not applied to an Ogg rate because Ogg Opus is fixed at 48000
    and the other mappings publish 0.
+6. `container/matroska.cst` attaches a BlockGroup's DiscardPadding to every
+   lace packet of that block. The demuxer forwards the field unchanged; a
+   consumer that applies it per packet trims a multi-lace block more than
+   once. Marking only the last lace belongs in the container module, which
+   this stage does not change.
 
 ## Checks NOT RUN
 

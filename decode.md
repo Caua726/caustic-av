@@ -372,6 +372,14 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
   nanoseconds, so the second and later frames of a block can differ by a
   nanosecond from the exact product. Each new packet resets to the container
   pts, so the error does not accumulate across blocks.
+- **Discard padding and lacing.** `container/matroska.cst` copies a
+  BlockGroup's DiscardPadding onto every lace packet of that block, because a
+  lace packet is a view of the same block metadata. The decoder applies the
+  value to the last frame of each packet it receives, so a block that carries
+  several laces and a non-zero DiscardPadding would trim each lace. Valid
+  files put the padding at the end of the block, so only the last lace should
+  carry it. This is a container-level limitation, recorded as PENDING; fixing
+  it belongs in `container/matroska.cst` (marking the last lace), not here.
 - **VP9 superframe timestamps.** Only the first output of a packet carries the
   container pts. A caller that needs per-frame times must derive them from
   `order` and the stream's frame rate, which this layer does not know.
