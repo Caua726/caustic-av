@@ -347,13 +347,14 @@ plausible output:
   `vp9_residual_tables_ready()` and returns `I_UNSUPPORTED` while either blob
   is pending, so the hub returns `I_UNSUPPORTED` for every frame until the
   generators have been run and their output committed.
-- **MP3:** stage 8a's note records the IMDCT window blobs
-  (`MP3_WINDOW_LONG/START/STOP/SHORT`) and the Table 3-B.3 synthesis window as
-  pending, with `mp3_window_tables_ready()` at 0. Stage 8b's note says it
-  builds analytic windows and reads only Table 3-B.3 through
-  `mp3_synth_window`; if that blob is still a zero fill, synthesis is silent
-  rather than an error. The hub does not add a guard of its own; the stage 8
-  merge must settle which side provides the windows.
+- **MP3:** stage 8a's note lists `MP3_WINDOW_LONG/START/STOP/SHORT` and
+  `MP3_DCT_TWIDDLE` as pending analytical blobs and reports
+  `mp3_window_tables_ready() == 0`; it lists the 512-entry Table 3-B.3
+  synthesis window as committed data in `mp3_tables_data.cst`. Stage 8b's note
+  says it builds analytic windows and reads only that synthesis vector through
+  `mp3_synth_window`; if the merged branch left the vector zero-filled,
+  synthesis would be silent rather than an error. Neither note says it is
+  zero-filled, so this is a merge-time check, not a hub guard.
 - **Opus:** `celt_tables_data.cst` and `silk_tables_data.cst` are committed;
   their own notes are the authority for whether any generated blob remains.
 
