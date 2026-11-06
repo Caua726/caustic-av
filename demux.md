@@ -224,7 +224,7 @@ open.
 | `I_BADPARAM` | null `Demux`/`Packet`, negative length, null source with bytes. |
 | `I_EOF` | empty source; a container header or page cut short; a declared frame past the source. |
 | `I_BADMAGIC` | no recognised signature; EBML DocType neither webm nor matroska; no Layer III frame after the ID3 tag/junk. |
-| `I_UNSUPPORTED` | Ogg version other than 0; too many Ogg tracks; a layer/free-format MP3 stream; an MP3 frame whose rate/channels change mid-stream. |
+| `I_UNSUPPORTED` | Ogg version other than 0; too many Ogg tracks; a Layer I/II or free-format MP3 stream that carried an ID3 tag; an MP3 frame whose rate/channels change mid-stream. Without an ID3 tag, the sniff scan accepts only a Layer III frame and reports `I_BADMAGIC`. |
 | `I_CORRUPT` | malformed page/EBML/block/header; a track index outside the published list; a timestamp past the arithmetic ceiling. |
 | `I_DIMS` | a Matroska audio rate too large to represent. |
 

@@ -196,7 +196,7 @@ struct Decoder {
     pending_pts_off as i64;  // that frame's pts offset, in track ticks
     video_shown    as i64;   // one video output already used the packet pts
 
-    mp3_frame as mp3.Mp3Frame;  // parsed at send, decoded at receive
+    mp3_frame as mp3.Mp3Frame;  // parsed from the pending packet at receive
 
     pcm as [11520]i16;          // decoded audio, valid until the next receive
 }
