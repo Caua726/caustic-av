@@ -295,6 +295,7 @@ fn _read_kf_y_mode(br as *vb.Vp9Bool, above as i64, left as i64) as i64 {
         if (nx <= 0) { return 0 - nx; }
         n = nx;
     }
+    return errno.I_CORRUPT;
 }
 
 // default_uv_mode: kf_uv_mode_probs[y_mode][node].
@@ -310,6 +311,7 @@ fn _read_kf_uv_mode(br as *vb.Vp9Bool, y_mode as i64) as i64 {
         if (nx <= 0) { return 0 - nx; }
         n = nx;
     }
+    return errno.I_CORRUPT;
 }
 
 // ── segment id and tx size ──────────────────────────────────────────
@@ -329,6 +331,7 @@ fn _read_segment_id(br as *vb.Vp9Bool, probs as *u8) as i64 {
         if (nx <= 0) { return 0 - nx; }
         n = nx;
     }
+    return errno.I_CORRUPT;
 }
 
 // read_tx_size (section 6.4.10), including the TX_MODE_SELECT tree of
@@ -482,6 +485,7 @@ fn _read_intra_tree(br as *vb.Vp9Bool, probs as *u8) as i64 {
         if (nx <= 0) { return 0 - nx; }
         n = nx;
     }
+    return errno.I_CORRUPT;
 }
 
 // Intra modes for one block. `kf` selects the fixed keyframe tables of
@@ -715,8 +719,8 @@ fn _get_segment_id(b as *Vp9Blk, r as i64, c as i64, bs as i64) as i64 {
     let is i64 as bw = rt.recon_num_8x8_wide(bs);
     let is i64 as bh = rt.recon_num_8x8_high(bs);
     if (bw < 1 || bh < 1) { return errno.I_CORRUPT; }
-    let is i64 as xmis = b.mi_cols - c;
-    let is i64 as ymis = b.mi_rows - r;
+    let is i64 as xmis with mut = b.mi_cols - c;
+    let is i64 as ymis with mut = b.mi_rows - r;
     if (xmis > bw) { xmis = bw; }
     if (ymis > bh) { ymis = bh; }
     if (xmis < 1 || ymis < 1) { return errno.I_CORRUPT; }
@@ -895,6 +899,7 @@ fn _read_mv_class(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64) as i64 {
         if (s <= 0) { return 0 - s; }
         n = s;
     }
+    return errno.I_CORRUPT;
 }
 
 // mv_fr_tree[6] (section 9.3): leaves 0..3.
@@ -918,6 +923,7 @@ fn _read_mv_fr(br as *vb.Vp9Bool, probs as *u8) as i64 {
         if (s <= 0) { return 0 - s; }
         n = s;
     }
+    return errno.I_CORRUPT;
 }
 
 // mv_joint_tree[6] (section 9.3): leaves MV_JOINT_ZERO..MV_JOINT_HNZVNZ.
@@ -941,6 +947,7 @@ fn _read_mv_joint(b as *Vp9Blk, br as *vb.Vp9Bool) as i64 {
         if (s <= 0) { return 0 - s; }
         n = s;
     }
+    return errno.I_CORRUPT;
 }
 
 // read_mv_component (section 6.4.20).

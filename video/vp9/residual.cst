@@ -296,6 +296,7 @@ fn _token_decode(br as *vb.Vp9Bool, p as *t.Vp9ProbCtx, tx_sz as i64,
         steps = steps + 1;
         if (steps > 20) { return errno.I_CORRUPT; }
     }
+    return errno.I_CORRUPT;
 }
 
 // read_coef (section 6.4.26) for the token just decoded. BitDepth is 8, so

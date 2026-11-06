@@ -371,8 +371,8 @@ fn inter_mv_scale(f as *InterFrame, plane as i64, x as i64, y as i64,
     let is i64 as base_x = (x * xscale) >> it.REF_SCALE_SHIFT;
     let is i64 as base_y = (y * yscale) >> it.REF_SCALE_SHIFT;
 
-    let is i64 as luma_x = x;
-    let is i64 as luma_y = y;
+    let is i64 as luma_x with mut = x;
+    let is i64 as luma_y with mut = y;
     if (plane > 0) {
         luma_x = x << f.sub_x;
         luma_y = y << f.sub_y;
