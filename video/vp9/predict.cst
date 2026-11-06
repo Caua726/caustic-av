@@ -31,6 +31,13 @@
 // from MiCols/MiRows and the plane's subsampling) and notOnRight. The caller
 // also passes the already reconstructed plane, so a transform block that is
 // not the first in a prediction block sees the previous block's output.
+//
+// A transform block may extend past the last sample of the coded plane grid
+// (maxX/maxY) while its top-left sample is still inside. Section 8.5.1 clamps
+// only the reference reads (Min(maxX, ...) and Min(maxY, ...)); the predicted
+// block itself is still size x size. The caller therefore pads each plane by
+// at least size-1 samples on the right and bottom, and the prediction writes
+// land in that padding.
 // =======================================================
 
 use "../../core/errno.cst" as errno;
@@ -42,8 +49,10 @@ use "recon_tables.cst" as rt;
 // have_above  : 1 when samples above the block are valid
 // not_on_right: 1 when the transform block is not on the right edge of the
 //               prediction block (spec's notOnRight; only used for 4x4)
-// max_x/max_y : last valid sample index in this plane, i.e. frame width-1 and
-//               height-1 after subsampling
+// max_x/max_y : last sample index of the coded plane grid: (MiCols*8)-1 and
+//               (MiRows*8)-1, shifted right by the plane's subsampling.
+//               Reference reads clamp to these; only the block's top-left
+//               must lie inside.
 struct IntraEdge {
     have_left    as i64;
     have_above   as i64;
@@ -350,9 +359,17 @@ fn pred_tm(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
 
 // Section 8.5.1: predict one transform block of side 1 << (tx_sz + 2).
 // `plane` points at the top-left sample of the frame plane and `stride` is
-// its row stride in bytes. Returns I_OK, or I_BADPARAM for an inconsistent
-// request (null pointers, a block outside max_x/max_y, availability flags
-// that do not match the block position, or a stride narrower than the frame).
+// its row stride in bytes. The top-left sample must lie inside the plane
+// (0 <= x <= max_x, 0 <= y <= max_y), but the block may overhang the right
+// and bottom edges: every reference-array read (aboveRow, leftCol and the
+// 4x4 top-right extension) is clamped to max_x/max_y exactly as 8.5.1 says,
+// and the full size x size block is written. The caller must allocate each
+// plane with at least size-1 padded samples to the right and below the last
+// valid sample, and pass a stride that covers the padded row; the visible
+// frame boundary is enforced by the clamps, not by rejecting the block.
+// Returns I_OK, or I_BADPARAM for an inconsistent request (null pointers, a
+// top-left outside max_x/max_y, availability flags that do not match the
+// block position, or a stride that cannot hold a frame row).
 fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
               tx_sz as i64, mode as i64, e as *IntraEdge) as i64 {
     if (cast(i64, plane) == 0 || cast(i64, e) == 0) { return errno.I_BADPARAM; }
@@ -369,7 +386,6 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
     let is i64 as log2size = tx_sz + 2;
     if (x < 0 || y < 0) { return errno.I_BADPARAM; }
     if (x > e.max_x || y > e.max_y) { return errno.I_BADPARAM; }
-    if (x + size - 1 > e.max_x || y + size - 1 > e.max_y) { return errno.I_BADPARAM; }
 
     // aboveRow[-1..2*size-1] at abuf[0..2*size]; leftCol at lbuf[0..size-1].
     let is [65]i32 as abuf;
@@ -443,6 +459,8 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
         pred_tm(ab, lb, size, pr);
     }
 
+    // The full block is written even where it crosses max_x/max_y; the
+    // caller's plane padding (see the file header) receives those samples.
     let is i64 as i with mut = 0;
     while (i < size) {
         let is i64 as j with mut = 0;

@@ -40,7 +40,7 @@ struct LfParams {
     sub_y            as i64;   // subsampling_y
     level            as i64;   // loop_filter_level, 0..63
     sharpness        as i64;   // loop_filter_sharpness, 0..7
-    delta_enabled    as i64;   // loop_filter_delta_enabled/update
+    delta_enabled    as i64;   // loop_filter_delta_enabled; 1 applies deltas
     seg_enabled      as i64;   // segmentation_enabled
     seg_abs_or_delta as i64;   // segmentation_abs_or_delta_update
     ref_deltas       as *i64;  // [MAX_REF_FRAMES], when delta_enabled
@@ -57,7 +57,6 @@ struct LfFrame {
     sub_y         as i64;
     level         as i64;
     sharpness     as i64;
-    delta_enabled as i64;
     // LvlLookup[segment][ref][modeType], flattened as (segment*4 + ref)*2 +
     // modeType. 8*4*2 = 64 entries.
     lvl_lookup    as [64]i32;
@@ -111,7 +110,6 @@ fn lf_frame_init(lf as *LfFrame, p as *LfParams) as i64 {
     lf.sub_y = p.sub_y;
     lf.level = p.level;
     lf.sharpness = p.sharpness;
-    lf.delta_enabled = p.delta_enabled;
 
     let is i64 as k with mut = 0;
     while (k < 64) {

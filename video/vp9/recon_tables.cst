@@ -14,14 +14,18 @@
 //       values in a compact text blob (recon_qvalue decodes it); the cosine
 //       table is a 2-byte little-endian blob. Both are committed source:
 //       nothing is generated or left pending.
-//   block and transform size derivations
-//       Spec sections 6.4.10 (max_txsize_lookup), 6.4.22 (get_uv_tx_size)
-//       and 6.4.23 (ss_size_lookup). The spec lists the values by block name;
-//       they are computed from the block's 8x8 width and height instead of
-//       copied into a second table, and the derivations are exact for every
-//       block size the uv path can reach (MiSize >= BLOCK_8X8). Blocks
-//       smaller than 8x8 return TX_4X4 before the table is consulted, as the
-//       spec requires, because their ss_size_lookup entries are BLOCK_INVALID.
+//   block and transform size tables
+//       Spec sections 6.4.10 (max_txsize_lookup), 6.4.22 (get_uv_tx_size),
+//       6.4.23 (ss_size_lookup) and 10.2 (the four num_*_blocks_* lookups).
+//       The conversion tables and max_txsize_lookup are the spec's printed
+//       13-entry arrays, written as conditionals so every entry stays visible
+//       and auditable. The 4x4-unit and 8x8-unit counts are separate helpers:
+//       they are different numbers for the same block, and mixing them
+//       silently changes the loop filter's block-edge modulus. get_uv_tx_size
+//       is reproduced geometrically from the 4x4 counts for the 4:2:0 case
+//       this decoder accepts. Blocks smaller than 8x8 return TX_4X4 before the
+//       tables are consulted, as the spec requires, because their
+//       ss_size_lookup entries are BLOCK_INVALID.
 //
 // The loop filter needs no numeric table: sections 8.8.3 and 8.8.4 define
 // filter size, limit, blimit and thresh arithmetically (the masks are
@@ -183,45 +187,93 @@ fn recon_sin64(angle as i64) as i64 {
     return recon_cos64(angle + 96);
 }
 
-// ── block geometry (spec 6.4.10, 6.4.22, 6.4.23) ────────────────────
+// ── block geometry (spec 6.4.10, 6.4.22, 6.4.23, 10.2) ──────────────
+//
+// Section 10.2 prints four block-size tables and 6.4.10 prints
+// max_txsize_lookup; they are written here as conditionals over the 13
+// BLOCK_* values, in the spec's order. Two unit systems are kept apart on
+// purpose:
+//   * num_4x4_blocks_*: how many 4x4 samples a block spans; this is the unit
+//     of get_plane_block_size (6.4.23).
+//   * num_8x8_blocks_*: how many 8x8 mode-info units it spans. Section 8.8
+//     step 10 multiplies these by 8 to get a sample modulus, so a wrong unit
+//     here disables valid loop-filter block edges rather than merely reading
+//     the wrong geometry.
 
-// num_8x8_blocks_wide_lookup[bs], for bs in 0..12. Returns 0 for a value
-// outside that range so a caller can reject it instead of reading a block as
-// a full superblock.
+// num_8x8_blocks_wide_lookup[bs] (spec 10.2), for bs in 0..12. Returns 0
+// outside that range so a caller can reject the value instead of treating it
+// as a full superblock.
 fn recon_num_8x8_wide(bs as i64) as i64 {
     if (bs < 0 || bs > BLOCK_64X64) { return 0; }
-    if (bs == BLOCK_4X4 || bs == BLOCK_4X8) { return 1; }
-    if (bs == BLOCK_8X4 || bs == BLOCK_8X8 || bs == BLOCK_8X16) { return 2; }
-    if (bs == BLOCK_16X8 || bs == BLOCK_16X16 || bs == BLOCK_16X32) { return 4; }
-    if (bs == BLOCK_32X16 || bs == BLOCK_32X32 || bs == BLOCK_32X64) { return 8; }
-    return 16;   // BLOCK_64X32, BLOCK_64X64
+    if (bs <= BLOCK_8X16) { return 1; }     // 4X4, 4X8, 8X4, 8X8, 8X16
+    if (bs <= BLOCK_16X32) { return 2; }    // 16X8, 16X16, 16X32
+    if (bs <= BLOCK_32X64) { return 4; }    // 32X16, 32X32, 32X64
+    return 8;                               // 64X32, 64X64
 }
 
+// num_8x8_blocks_high_lookup[bs] (spec 10.2).
 fn recon_num_8x8_high(bs as i64) as i64 {
     if (bs < 0 || bs > BLOCK_64X64) { return 0; }
-    if (bs == BLOCK_4X4 || bs == BLOCK_8X4) { return 1; }
-    if (bs == BLOCK_4X8 || bs == BLOCK_8X8 || bs == BLOCK_16X8) { return 2; }
-    if (bs == BLOCK_8X16 || bs == BLOCK_16X16 || bs == BLOCK_32X16) { return 4; }
-    if (bs == BLOCK_16X32 || bs == BLOCK_32X32 || bs == BLOCK_64X32) { return 8; }
-    return 16;   // BLOCK_32X64, BLOCK_64X64
+    if (bs == BLOCK_8X16) { return 2; }
+    if (bs == BLOCK_16X8) { return 1; }
+    if (bs == BLOCK_16X16) { return 2; }
+    if (bs == BLOCK_16X32) { return 4; }
+    if (bs == BLOCK_32X16) { return 2; }
+    if (bs == BLOCK_32X32) { return 4; }
+    if (bs == BLOCK_32X64) { return 8; }
+    if (bs == BLOCK_64X32) { return 4; }
+    if (bs == BLOCK_64X64) { return 8; }
+    return 1;                               // 4X4, 4X8, 8X4, 8X8
 }
 
-// max_txsize_lookup[bs] (spec 6.4.10): the largest transform side a block
-// allows, by its widest dimension.
+// num_4x4_blocks_wide_lookup[bs] (spec 10.2), in 4x4 sample units.
+fn recon_num_4x4_wide(bs as i64) as i64 {
+    if (bs < 0 || bs > BLOCK_64X64) { return 0; }
+    if (bs <= BLOCK_4X8) { return 1; }      // 4X4, 4X8
+    if (bs <= BLOCK_8X16) { return 2; }     // 8X4, 8X8, 8X16
+    if (bs <= BLOCK_16X32) { return 4; }    // 16X8, 16X16, 16X32
+    if (bs <= BLOCK_32X64) { return 8; }    // 32X16, 32X32, 32X64
+    return 16;                              // 64X32, 64X64
+}
+
+// num_4x4_blocks_high_lookup[bs] (spec 10.2), in 4x4 sample units.
+fn recon_num_4x4_high(bs as i64) as i64 {
+    if (bs < 0 || bs > BLOCK_64X64) { return 0; }
+    if (bs == BLOCK_4X8) { return 2; }
+    if (bs == BLOCK_8X4) { return 1; }
+    if (bs == BLOCK_8X8) { return 2; }
+    if (bs == BLOCK_8X16) { return 4; }
+    if (bs == BLOCK_16X8) { return 2; }
+    if (bs == BLOCK_16X16) { return 4; }
+    if (bs == BLOCK_16X32) { return 8; }
+    if (bs == BLOCK_32X16) { return 4; }
+    if (bs == BLOCK_32X32) { return 8; }
+    if (bs == BLOCK_32X64) { return 16; }
+    if (bs == BLOCK_64X32) { return 8; }
+    if (bs == BLOCK_64X64) { return 16; }
+    return 1;                               // 4X4
+}
+
+// max_txsize_lookup[bs] (spec 6.4.10): the largest transform a block allows.
+// This is the spec's direct 13-entry table; deriving it from the block's
+// dimensions is not equivalent. Max(width, height), for example, would give
+// 4X8 and 8X4 a TX_8X8 entry where the spec has TX_4X4, and Min in either
+// unit system is wrong for other non-square shapes. Out-of-range bs maps to
+// TX_4X4, the smallest entry, so a caller that forgot to validate cannot ask
+// for a transform larger than the block.
 fn recon_max_txsize(bs as i64) as i64 {
-    let is i64 as w = recon_num_8x8_wide(bs);
-    let is i64 as h = recon_num_8x8_high(bs);
-    let is i64 as m with mut = w;
-    if (h > m) { m = h; }
-    if (m <= 1) { return TX_4X4; }
-    if (m == 2) { return TX_8X8; }
-    if (m == 4) { return TX_16X16; }
-    return TX_32X32;
+    if (bs < BLOCK_8X8) { return TX_4X4; }       // 4X4, 4X8, 8X4
+    if (bs <= BLOCK_16X8) { return TX_8X8; }     // 8X8, 8X16, 16X8
+    if (bs <= BLOCK_32X16) { return TX_16X16; }  // 16X16, 16X32, 32X16
+    if (bs <= BLOCK_64X64) { return TX_32X32; }  // 32X32..64X64
+    return TX_4X4;                               // out of range
 }
 
-// Block size from a width and height in 8x8 units. Only the shapes the spec
-// defines are produced; a caller with zero dimensions has already been
-// rejected upstream.
+// Block size from a width and height in 4x4 sample units (the units of
+// num_4x4_blocks_*, not 8x8 mode-info units). Only the shapes the spec
+// defines are produced. Callers pass a valid 4:2:0 plane block: a pair that
+// no BLOCK_* describes (which only an invalid ss_size_lookup cell can
+// produce) is not meaningful here.
 fn recon_block_from_units(w as i64, h as i64) as i64 {
     if (w <= 1 && h <= 1) { return BLOCK_4X4; }
     if (w <= 1 && h <= 2) { return BLOCK_4X8; }
@@ -242,10 +294,18 @@ fn recon_block_from_units(w as i64, h as i64) as i64 {
 // `bs` and luma transform `tx_size` under the frame's subsampling. A luma
 // block smaller than 8x8 always uses TX_4X4, which is also the case the
 // spec's ss_size_lookup marks BLOCK_INVALID for chroma.
+//
+// The plane block is ss_size_lookup[bs][subx][suby], which is the 4x4-unit
+// width and height shifted right by the subsampling (at least 1x1). Only
+// (subx, suby) = (1, 1), i.e. 4:2:0, is reachable in this decoder: the I420
+// frame layout cannot carry 4:2:2 or 4:4:4, and those sizes are rejected
+// before prediction. The clamp guards the invalid ss_size_lookup cells that
+// a non-4:2:0 caller could reach; for 4:2:0 every shifted dimension is
+// already at least 1 because bs >= BLOCK_8X8.
 fn recon_uv_tx_size(bs as i64, tx_size as i64, subx as i64, suby as i64) as i64 {
     if (bs < BLOCK_8X8) { return TX_4X4; }
-    let is i64 as w with mut = recon_num_8x8_wide(bs) >> subx;
-    let is i64 as h with mut = recon_num_8x8_high(bs) >> suby;
+    let is i64 as w with mut = recon_num_4x4_wide(bs) >> subx;
+    let is i64 as h with mut = recon_num_4x4_high(bs) >> suby;
     if (w < 1) { w = 1; }
     if (h < 1) { h = 1; }
     let is i64 as plane_bs = recon_block_from_units(w, h);
