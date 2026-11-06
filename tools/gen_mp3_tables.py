@@ -7,10 +7,13 @@ Usage:
         -o audio/mp3/mp3_tables_data.cst
 
 The input is the published bitstream description "MPEG-Layer3 Bitstream
-Syntax and Decoding" (Sieler/Sperschneider), whose Tables 8, 9, 23, 24-41,
-42-59 and 60 carry the values this generator emits.  Nothing is taken from a
-decoder; the parser below only reads numbers and bit strings out of the
-document and checks their dimensions and prefix freedom.
+Syntax and Decoding" (Sieler/Sperschneider), whose Tables 8, 9, 16, 23,
+24-41, 42-59 and 60 carry the values this generator emits.  Nothing is
+taken from a decoder; the parser below only reads numbers and bit strings
+out of the document and checks their dimensions and prefix freedom.  The
+short bitrate, sample-rate, slen and LSF rows are written below from the
+same document (Tables 8, 9, 16 and the LSF procedure); the large tables
+are parsed from the supplied text.
 
 What is generated:
   * MP3_BITRATE_MPEG1/2, MP3_SAMPLE_RATE      (Tables 8 and 9)
