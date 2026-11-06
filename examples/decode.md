@@ -24,7 +24,7 @@ the brief covers, not a required suffix.
 |---|---|
 | `--md5` | Print the per-frame I420 MD5 (the default for video; accepted explicitly for scripts). |
 | `--pcm FILE` | Write decoded interleaved S16LE PCM to `FILE`. |
-| `--threads N` | VP9 tile threads, 1..16, calling thread included. Default 1 = the merged sequential path. Stage 9 API, **PENDING** (see below). |
+| `--threads N` | VP9 tile threads, 1..16, calling thread included. Default 1 = the sequential path. Uses the merged stage 9 API; threaded output equality is unverified. |
 | `--help`, `-h` | Usage on stdout, exit 0. |
 
 ## Output contract
@@ -127,8 +127,8 @@ dimensions use the ceiling chroma sizes, matching both references.
   under-applied by at most `pre-skip` samples (recorded as UNCONFIRMED).
 - **MP3:** native sample rate from the frame header, interleaved S16. The hub
   applies Matroska `DiscardPadding`; LAME/VBRI encoder delay and padding are
-  **not** trimmed, because the stage 10 decode note records that the merged
-  path does not implement gapless trim (`PENDING` there).
+  **not** trimmed, because the hub documents that MP3 gapless trimming is not
+  implemented and leaves the parser's delay/padding fields to a later layer.
 - **Byte order:** the decoder writes S16 into a host `i16` scratch. Every
   supported target is little-endian, so the bytes are S16LE; the example does
   not byte-swap. The reference command is `ffmpeg -f s16le`.
@@ -155,8 +155,9 @@ dimensions use the ceiling chroma sizes, matching both references.
   block, and sends the same packet again, up to 32 times. A track without
   dimensions is refused with `I_DIMS`.
 - Threads are opt-in through `--threads`; the default never binds a worker
-  block and uses the merged sequential walk. The stage 9 note documents that
-  output is meant to be identical for valid streams.
+  block and uses the hub's sequential walk. The merged stage 9 path is meant
+  to produce identical output for valid streams, but that equality has not
+  been verified by this example.
 
 ## Unsupported and error paths
 
@@ -174,23 +175,29 @@ dimensions use the ceiling chroma sizes, matching both references.
 
 ## Assumptions and PENDING
 
-- **Stage 8 MP3 is not merged.** The hub imports `audio/mp3/mp3.cst` and
-  `audio/mp3/mp3_decode.cst`. The example uses only the hub's documented
-  `decode_open`/`send`/`receive`, so it should not need changes when those
-  branches land; if the hub call sites change after merge, this example is
-  unaffected at the API level.
-- **Stage 9 threads are not merged.** `--threads` calls
-  `decode_vp9_threads_work_size` and `decode_vp9_bind_threads`, which the hub
-  marks PENDING. Until the stage 9 branch merges, the hub itself does not
-  compile; the example's thread path is written against the documented API.
-- **VP9 table blobs are still pending.** `vp9_decoder_receive` returns
-  `I_UNSUPPORTED` until `tools/gen_vp9_tables.py` and
-  `tools/gen_vp9_residual_tables.py` have been run and their blobs committed.
-  A VP9 run of this example will therefore stop with that message in the
-  current tree; this is the decoder saying it is not ready, not a frame hash.
-- **MP3 synthesis window.** The stage 8b note says it reads the committed
-  512-entry vector through `mp3_synth_window`. Whether the merged branch left
-  it zero-filled is a merge-time check; this example cannot see it.
+- **MP3 uses the merged decoder.** The hub's `decode_open`/`send`/`receive`
+  path calls the merged `audio/mp3/mp3.cst` parser and
+  `audio/mp3/mp3_decode.cst` decoder; the example itself uses only the hub.
+- **VP9 threads use the merged stage 9 API.** `--threads` calls
+  `decode_vp9_threads_work_size` and `decode_vp9_bind_threads` exactly as the
+  merged `video/vp9/threads.cst` documents. Threaded output equality with the
+  sequential path has not been verified.
+- **VP9 probability and residual blobs are still pending.**
+  `video/vp9/vp9_tables_data.cst` and `video/vp9/residual_tables_data.cst`
+  still hold empty placeholders and `VP9_TABLES_GENERATED` /
+  `VP9_RESIDUAL_TABLES_GENERATED` are 0. `vp9_decoder_receive` therefore
+  returns `I_UNSUPPORTED` until `tools/gen_vp9_tables.py` and
+  `tools/gen_vp9_residual_tables.py` have been run and their output committed.
+  A VP9 run of this example stops with that message until then; this is the
+  decoder saying it is not ready, not a frame hash.
+- **MP3 window blobs are still pending.** `MP3_WINDOW_LONG`,
+  `MP3_WINDOW_START`, `MP3_WINDOW_STOP`, `MP3_WINDOW_SHORT` and
+  `MP3_DCT_TWIDDLE` in `audio/mp3/mp3_tables_data.cst` are empty placeholders
+  and `mp3_window_tables_ready()` reports 0. The merged decoder does not read
+  them: it builds the windows and IMDCT matrices analytically in
+  `mp3_synth.cst`, and only the committed Table 3-B.3 synthesis vector is
+  looked up through `mp3_synth_window`. This example does not inspect that
+  vector.
 - **Ogg Opus end trim** follows RFC 7845 Sections 4.3/4.4 and was written
   from the RFC text. It has not been compared sample-for-sample with FFmpeg or
   `opus_compare`. The one-block delay is enough because the RFC limits the

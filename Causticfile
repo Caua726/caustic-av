@@ -24,9 +24,9 @@ target "run" {
     out "build/run"
 }
 
-// The example CLI. It imports the hub only; the codec modules it reaches are
-// the merged ones plus the stage 8 MP3 and stage 9 thread branches named in
-// examples/decode.md. No external dependency is linked or embedded.
+// The example CLI. It imports the hub only; the merged hub, MP3 decoder and
+// VP9 thread API are the implementation it calls. No external dependency is
+// linked or embedded.
 target "decode" {
     src "examples/decode.cst"
     out "build/decode"

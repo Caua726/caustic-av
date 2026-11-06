@@ -19,8 +19,8 @@
 // contracts and released before exit. Nothing is copied out of the decoder
 // except the PCM delay buffer used for the Ogg Opus final-granule trim.
 //
-// Status: WRITTEN, NOT VERIFIED. See examples/decode.md for the assumptions
-// (stage 8 MP3, stage 9 threads) and the reference commands not yet run.
+// Status: WRITTEN, NOT VERIFIED. See examples/decode.md for the remaining
+// generated blobs and the reference commands not yet run.
 // =======================================================
 
 use "std/io.cst" as io;
