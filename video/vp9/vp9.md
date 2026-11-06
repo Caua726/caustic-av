@@ -1,14 +1,22 @@
 # VP9: full frame decoding
 
-Stages 3-5 of the VP9 decoder. Stage 3 turns a packet into the frame's
+Stages 3-6 of the VP9 decoder. Stage 3 turns a packet into the frame's
 uncompressed and compressed headers, the reference and segmentation state
 that survives between frames, the probability contexts, and the byte ranges
 of the tiles. Stage 4 adds the tile walk, intra prediction, residual
 decoding, inverse transforms and the loop filter. Stage 5 adds inter frames
 (6.4.11-6.4.20 and 6.5), compound and scaled prediction (8.5.2), backward
 probability adaptation (8.3-8.4), and the pixel reference slots of 8.9-8.10.
-`decode.cst` is the frame driver; show_existing_frame and display order are
-stage 6.
+Stage 6 completes the profile-0 bitstream surface: show_existing_frame
+(8.9), the packet-to-display handoff with hidden frames, the public I420
+output record, variable frame sizes with a reallocatable reference pool,
+error-resilient and parallel-decoding frames, intra-only frames, the full
+1..64 x 1..4 tile grid, and the remaining loop-filter/segmentation/lossless
+paths. `decode.cst` is the frame driver.
+
+Every item in this note is **WRITTEN, NOT VERIFIED**: nothing has been
+compiled or run, and the checks named for the test phase have not been
+executed.
 
 Only profile 0 is accepted. The syntax of profiles 1-3 is different enough
 (4:2:2/4:4:4, 10/12-bit, an extra reserved bit after the profile bits) that
@@ -35,7 +43,7 @@ guessing would be worse than refusing: `vp9_header_parse` returns
 | `video/vp9/adapt.cst` | Backward probability adaptation of 8.3-8.4 over its own i64 tables. |
 | `video/vp9/adapt_bridge.cst` | Copies between `vp9_tables.cst`'s u8/byte layout and `adapt.cst`'s i64 layout and runs one `refresh_probs` (6.1.2). |
 | `video/vp9/loopfilter.cst` | The loop filter of 8.8. |
-| `video/vp9/decode.cst` | The frame driver: pool selection, tile walk, adaptation, loop filter, segment/mv bookkeeping, publish. |
+| `video/vp9/decode.cst` | The frame driver: packet split and send/receive handoff, pool selection, tile walk, adaptation, loop filter, segment/mv bookkeeping, show_existing output, publish. |
 | `tools/gen_vp9_tables.py` | Reads the specification text, validates every table's dimension and value range, and writes `vp9_tables_data.cst`. |
 
 The specification used is `.work/vp9/spec/clean.txt` (VP9 Bitstream &
@@ -76,26 +84,55 @@ copies every table and marks the context initialised;
 saved is corrupt input: libvpx calls it "uninitialized entropy context", and
 `vp9_state_load_probs` returns `I_CORRUPT` for it.
 
-## Frame decoding (stage 4-5)
+## Frame decoding (stage 4-6)
 
 `Vp9Decoder` owns `Vp9State`, the eight `refs.cst` slots, a reference pixel
-pool and the work block. The caller allocates the decoder object, a persistent
-work block (`vp9_work_size`) and up to nine pixel buffers
-(`vp9_decoder_add_buffer`); the library allocates nothing. `Vp9Decoder` is
-large (the `Vp9State` probability contexts plus `adapt.cst`'s i64 working set
-and counts, roughly 140 KiB), so it belongs in caller storage, not on a small
-stack.
+pool, the armed packet and the work block. The caller allocates the decoder
+object, a persistent work block (`vp9_work_size`) and up to nine pixel
+buffers (`vp9_decoder_add_buffer`); the library allocates nothing.
+`Vp9Decoder` is large (the `Vp9State` probability contexts plus `adapt.cst`'s
+i64 working set and counts, roughly 140 KiB), so it belongs in caller
+storage, not on a small stack.
+
+### Packet and output handoff
+
+`vp9_decoder_send(d, data, len)` validates the Annex B split (single frame or
+1..8 frame superframe) and stores the slice addresses and lengths; the bytes
+themselves stay the caller's. `vp9_decoder_receive(d, out)` then decodes
+slices from that packet until it has one frame to display: it returns 1 with
+`out` filled, or 0 when the packet has no further output. A packet therefore
+yields 0..8 outputs, in bitstream order, one per `receive` call.
+
+- A hidden coded frame (`show_frame == 0`) updates the reference slots and
+  yields no output; `receive` continues with the next slice.
+- A shown coded frame yields the pixels just reconstructed.
+- `show_existing_frame` yields the stored slot named by
+  `frame_to_show_map_idx` without decoding a tile or changing any state.
+
+`send` refuses a new packet while the previous one is undrained, so no frame
+of a packet can be skipped or handed out twice. The output record
+(`Vp9Output`) carries the I420 view (visible `width`/`height`, plane pointers
+and coded strides), the 7.2.4 render hint, profile, bit depth, subsampling,
+color space/range and a monotonically rising `order` hint. A packet with only
+hidden frames returns 0 and never produces a placeholder frame; the caller
+recognises "no output" by the return value, not by a zeroed view.
+
+The output view is valid until the next `receive` or `send` call. If the
+frame was published into a reference slot, its pixels stay valid while any
+slot names that buffer, which is what makes a later `show_existing` view of
+the same pixels safe.
 
 ### Reference pixel lifetime
 
 Each pool buffer is a caller-owned range. A decode picks a buffer whose pool
-index is named by no published slot (`refs.in_use`) and whose capacity holds
-`vp9_frame_size(width, height)`; if none is free and large enough the call
-returns `I_NOMEM` with `d.frame_need`, and the caller may
+index is named by no published slot (`refs.in_use`), whose range is
+publishable (`vp9_refs_buffer_publishable`) and whose capacity holds
+`vp9_frame_size(width, height)`; if none qualifies the call returns
+`I_NOMEM` with `d.frame_need`, and the caller may
 `vp9_decoder_replace_buffer` on an index returned by
-`vp9_decoder_free_buffer`. There are nine buffers: eight can be named by the
-reference slots at once, so at least one is always a free decode target (a
-superframe's shown-but-unpublished slice is held for the rest of that call).
+`vp9_decoder_free_buffer`. Nine buffers suffice because the packet handoff
+is lazy: at most one displayed frame exists outside the eight reference
+slots, and that frame was just decoded into the single transient buffer.
 With fewer than nine registered buffers an inter stream can reach `I_NOMEM`
 when every reference slot is live. Decoding never writes a published
 reference.
@@ -108,9 +145,7 @@ call. `refresh_frame_flags == 0` publishes nothing and leaves the buffer
 free. A frame may reference the very slot it later refreshes; publish is
 after the tiles, so the old pixels are only replaced once prediction is
 finished. `vp9_refs_buffer_in_use(map, id)` tells the caller when a buffer
-may be reused or freed. An output view of a frame that was not published
-(`show_frame == 1` with `refresh_frame_flags == 0`) stays valid only until
-the next decode call or until its buffer is replaced.
+may be reused or freed.
 
 `coded_w = round64(MiCols*8) + 64`, likewise for height; the 64-sample band
 on the right and bottom is what 6.4.21's overhanging edge blocks write.
@@ -120,38 +155,108 @@ Pending review notes).
 
 ### Per-slice order
 
-`vp9_decoder_decode` splits a superframe (Annex B) and calls `_decode_slice`
-for each frame in order. One slice:
+`vp9_decoder_receive` calls `_decode_slice` for one slice of the armed packet
+at a time. The output a slice may produce is returned immediately, so the
+order below is the bitstream order of section 8.1. One slice:
 
-1. `vp9_header_parse` (6.2-6.3), then the format, pending-table and
-   compressed-header checks.
-2. For an inter frame: `vp9_refs_check_header` against the pixel slots and
+1. `vp9_header_parse` (6.2-6.3). If `show_existing_frame == 1`, section 8.9
+   is the whole slice: `refs.vp9_refs_show_existing` copies the stored slot
+   view, `_out_from_slot` fills the output record from that slot (never from
+   the zeroed header geometry), and the slice returns. No compressed header
+   is parsed, no tile is decoded, no filter runs, `PrevSegmentIds` and
+   `PrevRefFrames` are untouched, and nothing is published (8.10 step 2 is
+   explicitly skipped when `show_existing_frame == 1`).
+2. Format, pending-table and compressed-header checks. A profile-0 surface
+   that is not 8-bit 4:2:0 returns `I_UNSUPPORTED`; a pending probability or
+   coefficient blob also returns `I_UNSUPPORTED` before any surface is
+   touched.
+3. For an inter frame: `vp9_refs_check_header` against the pixel slots and
    the 7.2.5 size-ratio requirement (at least one reference must satisfy
    `scale.vp9_scale_ratio_ok`); the per-reference bound of 8.5.2.3 is
    enforced again by `inter.cst` at every prediction.
-3. Select a free pool buffer, form the coded frame view, zero it.
-4. Carve the per-frame work arrays. For an intra or error-resilient frame,
+4. Select a free pool buffer (not named by a slot, publishable, large
+   enough), form the coded frame view, zero it.
+5. Carve the per-frame work arrays. For an intra or error-resilient frame,
    clear `PrevSegmentIds` (7.2), independently of the header's
-   `seg_map_clear`. Clear the current frame's `Mvs`/`SubMvs` (6.5 reads both
-   lists of a candidate before deciding, and 8.10 copies the field for the
-   next frame).
-5. `tile_decode_all` (6.4): one Boolean decoder per tile, above contexts
+   `seg_map_clear`; a size change also clears the current grid because
+   6.4.14 would otherwise index the old map at the new dimensions. Clear the
+   current frame's `Mvs`/`SubMvs` (6.5 reads both lists of a candidate
+   before deciding, and 8.10 copies the field for the next frame).
+6. `tile_decode_all` (6.4): one Boolean decoder per tile, above contexts
    once per frame, left contexts once per 8x8 row. For each block,
    `block.cst` decodes the partition tree, mode info, prediction and
    residual, and writes the mode-info arrays through `mvpred.cst`.
-6. `adapt_bridge.vp9_adapt_frame`: 6.1.2 exactly. If
+7. `adapt_bridge.vp9_adapt_frame`: 6.1.2 exactly. If
    `error_resilient_mode == 0 && frame_parallel_decoding_mode == 0`, load
-   the frame context (discarding the header's forward updates from the
-   adaptation prior), `adapt_coef_probs`, and for an inter frame load
-   `load_probs2` and `adapt_noncoef_probs`; then, if
-   `refresh_frame_context == 1`, save the context. `LastFrameType`,
-   `FrameIsIntra`, `interpolation_filter`, `tx_mode` and
-   `allow_high_precision_mv` all come from the parsed header. Counts were
-   cleared per frame and were accumulated by the tiles.
-7. Loop filter (8.8), then 8.1 step 3 (`PrevSegmentIds`), then 8.10 step 2
-   (`PrevRefFrames`/`PrevMvs` from the current arrays).
-8. Publish (8.10 step 1). If `show_frame == 1`, the output view is the
-   decoded frame; otherwise the output stays cleared.
+   the saved frame context (the adaptation prior is the context saved by the
+   previous save, not the header's forward-updated working tables),
+   `adapt_coef_probs`, and for an inter frame load `load_probs2` and
+   `adapt_noncoef_probs`; then, if `refresh_frame_context == 1`, save the
+   context. `error_resilient_mode == 1` forces
+   `frame_parallel_decoding_mode = 1` in 6.2, so neither a load nor an
+   adaptation happens, while `refresh_frame_context` is 0 and nothing is
+   saved. `LastFrameType`, `FrameIsIntra`, `interpolation_filter`, `tx_mode`
+   and `allow_high_precision_mv` all come from the parsed header. Counts were
+   cleared per frame and accumulated by the tiles; frames that skip
+   adaptation simply discard them. `refresh_frame_context == 1` with
+   `frame_parallel_decoding_mode == 1` still saves the header's forward
+   updates (8.1's refresh_probs save step), without adapting.
+8. Loop filter (8.8) when `loop_filter_level != 0`, then 8.1 step 3
+   (`PrevSegmentIds`), then 8.10 step 2 (`PrevRefFrames`/`PrevMvs` from the
+   current arrays).
+9. Publish (8.10 step 1). If `show_frame == 1`, fill the output record from
+   the decoded frame; otherwise return 0 and continue with the next slice.
+
+### Output and display rules
+
+- One `receive` call returns at most one frame. Hidden frames are decoded as
+  receive advances through the packet, but they are never turned into an
+  output view.
+- Show-existing returns at the time its slice appears in the bitstream, so
+  its display position is preserved even though the pixels are older.
+- The shown geometry is `FrameWidth`/`FrameHeight` for a coded frame and the
+  slot's `RefFrameWidth`/`RefFrameHeight` for show-existing; the two may
+  differ, including across a resolution change in the same packet.
+- `render_width`/`render_height` are the 7.2.4 hints: the current frame's for
+  a coded frame, the stored frame's for show-existing. They never affect
+  decoding or buffer selection.
+- The output has no fake fallback: `receive` returns 0 for "no more output"
+  and a negative code for an error. A packet with no displayed slice yields
+  no output at all.
+- `order` rises by one per returned frame (hidden frames do not consume an
+  output number), so a caller can detect that a show-existing output is a
+  new presentation event even though it repeats an old storage slot.
+
+### Variable frame size and reference resizing
+
+A stream may change `FrameWidth`/`FrameHeight` at any coded frame, and a
+show-existing slice may show a frame of a different size without changing
+the stream size at all.
+
+- A new size never invalidates a reference slot. Slots keep their own visible
+  and coded geometry; scaled inter prediction (7.2.5 and 8.5.2.3) is what
+  makes the difference legal.
+- Only the current frame needs a buffer for its own size:
+  `vp9_frame_size(width, height)` is 6.4's coded geometry,
+  `round64(MiCols*8) + 64` by the same for height. A free buffer that cannot
+  hold it produces `I_NOMEM` and `frame_need`; the caller replaces a free
+  buffer (`vp9_decoder_free_buffer`, `vp9_decoder_replace_buffer`) and sends
+  the packet again. A key frame republishes all eight slots from its one
+  buffer, so no old slot of the previous size survives it; an inter frame
+  leaves the other slots at their sizes.
+- `MiCols`/`MiRows`, `Sb64Cols`/`Sb64Rows`, `seg_map_clear` and
+  `use_prev_frame_mvs` are recomputed by `compute_image_size` (7.2.6) for
+  every frame that runs it. A size change sets `seg_map_clear` and disables
+  `use_prev_frame_mvs`; a show-existing frame runs neither, so it changes
+  no size bookkeeping.
+- The render size (7.2.4) is output metadata only. A render-size change
+  needs no buffer and never affects prediction; show-existing reports the
+  render hint stored with the slot.
+- Show-existing reads its geometry and format from the slot
+  (8.9: `RefFrameWidth`, `RefFrameHeight`, `RefSubsamplingX/Y`,
+  `RefBitDepth`), not from the zeroed header fields listed in stage 3's
+  Pending note 3. It can therefore display a frame smaller or larger than
+  the coded frames around it, even across a resolution change.
 
 ### Inter mode info
 
@@ -178,7 +283,7 @@ average with `Round2(a+b, 1)`. `blockIdx` is derived from the plane block
 (`it_plane_block_dims`), never from the MiSize alone, so the 8.5.2.1
 averages cannot read another piece's vector or the next reference list.
 
-### Stage 5 integration changes
+### Stage 5-6 integration changes
 
 These touch adopted stage 4-5 modules and are required for ordinary frame
 sizes; they do not change valid-stream output:
@@ -200,6 +305,16 @@ sizes; they do not change valid-stream output:
   the output is a view into the selected pool buffer, and the caller
   registers buffers up front. `frame_need`/`work_need` report the sizes to
   grow.
+- Stage 6 replaces the single-output `vp9_decoder_decode` with the
+  `vp9_decoder_send`/`vp9_decoder_receive` pair and the `Vp9Output` record.
+  A packet is consumed lazily, one slice per receive, so at most one display
+  view exists beside the reference slots. The old call could only return the
+  last displayed slice of a superframe; the new one returns every displayed
+  slice exactly once, in order.
+- Stage 6 adds the `show_existing_frame` branch before every table and tile
+  check, and the pre-decode `vp9_refs_buffer_publishable` test in
+  `_pick_buffer`, so a pool buffer is only ever chosen when no published
+  slot names its range.
 
 ### Coefficient and probability counts
 
@@ -236,9 +351,12 @@ must have been split first with `vp9_superframe_split`.
   profile, bit depth, chroma subsampling and color space, otherwise
   `I_CORRUPT` (sections 7.2 and 8.2). Only then does frame size with refs
   read `found_ref` until one is set and take that reference's dimensions.
-  The size-ratio conformance check of section 7.2.5 is not performed; see
-  Pending review notes. Inter frames inherit the color configuration of the
-  last coded frame, as they have no color config of their own.
+  The header records the sizes; the section 7.2.5 ratio requirement is
+  applied by `_decode_slice` before any buffer is chosen (at least one of the
+  three references must pass `scale.vp9_scale_ratio_ok`) and again per
+  reference by `inter.cst` at 8.5.2.3. Inter frames inherit the color
+  configuration of the last coded frame, as they have no color config of
+  their own.
 - Compressed header: `load_probs`, `load_probs2`, `clear_counts`, then
   `init_bool(header_size_in_bytes)` and, in specification order, tx mode,
   tx mode probs, coefficient probs, skip probs and — for inter frames —
@@ -283,6 +401,35 @@ header parser is unaffected: every compressed-header field is read with a
 fixed probability (252 or 128), so the bit position and every header field
 are correct without the blobs. `vp9_tables_ready()` reports the state, and
 `Vp9Header.probs_pending` carries it to the caller.
+
+## Remaining conformance paths
+
+Stage 6 closes the profile-0 syntax surface for the `vp90-2-*` suite. The
+paths and where they live:
+
+| Path | Where |
+|---|---|
+| Segmentation map prediction across intra/inter frames (`inter_segment_id`, `get_segment_id`, temporal update, `PrevSegmentIds`) | `block.cst` 6.4.12-6.4.14; `decode.cst` 7.2/8.1 step 3; header `seg_*` state |
+| Error-resilient frames (`setup_past_independence`, no `UsePrevFrameMvs`, forced parallel mode, no adaptation) | `header.cst` 6.2; `decode.cst` `_decode_slice`; `adapt.cst` `refresh_probs` |
+| `frame_parallel_decoding_mode` with `refresh_frame_context`: skip load/adapt, still save when requested; counts discarded | `adapt_bridge.cst`, `adapt.cst` |
+| Intra-only frames (color defaults, refresh mask, key-like partition table, no inter refs) | `header.cst`, `vp9_partition_prob`, `block.cst` |
+| Tiles 1x1..64x4 (per-tile Boolean decoder, above contexts once per frame, left contexts per 8x8 row) | `tile.cst` 6.4.1-6.4.2, 7.4 |
+| Loop filter deltas, sharpness and level 0 (a level-0 frame is never filtered, even with a segment ALT_L) | `loopfilter.cst` 8.8; `decode.cst` gate |
+| Lossless frames (4x4 WHT, DCT_DCT type selection) | `header.cst` (tx_mode), `residual.cst`, `transforms.cst` |
+| Skip blocks (skip context, `SEG_LVL_SKIP`, EobTotal-to-skip rule for inter >= 8x8) | `block.cst` 6.4.4/6.4.8/6.4.11 |
+| `allow_high_precision_mv` (UseHp, class0/hp bits, counts only when read) | `block.cst` 6.4.19-20, `mvpred.cst` 6.5.12-13 |
+| Switchable interpolation and compound reference modes | `block.cst` 6.4.16-17, `inter.cst` 8.5.2 |
+| `show_existing_frame` and display handoff (0..8 outputs per packet, hidden frames, stored-slot output) | `decode.cst` 8.9/8.10, `refs.cst` |
+| Variable frame sizes, scaled references and the 7.2.5/8.5.2.3 bounds | `header.cst` 6.2.5/7.2.5, `decode.cst`, `scale.cst`, `inter.cst` |
+
+Everything above is implemented but **not verified**: no frame has been
+decoded. The test phase must compare every displayed frame of the suite with
+libvpx's MD5 (the `.md5` files beside the vectors), check the container
+metadata with `ffprobe`, and compare the header fields with
+`trace_headers` (`-bsf:v trace_headers`). Superframe order needs a file with
+hidden alt-ref frames; variable size needs a resolution-change stream;
+show-existing needs a stream whose superframe ends with a show-existing
+slice.
 
 ## Errata
 
@@ -437,12 +584,13 @@ checks the header does not perform.
    of `PrevSegmentIds` at frame start when `h.seg_map_clear == 1`, before
    any block reads it. Both are recorded as UNCONFIRMED.
 
-5. **Reference pool API changed.** `vp9_decoder_decode` no longer takes a
-   per-call `mem`/`cap`: the output is a view into a pool buffer registered
-   with `vp9_decoder_add_buffer`. A caller that only wants one frame can
-   register one buffer, but then it cannot decode an inter frame (which
-   needs published references). Stage 6 may want a `show_existing` entry
-   point that copies a slot view without a decode target.
+5. **Reference pool API.** The public call is now the
+   `vp9_decoder_send`/`vp9_decoder_receive` pair. The output is a view into
+   a pool buffer registered with `vp9_decoder_add_buffer`; no per-call
+   `mem`/`cap` exists and the decoder never copies pixels. A caller that
+   only wants one frame can register one buffer, but then it cannot decode
+   an inter frame (which needs published references). `show_existing` needs
+   no decode target at all; it copies the slot view.
 
 6. **Coded size at the dimension ceiling.** `coded_w = round64(MiCols*8) +
    64` exceeds `core/frame.cst`'s `FRAME_MAX_DIM` when the visible side is
@@ -462,24 +610,96 @@ checks the header does not perform.
    `ref_stride`. These are documented at their definitions and in
    `inter.md`'s pending notes; they do not change valid-stream output.
 
+9. **Packet ownership and drain discipline.** `vp9_decoder_send` stores
+   pointers into the caller's packet and refuses to arm a second packet
+   until `vp9_decoder_receive` has returned 0 for the first. That is what
+   keeps every output handed out once, but it makes the packet buffer and
+   the output-view lifetime caller obligations; both are documented in
+   `decode.cst` and `decode.md`. A caller that forgets the final receive
+   gets `I_BADPARAM` on the next send rather than silent frame loss.
+
+10. **One output buffer outside the slots.** Because the packet handoff is
+    lazy, the pool of nine is sufficient even when a superframe contains
+    several displayed slices: the previous output may be reused by the next
+    `receive` call, and its view expires then. A caller that wants to retain
+    more than the current frame must copy it; the decoder deliberately
+    allocates no display queue. If a future API wants multiple live output
+    views, the pool has to grow (libvpx uses 8 + 1 + 3 = 12 frame buffers).
+
+11. **`order` is a hint, not a timestamp.** It is a monotonic counter over
+    returned frames; hidden frames do not consume one, show-existing does.
+    The decoder cannot derive presentation timestamps from the bitstream,
+    so the caller must keep its own timebase.
+
+12. **Two-pass packet reuse.** A caller that gets `I_NOMEM` for a later
+    slice of a superframe cannot resume that packet: the slices already
+    decoded have published references and advanced the persistent state.
+    Size the pool for the stream's largest frame before sending, or resync
+    at the next key frame. This is the same taint rule as a rejected
+    header.
+
 ## Limitations and deferred work
 
-- Profile 0 only, 8-bit 4:2:0; other profiles return `I_UNSUPPORTED`.
-- `show_existing_frame` returns `I_UNSUPPORTED`. Stage 6 adds it through
-  `refs.vp9_refs_show_existing`, plus presentation order and the display
-  handoff for superframes.
+- Profile 0 only, 8-bit 4:2:0; other profiles, 4:2:2/4:4:4, 10/12-bit and
+  CS_RGB return `I_UNSUPPORTED` (or `I_CORRUPT` where 6.2 makes CS_RGB a
+  conformance violation for profile 0).
 - The three probability blobs are pending (above). Until they are generated,
-  tile decoding is blocked by design; header parsing and the mode-info
-  syntax are unaffected.
+  tile decoding is blocked by design; header parsing, show-existing,
+  mode-info syntax and the packet split are unaffected.
 - The planning brief's stage-3 test file (`tests/test_vp9_headers.cst`, its
   IVF/raw fixtures and the `trace_headers` oracle commands) was **not
   written**: the coordinator removed the test phase and instructed that no
   new test suites or oracle scripts be added. `tests/run.cst` is untouched.
-  No stage 4/5 tests were added for the same reason.
+  No stage 4-6 tests were added for the same reason.
+- Multi-threaded tile decoding, row-mt, SIMD/`dsp/` kernels and lossless
+  encoder support are not part of this stage.
+
+### Stage 9/10 scope (not this stage)
+
+Stage 6 stops at a correct single-threaded profile-0 frame decoder with the
+send/receive handoff. The plan's later stages own:
+
+- **Stage 9 (`stage9-perf`):** SIMD in `dsp/` and threads, written with no
+  fps measurement. The hot kernels are already isolated in `block.cst`,
+  `residual.cst`, `transforms.cst`, `predict.cst`, `inter.cst` and
+  `loopfilter.cst`; a threaded path must either keep the above/left context
+  lifetimes of 7.4 per tile row or serialise them, and must sum the
+  per-tile counts before `vp9_adapt_frame`. None of that changes the
+  bitstream semantics documented here.
+- **Stage 10 (`examples/decode.cst`):** the `.webm`/`.ogg`/`.opus`/`.mp3`
+  decode example and the public `decode` hub. That layer maps
+  `Vp9Output` to the shared `frame.Frame` plus color metadata, passes the
+  packet bytes borrowed from the demuxer, and carries container timestamps,
+  since VP9 codes none. The container's CodecPrivate / `vpcC` color
+  overrides belong to that layer, not to the codec driver.
+- The encoder is outside the decoder stages entirely.
 
 ## Reference implementations read
 
 Only for behaviour; no code was copied, ported or transcribed.
+
+Stage 6 read these files straight from their upstream URLs:
+
+- libvpx `main`, `vp9/decoder/vp9_decodeframe.c` (show_existing header
+  path, `read_uncompressed_header` reference checks, the `decode_tiles`
+  loop-filter gate `cm->lf.filter_level && !cm->skip_loop_filter`, the
+  frame-end `vp9_adapt_coef_probs`/`vp9_adapt_mode_probs` sequence and the
+  `refresh_frame_context` save);
+- libvpx `main`, `vp9/decoder/vp9_decoder.c` (the separate working
+  `cm->fc`, `frame_contexts`, and buffer count
+  `FRAME_BUFFERS = REF_FRAMES + 1 + REFS_PER_FRAME`);
+- libvpx `main`, `vp9/common/vp9_entropy.c` and
+  `vp9/common/vp9_entropymode.c` (adaptation reads its prior from
+  `frame_contexts[idx]` and writes the working context, so the header's
+  forward updates are not the adaptation prior);
+- FFmpeg `master`, `libavcodec/vp9.c` (`prob_ctx` copy, compressed-header
+  forward updates into `s->prob.p`, `ff_vp9_adapt_probs` adapting the saved
+  context, the `refreshctx && !parallelmode` condition, and the
+  frame-progress reference lifetime);
+- FFmpeg `master`, `libavcodec/vp9prob.c` (`ff_vp9_adapt_probs`, the saved
+  `prob_ctx` as the prior and the key/intra skip/tx copy);
+- FFmpeg `master`, `libavcodec/vp9block.c` (block mode and MV syntax;
+  read alongside `vp9.c` for the inter paths).
 
 Stage 5 read these four files straight from their upstream URLs:
 
