@@ -1,12 +1,14 @@
 #!/bin/sh
 # Mini player: caustic-av decodes the video, mpv shows the frames.
 #
-#   tools/play.sh <file>        live: frames shown as they are decoded, silent
+#   tools/play.sh <file>        real time with audio, no seeking; needs the
+#                               decoder to keep up with the video
+#   tools/play.sh <file> live   frames shown as they are decoded, silent, for
+#                               videos the decoder cannot keep up with
 #   tools/play.sh <file> <N>    decode the first N seconds, then play them at
 #                               normal speed with audio and seeking
 #
-# The decoder is slower than real time, and a pipe cannot seek, so only the
-# second form can keep speed and audio. Build first with:
+# A pipe cannot seek, so only the last form can. Build first with:
 #   caustic -O2 examples/decode.cst -o build/decode
 set -eu
 in=$1
@@ -23,6 +25,12 @@ raw="--demuxer=rawvideo --demuxer-rawvideo-w=$w --demuxer-rawvideo-h=$h
   --title=caustic-av"
 
 if [ "$secs" = 0 ]; then
+  "$dec" --yuv --threads "$threads" "$in" 2>/dev/null | mpv $raw \
+    --audio-file="$in" ${MPV_ARGS:-} -
+  exit
+fi
+
+if [ "$secs" = live ]; then
   "$dec" --yuv --threads "$threads" "$in" | mpv $raw --no-audio --cache=no \
     --cache-pause=no --untimed ${MPV_ARGS:-} -
   exit
