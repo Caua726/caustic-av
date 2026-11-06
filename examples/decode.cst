@@ -80,6 +80,11 @@ struct Session {
     sink_ogg_opus as i64;
     sink_last_pts as i64;
     sink_last_pts_valid as i64;
+    sink_cur_pts as i64;
+    sink_first_pts as i64;
+    sink_first_valid as i64;
+    sink_first_open as i64;
+    sink_first_samples as i64;
     sink_total as i64;
     sink_written as i64;
     sink_pending_count as i64;
@@ -459,6 +464,13 @@ fn _emit_audio(s as *Session, ti as i64, out as *av.decode.Output) as i64 {
 
     if (s.sink_track != ti) { return av.errno.I_OK; }
 
+    // Samples returned by the first Ogg Opus page are needed to recover the
+    // stream's initial PCM position (RFC 7845 Section 4.5).
+    if (s.sink_ogg_opus != 0 && s.sink_first_open != 0
+        && s.sink_cur_pts == s.sink_first_pts) {
+        s.sink_first_samples = s.sink_first_samples + count;
+    }
+
     // A track-based MP3 open can still publish 0 channels/rate before the
     // first frame supplies them; adopt the first block's values.
     if (s.sink_rate <= 0) { s.sink_rate = out.audio.rate; }
@@ -539,6 +551,11 @@ fn _sink_start(s as *Session, ti as i64, t as *av.codec.Track,
     }
     s.sink_last_pts = 0;
     s.sink_last_pts_valid = 0;
+    s.sink_cur_pts = 0;
+    s.sink_first_pts = 0;
+    s.sink_first_valid = 0;
+    s.sink_first_open = 0;
+    s.sink_first_samples = 0;
     s.sink_total = 0;
     s.sink_written = 0;
     s.sink_pending_valid = 0;
@@ -548,11 +565,21 @@ fn _sink_start(s as *Session, ti as i64, t as *av.codec.Track,
     return av.errno.I_OK;
 }
 
-// RFC 7845 4.4: the final page granule minus pre-skip is the PCM sample
-// position to keep. The discarded tail cannot exceed the last packet, so it
-// fits in the one delayed block. A granule larger than the decoded total is a
-// stream that started above zero (RFC 7845 4.5); then there is nothing to
-// trim and every decoded sample is kept.
+// RFC 7845 4.3/4.4: the final page granule minus pre-skip is the final PCM
+// sample position; the number of samples to keep is that position minus the
+// stream's initial PCM position. A normal stream starts at granule zero, so
+// the initial position is zero. A cropped or joined stream (Section 4.5) can
+// start at a positive granule; the initial position is then
+//
+//   first_page_granule - first_page_decoded_samples - pre_skip
+//
+// and the example estimates first_page_decoded_samples as the samples the
+// first page returned plus the pre-skip. That is exact when the pre-skip lies
+// inside the first audio page, which is the normal encoder layout; if the
+// pre-skip spans the whole first page the estimate is smaller by the overflow
+// and the end trim is under-applied by at most pre-skip samples. The
+// discarded tail itself cannot exceed the last packet, so it fits in the one
+// delayed block.
 fn _sink_finish(s as *Session) as i64 {
     if (s.sink_track < 0 || s.sink_pending_valid == 0) {
         return av.errno.I_OK;
@@ -562,12 +589,25 @@ fn _sink_finish(s as *Session) as i64 {
 
     if (s.sink_ogg_opus != 0 && s.sink_last_pts_valid != 0
         && s.sink_last_pts >= 0) {
-        let is i64 as target = s.sink_last_pts - s.sink_pre_skip;
-        if (target < 0) {
+        let is i64 as initial with mut = 0;
+        if (s.sink_first_valid != 0 && s.sink_first_pts >= 0
+            && s.sink_first_pts >= s.sink_first_samples) {
+            let is i64 as d = s.sink_first_pts - s.sink_first_samples;
+            if (d > s.sink_pre_skip) { initial = d - s.sink_pre_skip; }
+        }
+        if (s.sink_last_pts < s.sink_pre_skip) {
             io.write_str(io.STDERR,
                 "decode: final Ogg Opus granule is before the pre-skip\n");
             return av.errno.I_CORRUPT;
         }
+        let is i64 as after = s.sink_last_pts - s.sink_pre_skip;
+        if (after < initial) {
+            io.write_str(io.STDERR,
+                "decode: final Ogg Opus granule is before the start "
+                "position\n");
+            return av.errno.I_CORRUPT;
+        }
+        let is i64 as target = after - initial;
         let is i64 as excess = s.sink_total - target;
         if (excess > 0) {
             if (excess > count) {
@@ -939,6 +979,15 @@ fn _run(path as *u8, pcm_path as *u8, threads as i64) as i32 {
         if (s.dec_state[ti] == 2) { continue; }
 
         if (s.sink_track == ti && s.sink_ogg_opus != 0) {
+            if (s.sink_first_valid == 0) {
+                s.sink_first_pts = pkt.pts;
+                s.sink_first_valid = 1;
+                s.sink_first_open = 1;
+            } else if (pkt.pts != s.sink_first_pts) {
+                // The first audio page with a completed packet has ended.
+                s.sink_first_open = 0;
+            }
+            s.sink_cur_pts = pkt.pts;
             s.sink_last_pts = pkt.pts;
             s.sink_last_pts_valid = 1;
         }

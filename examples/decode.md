@@ -108,14 +108,21 @@ dimensions use the ceiling chroma sizes, matching both references.
 - **Opus:** always 48 kHz, interleaved S16. The effective pre-skip is the
   OpusHead value (`decode_pre_skip`), already applied by the hub. WebM
   `DiscardPadding` is applied by the hub to the packet that ends a block.
-- **Ogg Opus end trim:** RFC 7845 Section 4.4 makes the final page granule the
-  end of the PCM sample position, with `position = granule - pre-skip`
-  (Section 4.3). The example delays writing the last decoded block by one
-  packet, then, at EOF, removes `decoded_total - (final_granule - pre_skip)`
-  samples from the tail and writes the shortened block. The removed count is
-  bounded by the final packet, as the RFC requires; a larger trim is reported
-  as unsupported. A final granule larger than the decoded total means the
-  stream started above position zero (Section 4.5); then nothing is trimmed.
+- **Ogg Opus end trim:** RFC 7845 Sections 4.3/4.4 make the final page granule
+  the end of the PCM sample position, with `position = granule - pre-skip`.
+  The number of samples to keep is that final position minus the stream's
+  initial PCM position. A normal stream starts at granule zero, so the initial
+  position is zero. For a cropped or joined stream (Section 4.5) the example
+  estimates it from the first audio page as
+  `first_granule - first_page_returned_samples - pre_skip`, clamped to
+  non-negative; normal files give exactly zero. The example delays writing the
+  last decoded block by one packet, then, at EOF, removes
+  `decoded_total - (final_granule - pre_skip - initial)` samples from the tail
+  and writes the shortened block. The removed count is bounded by the final
+  packet, as the RFC requires; a larger trim is reported as unsupported. If
+  the pre-skip spans the whole first audio page, the initial-position estimate
+  is smaller than the true one by that overflow, so the trim is under-applied
+  by at most `pre-skip` samples (recorded as UNCONFIRMED).
 - **MP3:** native sample rate from the frame header, interleaved S16. The hub
   applies Matroska `DiscardPadding`; LAME/VBRI encoder delay and padding are
   **not** trimmed, because the stage 10 decode note records that the merged
@@ -186,8 +193,12 @@ dimensions use the ceiling chroma sizes, matching both references.
   from the RFC text. It has not been compared sample-for-sample with FFmpeg or
   `opus_compare`. The one-block delay is enough because the RFC limits the
   discard to the last packet; a larger trim is reported, not silently
-  truncated. Streams whose initial granule is above zero keep every decoded
-  sample (no relative-offset subtraction is attempted).
+  truncated. **UNCONFIRMED:** the initial PCM position for a cropped/joined
+  stream is estimated as `first_granule - first_page_returned - pre_skip`.
+  That is exact when the pre-skip lies inside the first audio page (the normal
+  encoder layout); when the pre-skip spans the whole page it is low by the
+  overflow, so the end trim is under-applied by at most `pre-skip` samples.
+  No joined/cropped vector has been examined.
 - **Multiple video tracks** are hashed in decode order with no per-track
   label. This is a documented example limitation, not a library contract.
 - **No track selection or seeking.** The example decodes every track it can.
