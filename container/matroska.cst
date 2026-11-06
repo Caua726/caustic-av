@@ -22,15 +22,25 @@
 //   (cluster Timecode + block relative timestamp) * TimecodeScale
 // and every value this module reports in pts/dts/duration is in nanoseconds.
 // CodecDelay and SeekPreRoll are reported on the track in nanoseconds; the
-// demuxer does not apply them, because they belong to the decoder's pre-roll
-// handling, not to the container timeline.
+// demuxer does not subtract them, because they describe the decoder's
+// pre-roll rather than the container timeline. (FFmpeg's matroskadec.c
+// subtracts CodecDelay from pts after rounding it to the track's millisecond
+// timebase; that is an AVPacket policy, not the Block timeline. Here the
+// caller sees the container value plus the delay field, and the decoder can
+// apply the pre-roll once, at the right precision.)
+//
+// TrackTimestampScale (0x23314F) would multiply every timestamp of one track;
+// this stage's timing contract is Info TimecodeScale alone, so a value other
+// than 1.0 is refused with I_UNSUPPORTED rather than silently ignored.
 //
 // Lacing: SimpleBlock and Block may pack several frames into one payload.
 // All three modes are decoded (Xiph, fixed-size and EBML) and one packet is
 // returned per lace, in order, with the frame slice, its own pts and its
-// duration. With BlockDuration the duration is divided over the laces; the
-// last lace takes the remainder so the block's total is exact. Without it,
-// each lace takes the track's DefaultDuration (0 when the track has none).
+// duration. A BlockDuration, or DefaultDuration * lace count when the block
+// has none, is spread over the laces with the same integer split FFmpeg uses:
+// lace i gets total*(i+1)/count - total*i/count nanoseconds, so a remainder is
+// spread one nanosecond at a time instead of landing entirely on the last
+// frame.
 //
 // Packet data points into src and stays valid until the next mk_next call,
 // like every borrowed view in this library.
@@ -45,6 +55,9 @@ use "../core/packet.cst" as packet;
 let is i64 as EBML_HEADER        with imut = 440786851;   // 0x1A45DFA3
 let is i64 as EBML_DOC_TYPE      with imut = 17026;       // 0x4282
 let is i64 as EBML_DOC_TYPE_READ with imut = 17029;       // 0x4285
+let is i64 as EBML_READ_VERSION  with imut = 17143;       // 0x42F7
+let is i64 as EBML_MAX_ID_LENGTH with imut = 17138;       // 0x42F2
+let is i64 as EBML_MAX_SIZE_LENGTH with imut = 17139;     // 0x42F3
 
 let is i64 as MK_SEGMENT         with imut = 408125543;   // 0x18538067
 let is i64 as MK_INFO            with imut = 357149030;   // 0x1549A966
@@ -63,6 +76,7 @@ let is i64 as MK_TRACK_TYPE          with imut = 131;     // 0x83
 let is i64 as MK_CODEC_ID            with imut = 134;     // 0x86
 let is i64 as MK_CODEC_PRIVATE       with imut = 25506;   // 0x63A2
 let is i64 as MK_DEFAULT_DURATION    with imut = 2352003; // 0x23E383
+let is i64 as MK_TRACK_TIMESTAMP_SCALE with imut = 2306383; // 0x23314F
 let is i64 as MK_CODEC_DELAY         with imut = 22186;   // 0x56AA
 let is i64 as MK_SEEK_PRE_ROLL       with imut = 22203;   // 0x56BB
 let is i64 as MK_VIDEO               with imut = 224;     // 0xE0
@@ -139,8 +153,7 @@ struct Mk {
     lace_count  as i64;
     lace_index  as i64;
     lace_pts    as i64;        // ns of the first lace
-    lace_dur    as i64;        // ns per lace
-    lace_dur_last as i64;      // ns of the last lace (exact remainder)
+    lace_total  as i64;        // ns of the whole block, split over the laces
     lace_track  as i32;
     lace_key    as i64;
     lace_discard as i64;       // ns, from BlockGroup DiscardPadding
@@ -293,6 +306,14 @@ fn _parse_entry(m as *Mk, e as *ebml.Ebml, off as i64, size as i64,
             r = ebml.ebml_uint(e, &el, &t.default_duration);
             if (r < 0) { return r; }
             if (t.default_duration < 0) { return errno.I_CORRUPT; }
+        } else if (el.id == MK_TRACK_TIMESTAMP_SCALE) {
+            // The default is 1.0. Anything else would scale every timestamp
+            // of this track, which this stage's timing contract does not
+            // model, so say so instead of ignoring it.
+            let is f64 as v with mut = 0.0;
+            r = ebml.ebml_float(e, &el, &v);
+            if (r < 0) { return r; }
+            if (v != 1.0) { return errno.I_UNSUPPORTED; }
         } else if (el.id == MK_CODEC_DELAY) {
             r = ebml.ebml_uint(e, &el, &t.codec_delay);
             if (r < 0) { return r; }
@@ -355,8 +376,7 @@ fn _mk_clear(m as *Mk) as void {
     m.lace_count = 0;
     m.lace_index = 0;
     m.lace_pts = 0;
-    m.lace_dur = 0;
-    m.lace_dur_last = 0;
+    m.lace_total = 0;
     m.lace_track = 0;
     m.lace_key = 0;
     m.lace_discard = 0;
@@ -392,8 +412,7 @@ fn _mk_open(m as *Mk, src as *u8, len as i64) as i64 {
     m.lace_count = 0;
     m.lace_index = 0;
     m.lace_pts = 0;
-    m.lace_dur = 0;
-    m.lace_dur_last = 0;
+    m.lace_total = 0;
     m.lace_track = 0;
     m.lace_key = 0;
     m.lace_discard = 0;
@@ -429,6 +448,36 @@ fn _mk_open(m as *Mk, src as *u8, len as i64) as i64 {
         if (r < 0) { return r; }
         if (v <= 0) { return errno.I_CORRUPT; }
         if (v > 4) { return errno.I_UNSUPPORTED; }
+    }
+
+    // The header names the vint bounds the file uses. This reader is built
+    // for EBML v1, four-byte IDs and eight-byte sizes; a file declaring
+    // wider ones is valid EBML but not something this reader can index.
+    let is ebml.EbmlElement as lim;
+    r = ebml.ebml_find(&e, el.off, el.next, EBML_READ_VERSION, &lim);
+    if (r < 0) { return r; }
+    if (r == 1) {
+        let is i64 as v with mut = 0;
+        r = ebml.ebml_uint(&e, &lim, &v);
+        if (r < 0) { return r; }
+        if (v <= 0) { return errno.I_CORRUPT; }
+        if (v > 1) { return errno.I_UNSUPPORTED; }
+    }
+    r = ebml.ebml_find(&e, el.off, el.next, EBML_MAX_ID_LENGTH, &lim);
+    if (r < 0) { return r; }
+    if (r == 1) {
+        let is i64 as v with mut = 0;
+        r = ebml.ebml_uint(&e, &lim, &v);
+        if (r < 0) { return r; }
+        if (v <= 0 || v > 4) { return errno.I_UNSUPPORTED; }
+    }
+    r = ebml.ebml_find(&e, el.off, el.next, EBML_MAX_SIZE_LENGTH, &lim);
+    if (r < 0) { return r; }
+    if (r == 1) {
+        let is i64 as v with mut = 0;
+        r = ebml.ebml_uint(&e, &lim, &v);
+        if (r < 0) { return r; }
+        if (v <= 0 || v > 8) { return errno.I_UNSUPPORTED; }
     }
 
     // Segment, allowing Void/CRC padding between it and the header.
@@ -648,37 +697,25 @@ fn _parse_block(m as *Mk, off as i64, size as i64, key_in as i64,
                        &base_ns);
     if (r < 0) { return r; }
 
-    let is i64 as per with mut = 0;
-    let is i64 as last with mut = 0;
-    let is i64 as span with mut = 0;
+    let is i64 as total with mut = 0;
     if (have_dur != 0) {
-        let is i64 as total with mut = 0;
         r = _ns_from_ticks(dur_ticks, m.timecode_scale, &total);
         if (r < 0) { return r; }
-        per = total / count;
-        last = total - per * (count - 1);
-        span = total;
     } else {
-        per = t.default_duration;
-        last = per;
-        // The last lace's pts is base + (count-1)*per. Refuse a table that
-        // would overflow that sum rather than wrapping a timestamp.
-        if (count > 1) {
-            if (per > 4611686018427387904 / (count - 1)) {
-                return errno.I_CORRUPT;
-            }
-            span = per * (count - 1);
+        // No BlockDuration: the block spans one DefaultDuration per lace.
+        if (t.default_duration > 4611686018427387904 / count) {
+            return errno.I_CORRUPT;
         }
+        total = t.default_duration * count;
     }
-    if (base_ns > 0 && span > 4611686018427387904 - base_ns) {
+    if (base_ns > 0 && total > 4611686018427387904 - base_ns) {
         return errno.I_CORRUPT;
     }
 
     m.lace_count = count;
     m.lace_index = 0;
     m.lace_pts = base_ns;
-    m.lace_dur = per;
-    m.lace_dur_last = last;
+    m.lace_total = total;
     m.lace_track = cast(i32, ti);
     m.lace_key = key;
     m.lace_discard = discard;
@@ -786,9 +823,14 @@ fn mk_next(m as *Mk, pkt as *packet.Packet) as i64 {
     while (1) {
         if (m.lace_index < m.lace_count) {
             let is i64 as i = m.lace_index;
-            let is i64 as dur with mut = m.lace_dur;
-            if (i == m.lace_count - 1) { dur = m.lace_dur_last; }
-            let is i64 as pts = m.lace_pts + i * m.lace_dur;
+            let is i64 as count = m.lace_count;
+            // floor(total*(i+1)/count) - floor(total*i/count), computed from
+            // the quotient and remainder so the products stay small. pts is
+            // the sum of the preceding lace durations.
+            let is i64 as q = m.lace_total / count;
+            let is i64 as rem = m.lace_total % count;
+            let is i64 as dur = q + (rem * (i + 1)) / count - (rem * i) / count;
+            let is i64 as pts = m.lace_pts + q * i + (rem * i) / count;
             let is i64 as r with mut = packet.packet_set(pkt, m.laces[i].ptr,
                                                 m.laces[i].len, m.lace_track,
                                                 pts, pts, dur, m.lace_key);
