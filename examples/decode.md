@@ -136,10 +136,11 @@ dimensions use the ceiling chroma sizes, matching both references.
   - `decode_vp9_threads_work_size(w, h, N)` bytes for the optional worker
     block, bound with `decode_vp9_bind_threads`.
   `w`/`h` are the container track dimensions. After a recoverable
-  `I_NOMEM`, the example asks `decode_vp9_work_need`/`decode_vp9_frame_need`,
-  grows or replaces only a buffer no reference slot names, and sends the same
-  packet again, up to 32 times. A track without dimensions is refused with
-  `I_DIMS`.
+  `I_NOMEM`, the example asks `decode_vp9_work_need`,
+  `decode_vp9_frame_need` or `decode_vp9_threads_need`, grows the work block,
+  replaces only a pixel buffer no reference slot names, or grows the worker
+  block, and sends the same packet again, up to 32 times. A track without
+  dimensions is refused with `I_DIMS`.
 - Threads are opt-in through `--threads`; the default never binds a worker
   block and uses the merged sequential walk. The stage 9 note documents that
   output is meant to be identical for valid streams.
