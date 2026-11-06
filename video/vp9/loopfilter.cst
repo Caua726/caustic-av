@@ -69,7 +69,8 @@ struct LfBlockInfo {
     tx_sizes    as *u8;   // luma TX_* enum
     skips       as *u8;
     segment_ids as *u8;
-    ref_frames  as *u8;   // RefFrames[..][0]
+    ref_frames  as *u8;   // RefFrames[..][0], ref_stride bytes apart
+    ref_stride  as i64;
     y_modes     as *u8;   // YModes (0..13)
 }
 
@@ -404,7 +405,7 @@ fn lf_filter_sb(lf as *LfFrame, blk as *LfBlockInfo, plane as i64, pass as i64,
                 let is i64 as tx = cast(i64, blk.tx_sizes[idx]);
                 let is i64 as skip = cast(i64, blk.skips[idx]);
                 let is i64 as seg = cast(i64, blk.segment_ids[idx]);
-                let is i64 as ref = cast(i64, blk.ref_frames[idx]);
+                let is i64 as ref = cast(i64, blk.ref_frames[idx * blk.ref_stride]);
                 let is i64 as mode = cast(i64, blk.y_modes[idx]);
                 if (mi_size < rt.BLOCK_4X4 || mi_size > rt.BLOCK_64X64) {
                     return errno.I_CORRUPT;
@@ -501,6 +502,7 @@ fn lf_filter_plane(lf as *LfFrame, blk as *LfBlockInfo, plane as i64,
         || cast(i64, blk.ref_frames) == 0 || cast(i64, blk.y_modes) == 0) {
         return errno.I_BADPARAM;
     }
+    if (blk.ref_stride < 1 || blk.ref_stride > 2) { return errno.I_BADPARAM; }
 
     let is i64 as subx with mut = 0;
     if (plane > 0) { subx = lf.sub_x; }

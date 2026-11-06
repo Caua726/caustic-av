@@ -1,0 +1,1027 @@
+// =======================================================
+// caustic-av/video/vp9/adapt.cst
+// Backward probability adaptation for VP9, exactly as specified in §8.3
+// (clear counts), §8.4 (general), §8.4.1 (merge prob), §8.4.2 (merge probs),
+// §8.4.3 (coefficient probabilities) and §8.4.4 (non-coefficient
+// probabilities) of the VP9 Bitstream & Decoding Process Specification,
+// v0.6/v0.7. Trees are the §9.3 parse trees; the number of internal nodes of
+// a tree is its leaf count minus one, and node `i` owns probability
+// `probs[i >> 1]`.
+//
+// The module is pure state transformation over caller-owned structs: no
+// allocation, no mutable state, no I/O. Every function returns 0 or a positive
+// count on success and a negative i64 errno on a bad argument or an
+// out-of-range dimension, so an integration mistake fails loudly instead of
+// scribbling outside an array.
+//
+// Counts accumulate during the tile decode; they are cleared once per frame
+// (§8.3, frame() in §6.1) and consumed once per frame by refresh_probs()
+// (§6.1.2). Probabilities live in four frame contexts, indexed 0..3; load and
+// save copy between one context slot and the working set. The default
+// probability tables (§10.5) are *not* here: setup_past_independence() also
+// resets segmentation, loop-filter deltas and sign biases, which belong to the
+// uncompressed-header layer, so this module only offers the probability half
+// of that reset (setup_past_independence_probs) and documents the exact
+// sequence the integration must run -- see adapt.md.
+//
+// Arithmetic is integer only. merge_prob reproduces the spec's Clip3 and
+// Round2, using the spec's truncating division; the denominators are always
+// positive, so i64 division is the specified one.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+// ── Dimensions (§3, "Symbols") ───────────────────────────────────────
+
+let is i64 as VP9_FRAME_CONTEXTS       with imut = 4;
+let is i64 as VP9_TX_SIZES             with imut = 4;
+let is i64 as VP9_BLOCK_TYPES          with imut = 2;
+let is i64 as VP9_REF_TYPES            with imut = 2;
+let is i64 as VP9_COEF_BANDS           with imut = 6;
+let is i64 as VP9_PREV_COEF_CONTEXTS   with imut = 6;
+let is i64 as VP9_UNCONSTRAINED_NODES  with imut = 3;
+let is i64 as VP9_PARTITION_CONTEXTS   with imut = 16;
+let is i64 as VP9_PARTITION_TYPES      with imut = 4;
+let is i64 as VP9_INTRA_MODES          with imut = 10;
+let is i64 as VP9_INTER_MODES          with imut = 4;
+let is i64 as VP9_INTER_MODE_CONTEXTS  with imut = 7;
+let is i64 as VP9_BLOCK_SIZE_GROUPS    with imut = 4;
+let is i64 as VP9_SKIP_CONTEXTS        with imut = 3;
+let is i64 as VP9_IS_INTER_CONTEXTS    with imut = 4;
+let is i64 as VP9_COMP_MODE_CONTEXTS   with imut = 5;
+let is i64 as VP9_REF_CONTEXTS         with imut = 5;
+let is i64 as VP9_INTERP_FILTER_CONTEXTS with imut = 4;
+let is i64 as VP9_SWITCHABLE_FILTERS   with imut = 3;
+let is i64 as VP9_TX_SIZE_CONTEXTS     with imut = 2;
+let is i64 as VP9_MV_JOINTS            with imut = 4;
+let is i64 as VP9_MV_CLASSES           with imut = 11;
+let is i64 as VP9_CLASS0_SIZE          with imut = 2;
+let is i64 as VP9_MV_OFFSET_BITS       with imut = 10;
+let is i64 as VP9_MV_FR_SIZE           with imut = 4;
+
+// Number of nodes in each §9.3 tree this module consumes. A tree with n
+// leaves has 2*n-2 nodes and n-1 probabilities.
+let is i64 as VP9_INTRA_MODE_TREE_NODES   with imut = 18;
+let is i64 as VP9_INTER_MODE_TREE_NODES   with imut = 6;
+let is i64 as VP9_PARTITION_TREE_NODES    with imut = 6;
+let is i64 as VP9_INTERP_FILTER_TREE_NODES with imut = 4;
+let is i64 as VP9_TX_SIZE_8_TREE_NODES    with imut = 2;
+let is i64 as VP9_TX_SIZE_16_TREE_NODES   with imut = 4;
+let is i64 as VP9_TX_SIZE_32_TREE_NODES   with imut = 6;
+let is i64 as VP9_MV_JOINT_TREE_NODES     with imut = 6;
+let is i64 as VP9_MV_CLASS_TREE_NODES     with imut = 20;
+let is i64 as VP9_MV_FR_TREE_NODES        with imut = 6;
+let is i64 as VP9_SMALL_TOKEN_TREE_NODES  with imut = 6;
+let is i64 as VP9_BINARY_TREE_NODES       with imut = 2;
+
+// ── Adaptation constants ─────────────────────────────────────────────
+
+let is i64 as VP9_MAX_PROB          with imut = 255;
+let is i64 as VP9_COUNT_SAT         with imut = 20;   // COUNT_SAT, §8.4.4
+let is i64 as VP9_MAX_UPDATE_FACTOR with imut = 128;  // MAX_UPDATE_FACTOR, §8.4.4
+let is i64 as VP9_COEF_COUNT_SAT    with imut = 24;   // §8.4.3
+let is i64 as VP9_COEF_UF_INTRA     with imut = 112;  // §8.4.3, FrameIsIntra
+let is i64 as VP9_COEF_UF_AFTER_KEY with imut = 128;  // §8.4.3, LastFrameType == KEY_FRAME
+let is i64 as VP9_COEF_UF_INTER     with imut = 112;  // §8.4.3, otherwise
+
+// Per-frame tallies cannot approach this: a frame holds at most a few million
+// transform blocks. The ceiling exists so ct0 * 256 and pre_prob * 256 stay
+// inside i64 no matter what a caller passes; beyond it the answer would not be
+// the spec's integer result.
+let is i64 as VP9_MAX_COUNT with imut = 1099511627776;  // 2^40
+
+// ── Enum values used as tree leaves (§7.4) ───────────────────────────
+
+let is i64 as VP9_KEY_FRAME     with imut = 0;
+let is i64 as VP9_NON_KEY_FRAME with imut = 1;
+
+let is i64 as VP9_INTRA_DC_PRED   with imut = 0;
+let is i64 as VP9_INTRA_V_PRED    with imut = 1;
+let is i64 as VP9_INTRA_H_PRED    with imut = 2;
+let is i64 as VP9_INTRA_D45_PRED  with imut = 3;
+let is i64 as VP9_INTRA_D135_PRED with imut = 4;
+let is i64 as VP9_INTRA_D117_PRED with imut = 5;
+let is i64 as VP9_INTRA_D153_PRED with imut = 6;
+let is i64 as VP9_INTRA_D207_PRED with imut = 7;
+let is i64 as VP9_INTRA_D63_PRED  with imut = 8;
+let is i64 as VP9_INTRA_TM_PRED   with imut = 9;
+
+let is i64 as VP9_INTER_NEARESTMV with imut = 0;
+let is i64 as VP9_INTER_NEARMV    with imut = 1;
+let is i64 as VP9_INTER_ZEROMV    with imut = 2;
+let is i64 as VP9_INTER_NEWMV     with imut = 3;
+
+let is i64 as VP9_PARTITION_NONE  with imut = 0;
+let is i64 as VP9_PARTITION_HORZ  with imut = 1;
+let is i64 as VP9_PARTITION_VERT  with imut = 2;
+let is i64 as VP9_PARTITION_SPLIT with imut = 3;
+
+let is i64 as VP9_INTERP_EIGHTTAP        with imut = 0;
+let is i64 as VP9_INTERP_EIGHTTAP_SMOOTH with imut = 1;
+let is i64 as VP9_INTERP_EIGHTTAP_SHARP  with imut = 2;
+let is i64 as VP9_INTERP_SWITCHABLE      with imut = 4;
+
+let is i64 as VP9_TX_4X4   with imut = 0;
+let is i64 as VP9_TX_8X8   with imut = 1;
+let is i64 as VP9_TX_16X16 with imut = 2;
+let is i64 as VP9_TX_32X32 with imut = 3;
+let is i64 as VP9_TX_MODE_SELECT with imut = 4;
+
+let is i64 as VP9_MV_JOINT_ZERO   with imut = 0;
+let is i64 as VP9_MV_JOINT_HNZVZ  with imut = 1;
+let is i64 as VP9_MV_JOINT_HZVNZ  with imut = 2;
+let is i64 as VP9_MV_JOINT_HNZVNZ with imut = 3;
+
+let is i64 as VP9_MV_CLASS_0 with imut = 0;
+let is i64 as VP9_MV_CLASS_1 with imut = 1;
+let is i64 as VP9_MV_CLASS_2 with imut = 2;
+let is i64 as VP9_MV_CLASS_3 with imut = 3;
+let is i64 as VP9_MV_CLASS_4 with imut = 4;
+let is i64 as VP9_MV_CLASS_5 with imut = 5;
+let is i64 as VP9_MV_CLASS_6 with imut = 6;
+let is i64 as VP9_MV_CLASS_7 with imut = 7;
+let is i64 as VP9_MV_CLASS_8 with imut = 8;
+let is i64 as VP9_MV_CLASS_9 with imut = 9;
+let is i64 as VP9_MV_CLASS_10 with imut = 10;
+
+// §8.4.3 small_token_tree leaves (ZERO_TOKEN, ONE_TOKEN, TWO_TOKEN).
+let is i64 as VP9_TOKEN_ZERO with imut = 0;
+let is i64 as VP9_TOKEN_ONE  with imut = 1;
+let is i64 as VP9_TOKEN_TWO  with imut = 2;
+
+// ── Probability layout ───────────────────────────────────────────────
+//
+// One instance per frame context (0..3) plus one working copy. Field names
+// and dimensions are the spec's; comment after each field gives
+// [dims] as [TX_SIZES][BLOCK_TYPES]... The innermost dimension of a tree
+// probability row is the number of internal nodes of that tree: 9 for the
+// intra-mode tree, 3 for the 4-leaf trees, and so on.
+//
+// The coefficient row is [3] = UNCONSTRAINED_NODES:
+//   [0] more_coefs, [1] token > ZERO_TOKEN, [2] token > ONE_TOKEN.
+
+struct Vp9Probs {
+    // coef_probs[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS]
+    //           [PREV_COEF_CONTEXTS][UNCONSTRAINED_NODES]
+    coef_probs         as [4][2][2][6][6][3]i64;
+
+    is_inter_prob      as [4]i64;       // [IS_INTER_CONTEXTS]
+    comp_mode_prob     as [5]i64;       // [COMP_MODE_CONTEXTS]
+    comp_ref_prob      as [5]i64;       // [REF_CONTEXTS]
+    single_ref_prob    as [5][2]i64;    // [REF_CONTEXTS][2]
+    inter_mode_probs   as [7][3]i64;    // [INTER_MODE_CONTEXTS][INTER_MODES-1]
+    y_mode_probs       as [4][9]i64;    // [BLOCK_SIZE_GROUPS][INTRA_MODES-1]
+    uv_mode_probs      as [10][9]i64;   // [INTRA_MODES][INTRA_MODES-1]
+    partition_probs    as [16][3]i64;   // [PARTITION_CONTEXTS][PARTITION_TYPES-1]
+    skip_prob          as [3]i64;       // [SKIP_CONTEXTS]
+    interp_filter_probs as [4][2]i64;   // [INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS-1]
+
+    // tx_probs[TX_SIZES][TX_SIZE_CONTEXTS][TX_SIZES-1]. Only rows
+    // TX_8X8, TX_16X16 and TX_32X32 are used, with 1, 2 and 3 live
+    // probabilities respectively; row TX_4X4 is padding so that indexing by
+    // maxTxSize is direct.
+    tx_probs           as [4][2][3]i64;
+
+    mv_joint_probs     as [3]i64;       // [MV_JOINTS-1]
+    mv_sign_prob       as [2]i64;       // [2]
+    mv_class_probs     as [2][10]i64;   // [2][MV_CLASSES-1]
+    mv_class0_bit_prob as [2]i64;       // [2]
+    mv_bits_prob       as [2][10]i64;   // [2][MV_OFFSET_BITS]
+    mv_class0_fr_probs as [2][2][3]i64; // [2][CLASS0_SIZE][MV_FR_SIZE-1]
+    mv_fr_probs        as [2][3]i64;    // [2][MV_FR_SIZE-1]
+    mv_class0_hp_prob  as [2]i64;       // [2]
+    mv_hp_prob         as [2]i64;       // [2]
+}
+
+// ── Counts layout (§8.3) ─────────────────────────────────────────────
+//
+// Dimensions are exactly the ones listed by §8.3; every array here is set to
+// zero by clear_counts. The decoder owns the increments (§9.3.4): it adds one
+// at the index of the value that was decoded in the context that selected the
+// probability.
+//
+// counts_token uses three buckets because §9.3.4 counts
+// counts_token[...][Min(2,syntax)]; there is no fourth "end of block" bucket.
+// A more_coefs == 0 ends the block without decoding a token, so it touches
+// counts_more_coefs only (see adapt.md, UNCONFIRMED note).
+
+struct Vp9Counts {
+    counts_intra_mode   as [4][10]i64;      // [BLOCK_SIZE_GROUPS][INTRA_MODES]
+    counts_uv_mode      as [10][10]i64;     // [INTRA_MODES][INTRA_MODES]
+    counts_partition    as [16][4]i64;      // [PARTITION_CONTEXTS][PARTITION_TYPES]
+    counts_interp_filter as [4][3]i64;      // [INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS]
+    counts_inter_mode   as [7][4]i64;       // [INTER_MODE_CONTEXTS][INTER_MODES]
+    counts_tx_size      as [4][2][4]i64;    // [TX_SIZES][TX_SIZE_CONTEXTS][TX_SIZES]
+    counts_is_inter     as [4][2]i64;       // [IS_INTER_CONTEXTS][2]
+    counts_comp_mode    as [5][2]i64;       // [COMP_MODE_CONTEXTS][2]
+    counts_single_ref   as [5][2][2]i64;    // [REF_CONTEXTS][2][2]
+    counts_comp_ref     as [5][2]i64;       // [REF_CONTEXTS][2]
+    counts_skip         as [3][2]i64;       // [SKIP_CONTEXTS][2]
+    counts_mv_joint     as [4]i64;          // [MV_JOINTS]
+    counts_mv_sign      as [2][2]i64;       // [2][2]
+    counts_mv_class     as [2][11]i64;      // [2][MV_CLASSES]
+    counts_mv_class0_bit as [2][2]i64;      // [2][CLASS0_SIZE]
+    counts_mv_class0_fr as [2][2][4]i64;    // [2][CLASS0_SIZE][MV_FR_SIZE]
+    counts_mv_class0_hp as [2][2]i64;       // [2][2]
+    counts_mv_bits      as [2][10][2]i64;   // [2][MV_OFFSET_BITS][2]
+    counts_mv_fr        as [2][4]i64;       // [2][MV_FR_SIZE]
+    counts_mv_hp        as [2][2]i64;       // [2][2]
+
+    // counts_token[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS]
+    //             [PREV_COEF_CONTEXTS][UNCONSTRAINED_NODES]
+    counts_token        as [4][2][2][6][6][3]i64;
+    // counts_more_coefs[TX_SIZES][BLOCK_TYPES][REF_TYPES][COEF_BANDS]
+    //                  [PREV_COEF_CONTEXTS][2]
+    counts_more_coefs   as [4][2][2][6][6][2]i64;
+}
+
+// The four saved frame contexts called ctx 0..3 by §7.1.2 and §8.2.
+struct Vp9ProbContexts {
+    ctx as [4]Vp9Probs;
+}
+
+// ── Trees (§9.3) ─────────────────────────────────────────────────────
+//
+// Only the trees the adaptation process walks are kept here. Leaf values are
+// negative syntax-element values; 0 is the leaf for value 0 (so "s <= 0" is a
+// leaf, exactly as §8.4.2 states). Positive values are even node offsets.
+// The decoder's tree decode process (§9.3.3) uses the same arrays and may
+// reuse or alias this struct; the trees it additionally needs (segment,
+// token, cols/rows partition) are outside this file.
+
+struct Vp9Trees {
+    intra_mode    as [18]i64;
+    inter_mode    as [6]i64;
+    partition     as [6]i64;
+    interp_filter as [4]i64;
+    tx_size_8     as [2]i64;
+    tx_size_16    as [4]i64;
+    tx_size_32    as [6]i64;
+    mv_joint      as [6]i64;
+    mv_class      as [20]i64;
+    mv_fr         as [6]i64;
+    small_token   as [6]i64;
+    binary        as [2]i64;
+}
+
+fn vp9_trees_init(t as *Vp9Trees) as i64 {
+    if (cast(i64, t) == 0) { return errno.I_BADPARAM; }
+
+    // intra_mode_tree[18] (§9.3.1)
+    t.intra_mode[0]  = 0 - VP9_INTRA_DC_PRED;
+    t.intra_mode[1]  = 2;
+    t.intra_mode[2]  = 0 - VP9_INTRA_TM_PRED;
+    t.intra_mode[3]  = 4;
+    t.intra_mode[4]  = 0 - VP9_INTRA_V_PRED;
+    t.intra_mode[5]  = 6;
+    t.intra_mode[6]  = 8;
+    t.intra_mode[7]  = 12;
+    t.intra_mode[8]  = 0 - VP9_INTRA_H_PRED;
+    t.intra_mode[9]  = 10;
+    t.intra_mode[10] = 0 - VP9_INTRA_D135_PRED;
+    t.intra_mode[11] = 0 - VP9_INTRA_D117_PRED;
+    t.intra_mode[12] = 0 - VP9_INTRA_D45_PRED;
+    t.intra_mode[13] = 14;
+    t.intra_mode[14] = 0 - VP9_INTRA_D63_PRED;
+    t.intra_mode[15] = 16;
+    t.intra_mode[16] = 0 - VP9_INTRA_D153_PRED;
+    t.intra_mode[17] = 0 - VP9_INTRA_D207_PRED;
+
+    // inter_mode_tree[6]: leaves are offsets from NEARESTMV.
+    t.inter_mode[0] = 0 - (VP9_INTER_ZEROMV - VP9_INTER_NEARESTMV);
+    t.inter_mode[1] = 2;
+    t.inter_mode[2] = 0 - (VP9_INTER_NEARESTMV - VP9_INTER_NEARESTMV);
+    t.inter_mode[3] = 4;
+    t.inter_mode[4] = 0 - (VP9_INTER_NEARMV - VP9_INTER_NEARESTMV);
+    t.inter_mode[5] = 0 - (VP9_INTER_NEWMV - VP9_INTER_NEARESTMV);
+
+    // partition_tree[6]
+    t.partition[0] = 0 - VP9_PARTITION_NONE;
+    t.partition[1] = 2;
+    t.partition[2] = 0 - VP9_PARTITION_HORZ;
+    t.partition[3] = 4;
+    t.partition[4] = 0 - VP9_PARTITION_VERT;
+    t.partition[5] = 0 - VP9_PARTITION_SPLIT;
+
+    // interp_filter_tree[4]
+    t.interp_filter[0] = 0 - VP9_INTERP_EIGHTTAP;
+    t.interp_filter[1] = 2;
+    t.interp_filter[2] = 0 - VP9_INTERP_EIGHTTAP_SMOOTH;
+    t.interp_filter[3] = 0 - VP9_INTERP_EIGHTTAP_SHARP;
+
+    // tx_size_8_tree[2]
+    t.tx_size_8[0] = 0 - VP9_TX_4X4;
+    t.tx_size_8[1] = 0 - VP9_TX_8X8;
+
+    // tx_size_16_tree[4]
+    t.tx_size_16[0] = 0 - VP9_TX_4X4;
+    t.tx_size_16[1] = 2;
+    t.tx_size_16[2] = 0 - VP9_TX_8X8;
+    t.tx_size_16[3] = 0 - VP9_TX_16X16;
+
+    // tx_size_32_tree[6]
+    t.tx_size_32[0] = 0 - VP9_TX_4X4;
+    t.tx_size_32[1] = 2;
+    t.tx_size_32[2] = 0 - VP9_TX_8X8;
+    t.tx_size_32[3] = 4;
+    t.tx_size_32[4] = 0 - VP9_TX_16X16;
+    t.tx_size_32[5] = 0 - VP9_TX_32X32;
+
+    // mv_joint_tree[6]
+    t.mv_joint[0] = 0 - VP9_MV_JOINT_ZERO;
+    t.mv_joint[1] = 2;
+    t.mv_joint[2] = 0 - VP9_MV_JOINT_HNZVZ;
+    t.mv_joint[3] = 4;
+    t.mv_joint[4] = 0 - VP9_MV_JOINT_HZVNZ;
+    t.mv_joint[5] = 0 - VP9_MV_JOINT_HNZVNZ;
+
+    // mv_class_tree[20]
+    t.mv_class[0]  = 0 - VP9_MV_CLASS_0;
+    t.mv_class[1]  = 2;
+    t.mv_class[2]  = 0 - VP9_MV_CLASS_1;
+    t.mv_class[3]  = 4;
+    t.mv_class[4]  = 6;
+    t.mv_class[5]  = 8;
+    t.mv_class[6]  = 0 - VP9_MV_CLASS_2;
+    t.mv_class[7]  = 0 - VP9_MV_CLASS_3;
+    t.mv_class[8]  = 10;
+    t.mv_class[9]  = 12;
+    t.mv_class[10] = 0 - VP9_MV_CLASS_4;
+    t.mv_class[11] = 0 - VP9_MV_CLASS_5;
+    t.mv_class[12] = 0 - VP9_MV_CLASS_6;
+    t.mv_class[13] = 14;
+    t.mv_class[14] = 16;
+    t.mv_class[15] = 18;
+    t.mv_class[16] = 0 - VP9_MV_CLASS_7;
+    t.mv_class[17] = 0 - VP9_MV_CLASS_8;
+    t.mv_class[18] = 0 - VP9_MV_CLASS_9;
+    t.mv_class[19] = 0 - VP9_MV_CLASS_10;
+
+    // mv_fr_tree[6]: leaves 0..3.
+    t.mv_fr[0] = 0;
+    t.mv_fr[1] = 2;
+    t.mv_fr[2] = 0 - 1;
+    t.mv_fr[3] = 4;
+    t.mv_fr[4] = 0 - 2;
+    t.mv_fr[5] = 0 - 3;
+
+    // small_token_tree[6]: nodes 0 and 1 are unused; adaptation starts at 2.
+    t.small_token[0] = 0;
+    t.small_token[1] = 0;
+    t.small_token[2] = 0 - VP9_TOKEN_ZERO;
+    t.small_token[3] = 4;
+    t.small_token[4] = 0 - VP9_TOKEN_ONE;
+    t.small_token[5] = 0 - VP9_TOKEN_TWO;
+
+    // binary_tree[2]
+    t.binary[0] = 0;
+    t.binary[1] = 0 - 1;
+
+    return errno.I_OK;
+}
+
+// ── Byte helpers (caller-owned memory only) ──────────────────────────
+
+fn _zero_bytes(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = cast(u8, 0);
+        i = i + 1;
+    }
+}
+
+fn _copy_bytes(dst as *u8, src as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+// Copy every probability table. Used by save_probs and by the explicit
+// load/save helpers below; exposed because the uncompressed header needs the
+// same copy when it resets a context to the default tables.
+fn probs_copy(dst as *Vp9Probs, src as *Vp9Probs) as i64 {
+    if (cast(i64, dst) == 0 || cast(i64, src) == 0) { return errno.I_BADPARAM; }
+    _copy_bytes(cast(*u8, cast(i64, dst)), cast(*u8, cast(i64, src)),
+                cast(i64, sizeof(Vp9Probs)));
+    return errno.I_OK;
+}
+
+// ── §8.3 Clear counts ────────────────────────────────────────────────
+
+fn clear_counts(c as *Vp9Counts) as i64 {
+    if (cast(i64, c) == 0) { return errno.I_BADPARAM; }
+    _zero_bytes(cast(*u8, cast(i64, c)), cast(i64, sizeof(Vp9Counts)));
+    return errno.I_OK;
+}
+
+// ── §8.4.1 Merge prob ────────────────────────────────────────────────
+//
+// den   = ct0 + ct1
+// prob  = (den == 0) ? 128 : Clip3(1, 255, (ct0 * 256 + (den >> 1)) / den)
+// count = Min(ct0 + ct1, count_sat)
+// factor = max_update_factor * count / count_sat
+// out   = Round2(pre_prob * (256 - factor) + prob * factor, 8)
+//
+// Round2(x, 8) is (x + 128) >> 8. When den is 0, count and factor are 0 and
+// the result is pre_prob, which is why the call is a no-op for an unused
+// context. Returns the probability in 1..255, or a negative errno.
+
+fn merge_prob(pre_prob as i64, ct0 as i64, ct1 as i64,
+              count_sat as i64, max_update_factor as i64) as i64 {
+    if (pre_prob < 1 || pre_prob > VP9_MAX_PROB) { return errno.I_BADPARAM; }
+    if (ct0 < 0 || ct1 < 0) { return errno.I_BADPARAM; }
+    if (ct0 > VP9_MAX_COUNT || ct1 > VP9_MAX_COUNT) { return errno.I_DIMS; }
+    if (count_sat <= 0 || count_sat > VP9_MAX_COUNT) { return errno.I_BADPARAM; }
+    if (max_update_factor < 0 || max_update_factor > VP9_MAX_UPDATE_FACTOR) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as den = ct0 + ct1;
+    let is i64 as prob with mut = 128;
+    if (den != 0) {
+        prob = (ct0 * 256 + (den >> 1)) / den;
+        if (prob < 1) { prob = 1; }
+        if (prob > VP9_MAX_PROB) { prob = VP9_MAX_PROB; }
+    }
+
+    let is i64 as count with mut = den;
+    if (count > count_sat) { count = count_sat; }
+    let is i64 as factor = max_update_factor * count / count_sat;
+    let is i64 as v = pre_prob * (256 - factor) + prob * factor;
+    return (v + 128) >> 8;
+}
+
+// ── §8.4.2 Merge probs ───────────────────────────────────────────────
+//
+// Walks tree nodes from `i`, sums the leaf counts below each branch, updates
+// probs[i >> 1] in place, and returns the total count below node i. Leaf
+// values are counts[-s] for s <= 0; positive children are visited first, so a
+// parent probability is read after its children were updated but its own
+// index (i >> 1) was never touched by them.
+//
+// tree_len, probs_len and counts_len are the declared lengths of the arrays.
+// They are validated against each other (probs_len must be tree_len / 2) and
+// against every visited node and leaf, so a mismatched call is an error rather
+// than an out-of-bounds access. Recursion depth is the tree depth; the deepest
+// §9.3 path here is 7 frames (mv_class 0->2->4->8->12->14->16, and
+// intra_mode 0->2->4->6->12->14->16).
+
+fn merge_probs(tree as *i64, tree_len as i64, i as i64,
+               probs as *i64, probs_len as i64,
+               counts as *i64, counts_len as i64,
+               count_sat as i64, max_update_factor as i64) as i64 {
+    if (cast(i64, tree) == 0 || cast(i64, probs) == 0 || cast(i64, counts) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (tree_len < 2 || (tree_len & 1) != 0) { return errno.I_DIMS; }
+    if (probs_len != (tree_len >> 1)) { return errno.I_DIMS; }
+    if (counts_len <= 0) { return errno.I_DIMS; }
+    if (count_sat <= 0 || count_sat > VP9_MAX_COUNT) { return errno.I_BADPARAM; }
+    if (max_update_factor < 0 || max_update_factor > VP9_MAX_UPDATE_FACTOR) {
+        return errno.I_BADPARAM;
+    }
+    if (i < 0 || (i & 1) != 0 || i + 1 >= tree_len) { return errno.I_DIMS; }
+
+    let is i64 as left_count with mut = 0;
+    let is i64 as l = tree[i];
+    if (l <= 0) {
+        let is i64 as li = 0 - l;
+        if (li >= counts_len) { return errno.I_DIMS; }
+        left_count = counts[li];
+        if (left_count < 0 || left_count > VP9_MAX_COUNT) { return errno.I_DIMS; }
+    } else {
+        if ((l & 1) != 0 || l + 1 >= tree_len) { return errno.I_DIMS; }
+        left_count = merge_probs(tree, tree_len, l, probs, probs_len,
+                                 counts, counts_len, count_sat, max_update_factor);
+        if (left_count < 0) { return left_count; }
+    }
+
+    let is i64 as right_count with mut = 0;
+    let is i64 as r = tree[i + 1];
+    if (r <= 0) {
+        let is i64 as ri = 0 - r;
+        if (ri >= counts_len) { return errno.I_DIMS; }
+        right_count = counts[ri];
+        if (right_count < 0 || right_count > VP9_MAX_COUNT) { return errno.I_DIMS; }
+    } else {
+        if ((r & 1) != 0 || r + 1 >= tree_len) { return errno.I_DIMS; }
+        right_count = merge_probs(tree, tree_len, r, probs, probs_len,
+                                  counts, counts_len, count_sat, max_update_factor);
+        if (right_count < 0) { return right_count; }
+    }
+
+    let is i64 as total = left_count + right_count;
+    if (total > VP9_MAX_COUNT) { return errno.I_DIMS; }
+
+    let is i64 as out = merge_prob(probs[i >> 1], left_count, right_count,
+                                   count_sat, max_update_factor);
+    if (out < 0) { return out; }
+    probs[i >> 1] = out;
+    return total;
+}
+
+// §8.4.4 adapt_prob and adapt_probs: the non-coefficient wrappers.
+fn adapt_prob(prob as i64, ct0 as i64, ct1 as i64) as i64 {
+    return merge_prob(prob, ct0, ct1, VP9_COUNT_SAT, VP9_MAX_UPDATE_FACTOR);
+}
+
+fn adapt_probs(tree as *i64, tree_len as i64, probs as *i64, probs_len as i64,
+               counts as *i64, counts_len as i64) as i64 {
+    return merge_probs(tree, tree_len, 0, probs, probs_len, counts, counts_len,
+                       VP9_COUNT_SAT, VP9_MAX_UPDATE_FACTOR);
+}
+
+// ── §8.4.3 Coefficient probability adaptation ────────────────────────
+//
+// updateFactor: 112 when FrameIsIntra is 1; else 128 when LastFrameType is
+// KEY_FRAME; else 112. LastFrameType is not consulted for an intra frame
+// (§7.2 note it is undefined for the first frame, which is intra).
+//
+// Loop order is the spec's t,i,j,k,l; k is the band and l the previous-coef
+// context. Band 0 carries only three contexts; bands 1..5 carry six. Counts
+// saturation is 24 here, not COUNT_SAT.
+//
+// small_token_tree starts at node 2, so it updates probability entries 1 and
+// 2 of the coefficient row; binary_tree at node 0 updates entry 0
+// (more_coefs). The two calls read and write the same row.
+
+fn adapt_coef_probs(p as *Vp9Probs, c as *Vp9Counts, t as *Vp9Trees,
+                    frame_is_intra as i64, last_frame_type as i64) as i64 {
+    if (cast(i64, p) == 0 || cast(i64, c) == 0 || cast(i64, t) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (frame_is_intra != 0 && frame_is_intra != 1) { return errno.I_BADPARAM; }
+    if (frame_is_intra == 0) {
+        if (last_frame_type != VP9_KEY_FRAME && last_frame_type != VP9_NON_KEY_FRAME) {
+            return errno.I_BADPARAM;
+        }
+    }
+
+    let is i64 as uf with mut = VP9_COEF_UF_INTRA;
+    if (frame_is_intra == 0) {
+        if (last_frame_type == VP9_KEY_FRAME) {
+            uf = VP9_COEF_UF_AFTER_KEY;
+        } else {
+            uf = VP9_COEF_UF_INTER;
+        }
+    }
+
+    let is i64 as tx with mut = 0;
+    while (tx < VP9_TX_SIZES) {
+        let is i64 as pt with mut = 0;
+        while (pt < VP9_BLOCK_TYPES) {
+            let is i64 as rt with mut = 0;
+            while (rt < VP9_REF_TYPES) {
+                let is i64 as band with mut = 0;
+                while (band < VP9_COEF_BANDS) {
+                    let is i64 as maxl with mut = VP9_PREV_COEF_CONTEXTS;
+                    if (band == 0) { maxl = 3; }
+                    let is i64 as cx with mut = 0;
+                    while (cx < maxl) {
+                        let is i64 as st = merge_probs(
+                            &t.small_token[0], VP9_SMALL_TOKEN_TREE_NODES, 2,
+                            &p.coef_probs[tx][pt][rt][band][cx][0], 3,
+                            &c.counts_token[tx][pt][rt][band][cx][0], 3,
+                            VP9_COEF_COUNT_SAT, uf);
+                        if (st < 0) { return st; }
+
+                        let is i64 as st2 = merge_probs(
+                            &t.binary[0], VP9_BINARY_TREE_NODES, 0,
+                            &p.coef_probs[tx][pt][rt][band][cx][0], 1,
+                            &c.counts_more_coefs[tx][pt][rt][band][cx][0], 2,
+                            VP9_COEF_COUNT_SAT, uf);
+                        if (st2 < 0) { return st2; }
+
+                        cx = cx + 1;
+                    }
+                    band = band + 1;
+                }
+                rt = rt + 1;
+            }
+            pt = pt + 1;
+        }
+        tx = tx + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── §8.4.4 Non-coefficient probability adaptation ────────────────────
+//
+// Every listed table is adapted in the spec's order with COUNT_SAT (20) and
+// MAX_UPDATE_FACTOR (128). interp_filter_probs is adapted only when the frame
+// filter is SWITCHABLE; tx_probs only when tx_mode is TX_MODE_SELECT (and
+// only the three selectable rows); the high-precision MV probabilities only
+// when allow_high_precision_mv is set.
+
+fn adapt_noncoef_probs(p as *Vp9Probs, c as *Vp9Counts, t as *Vp9Trees,
+                       interpolation_filter as i64, tx_mode as i64,
+                       allow_high_precision_mv as i64) as i64 {
+    if (cast(i64, p) == 0 || cast(i64, c) == 0 || cast(i64, t) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (interpolation_filter < 0 || interpolation_filter > VP9_INTERP_SWITCHABLE) {
+        return errno.I_BADPARAM;
+    }
+    if (tx_mode < 0 || tx_mode > VP9_TX_MODE_SELECT) { return errno.I_BADPARAM; }
+    if (allow_high_precision_mv != 0 && allow_high_precision_mv != 1) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as st with mut = 0;
+
+    // is_inter_prob[IS_INTER_CONTEXTS]
+    i = 0;
+    while (i < VP9_IS_INTER_CONTEXTS) {
+        st = adapt_prob(p.is_inter_prob[i],
+                        c.counts_is_inter[i][0], c.counts_is_inter[i][1]);
+        if (st < 0) { return st; }
+        p.is_inter_prob[i] = st;
+        i = i + 1;
+    }
+
+    // comp_mode_prob[COMP_MODE_CONTEXTS]
+    i = 0;
+    while (i < VP9_COMP_MODE_CONTEXTS) {
+        st = adapt_prob(p.comp_mode_prob[i],
+                        c.counts_comp_mode[i][0], c.counts_comp_mode[i][1]);
+        if (st < 0) { return st; }
+        p.comp_mode_prob[i] = st;
+        i = i + 1;
+    }
+
+    // comp_ref_prob[REF_CONTEXTS]
+    i = 0;
+    while (i < VP9_REF_CONTEXTS) {
+        st = adapt_prob(p.comp_ref_prob[i],
+                        c.counts_comp_ref[i][0], c.counts_comp_ref[i][1]);
+        if (st < 0) { return st; }
+        p.comp_ref_prob[i] = st;
+        i = i + 1;
+    }
+
+    // single_ref_prob[REF_CONTEXTS][2]
+    i = 0;
+    while (i < VP9_REF_CONTEXTS) {
+        j = 0;
+        while (j < 2) {
+            st = adapt_prob(p.single_ref_prob[i][j],
+                            c.counts_single_ref[i][j][0],
+                            c.counts_single_ref[i][j][1]);
+            if (st < 0) { return st; }
+            p.single_ref_prob[i][j] = st;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // inter_mode_probs[INTER_MODE_CONTEXTS]
+    i = 0;
+    while (i < VP9_INTER_MODE_CONTEXTS) {
+        st = adapt_probs(&t.inter_mode[0], VP9_INTER_MODE_TREE_NODES,
+                         &p.inter_mode_probs[i][0], 3,
+                         &c.counts_inter_mode[i][0], VP9_INTER_MODES);
+        if (st < 0) { return st; }
+        i = i + 1;
+    }
+
+    // y_mode_probs[BLOCK_SIZE_GROUPS]
+    i = 0;
+    while (i < VP9_BLOCK_SIZE_GROUPS) {
+        st = adapt_probs(&t.intra_mode[0], VP9_INTRA_MODE_TREE_NODES,
+                         &p.y_mode_probs[i][0], VP9_INTRA_MODES - 1,
+                         &c.counts_intra_mode[i][0], VP9_INTRA_MODES);
+        if (st < 0) { return st; }
+        i = i + 1;
+    }
+
+    // uv_mode_probs[INTRA_MODES]
+    i = 0;
+    while (i < VP9_INTRA_MODES) {
+        st = adapt_probs(&t.intra_mode[0], VP9_INTRA_MODE_TREE_NODES,
+                         &p.uv_mode_probs[i][0], VP9_INTRA_MODES - 1,
+                         &c.counts_uv_mode[i][0], VP9_INTRA_MODES);
+        if (st < 0) { return st; }
+        i = i + 1;
+    }
+
+    // partition_probs[PARTITION_CONTEXTS]
+    i = 0;
+    while (i < VP9_PARTITION_CONTEXTS) {
+        st = adapt_probs(&t.partition[0], VP9_PARTITION_TREE_NODES,
+                         &p.partition_probs[i][0], VP9_PARTITION_TYPES - 1,
+                         &c.counts_partition[i][0], VP9_PARTITION_TYPES);
+        if (st < 0) { return st; }
+        i = i + 1;
+    }
+
+    // skip_prob[SKIP_CONTEXTS]
+    i = 0;
+    while (i < VP9_SKIP_CONTEXTS) {
+        st = adapt_prob(p.skip_prob[i],
+                        c.counts_skip[i][0], c.counts_skip[i][1]);
+        if (st < 0) { return st; }
+        p.skip_prob[i] = st;
+        i = i + 1;
+    }
+
+    // interp_filter_probs[INTERP_FILTER_CONTEXTS], switchable frames only
+    if (interpolation_filter == VP9_INTERP_SWITCHABLE) {
+        i = 0;
+        while (i < VP9_INTERP_FILTER_CONTEXTS) {
+            st = adapt_probs(&t.interp_filter[0], VP9_INTERP_FILTER_TREE_NODES,
+                             &p.interp_filter_probs[i][0],
+                             VP9_SWITCHABLE_FILTERS - 1,
+                             &c.counts_interp_filter[i][0],
+                             VP9_SWITCHABLE_FILTERS);
+            if (st < 0) { return st; }
+            i = i + 1;
+        }
+    }
+
+    // tx_probs, TX_MODE_SELECT frames only. Row TX_4X4 is never selected and
+    // has no tree; rows 1..3 are 1, 2 and 3 probabilities wide.
+    if (tx_mode == VP9_TX_MODE_SELECT) {
+        i = 0;
+        while (i < VP9_TX_SIZE_CONTEXTS) {
+            st = adapt_probs(&t.tx_size_8[0], VP9_TX_SIZE_8_TREE_NODES,
+                             &p.tx_probs[VP9_TX_8X8][i][0], 1,
+                             &c.counts_tx_size[VP9_TX_8X8][i][0],
+                             VP9_TX_SIZES);
+            if (st < 0) { return st; }
+
+            st = adapt_probs(&t.tx_size_16[0], VP9_TX_SIZE_16_TREE_NODES,
+                             &p.tx_probs[VP9_TX_16X16][i][0], 2,
+                             &c.counts_tx_size[VP9_TX_16X16][i][0],
+                             VP9_TX_SIZES);
+            if (st < 0) { return st; }
+
+            st = adapt_probs(&t.tx_size_32[0], VP9_TX_SIZE_32_TREE_NODES,
+                             &p.tx_probs[VP9_TX_32X32][i][0], 3,
+                             &c.counts_tx_size[VP9_TX_32X32][i][0],
+                             VP9_TX_SIZES);
+            if (st < 0) { return st; }
+
+            i = i + 1;
+        }
+    }
+
+    // mv_joint_probs
+    st = adapt_probs(&t.mv_joint[0], VP9_MV_JOINT_TREE_NODES,
+                     &p.mv_joint_probs[0], VP9_MV_JOINTS - 1,
+                     &c.counts_mv_joint[0], VP9_MV_JOINTS);
+    if (st < 0) { return st; }
+
+    // Per-component motion vector probabilities, comp = 0..1.
+    i = 0;
+    while (i < 2) {
+        st = adapt_prob(p.mv_sign_prob[i],
+                        c.counts_mv_sign[i][0], c.counts_mv_sign[i][1]);
+        if (st < 0) { return st; }
+        p.mv_sign_prob[i] = st;
+
+        st = adapt_probs(&t.mv_class[0], VP9_MV_CLASS_TREE_NODES,
+                         &p.mv_class_probs[i][0], VP9_MV_CLASSES - 1,
+                         &c.counts_mv_class[i][0], VP9_MV_CLASSES);
+        if (st < 0) { return st; }
+
+        st = adapt_prob(p.mv_class0_bit_prob[i],
+                        c.counts_mv_class0_bit[i][0],
+                        c.counts_mv_class0_bit[i][1]);
+        if (st < 0) { return st; }
+        p.mv_class0_bit_prob[i] = st;
+
+        j = 0;
+        while (j < VP9_MV_OFFSET_BITS) {
+            st = adapt_prob(p.mv_bits_prob[i][j],
+                            c.counts_mv_bits[i][j][0],
+                            c.counts_mv_bits[i][j][1]);
+            if (st < 0) { return st; }
+            p.mv_bits_prob[i][j] = st;
+            j = j + 1;
+        }
+
+        j = 0;
+        while (j < VP9_CLASS0_SIZE) {
+            st = adapt_probs(&t.mv_fr[0], VP9_MV_FR_TREE_NODES,
+                             &p.mv_class0_fr_probs[i][j][0],
+                             VP9_MV_FR_SIZE - 1,
+                             &c.counts_mv_class0_fr[i][j][0],
+                             VP9_MV_FR_SIZE);
+            if (st < 0) { return st; }
+            j = j + 1;
+        }
+
+        st = adapt_probs(&t.mv_fr[0], VP9_MV_FR_TREE_NODES,
+                         &p.mv_fr_probs[i][0], VP9_MV_FR_SIZE - 1,
+                         &c.counts_mv_fr[i][0], VP9_MV_FR_SIZE);
+        if (st < 0) { return st; }
+
+        if (allow_high_precision_mv == 1) {
+            st = adapt_prob(p.mv_class0_hp_prob[i],
+                            c.counts_mv_class0_hp[i][0],
+                            c.counts_mv_class0_hp[i][1]);
+            if (st < 0) { return st; }
+            p.mv_class0_hp_prob[i] = st;
+
+            st = adapt_prob(p.mv_hp_prob[i],
+                            c.counts_mv_hp[i][0], c.counts_mv_hp[i][1]);
+            if (st < 0) { return st; }
+            p.mv_hp_prob[i] = st;
+        }
+
+        i = i + 1;
+    }
+
+    return errno.I_OK;
+}
+
+// ── §7.1.2 Frame contexts: load, save, reset ─────────────────────────
+//
+// load_probs copies every table except tx_probs and skip_prob. The working
+// copy of those two is preserved, exactly as the spec's wording requires; it
+// is what makes an intra frame save the forward-updated skip/tx probabilities
+// (refresh_probs never calls load_probs2 for intra frames).
+fn load_probs(ctxs as *Vp9ProbContexts, frame_context_idx as i64,
+              cur as *Vp9Probs) as i64 {
+    if (cast(i64, ctxs) == 0 || cast(i64, cur) == 0) { return errno.I_BADPARAM; }
+    if (frame_context_idx < 0 || frame_context_idx >= VP9_FRAME_CONTEXTS) {
+        return errno.I_BADPARAM;
+    }
+
+    let is [3]i64 as keep_skip;
+    let is [4][2][3]i64 as keep_tx;
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as k with mut = 0;
+
+    i = 0;
+    while (i < VP9_SKIP_CONTEXTS) {
+        keep_skip[i] = cur.skip_prob[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < VP9_TX_SIZES) {
+        j = 0;
+        while (j < VP9_TX_SIZE_CONTEXTS) {
+            k = 0;
+            while (k < VP9_TX_SIZES - 1) {
+                keep_tx[i][j][k] = cur.tx_probs[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    let is i64 as st = probs_copy(cur, &ctxs.ctx[frame_context_idx]);
+    if (st < 0) { return st; }
+
+    i = 0;
+    while (i < VP9_SKIP_CONTEXTS) {
+        cur.skip_prob[i] = keep_skip[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < VP9_TX_SIZES) {
+        j = 0;
+        while (j < VP9_TX_SIZE_CONTEXTS) {
+            k = 0;
+            while (k < VP9_TX_SIZES - 1) {
+                cur.tx_probs[i][j][k] = keep_tx[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return errno.I_OK;
+}
+
+// load_probs2 copies only tx_probs and skip_prob from frame context ctx.
+fn load_probs2(ctxs as *Vp9ProbContexts, frame_context_idx as i64,
+               cur as *Vp9Probs) as i64 {
+    if (cast(i64, ctxs) == 0 || cast(i64, cur) == 0) { return errno.I_BADPARAM; }
+    if (frame_context_idx < 0 || frame_context_idx >= VP9_FRAME_CONTEXTS) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as k with mut = 0;
+
+    i = 0;
+    while (i < VP9_SKIP_CONTEXTS) {
+        cur.skip_prob[i] = ctxs.ctx[frame_context_idx].skip_prob[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < VP9_TX_SIZES) {
+        j = 0;
+        while (j < VP9_TX_SIZE_CONTEXTS) {
+            k = 0;
+            while (k < VP9_TX_SIZES - 1) {
+                cur.tx_probs[i][j][k] = ctxs.ctx[frame_context_idx].tx_probs[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return errno.I_OK;
+}
+
+// save_probs copies every probability table into frame context ctx.
+fn save_probs(ctxs as *Vp9ProbContexts, frame_context_idx as i64,
+              cur as *Vp9Probs) as i64 {
+    if (cast(i64, ctxs) == 0 || cast(i64, cur) == 0) { return errno.I_BADPARAM; }
+    if (frame_context_idx < 0 || frame_context_idx >= VP9_FRAME_CONTEXTS) {
+        return errno.I_BADPARAM;
+    }
+    return probs_copy(&ctxs.ctx[frame_context_idx], cur);
+}
+
+// Probability half of setup_past_independence: reset the working tables to
+// the defaults of §10.5. The caller owns `defaults`; this module does not
+// embed those tables. The uncompressed-header layer must still reset
+// FeatureData/FeatureEnabled, segmentation_abs_or_delta_update,
+// PrevSegmentIds, the loop-filter deltas, and ref_frame_sign_bias, then run
+// the §6.2 save sequence. See adapt.md for the exact order.
+fn setup_past_independence_probs(cur as *Vp9Probs, defaults as *Vp9Probs) as i64 {
+    return probs_copy(cur, defaults);
+}
+
+// ── §6.1.2 Refresh probs ─────────────────────────────────────────────
+//
+// The whole per-frame adaptation call in one place:
+//
+//   if (error_resilient_mode == 0 && frame_parallel_decoding_mode == 0) {
+//     load_probs(frame_context_idx); adapt_coef_probs();
+//     if (FrameIsIntra == 0) { load_probs2(frame_context_idx); adapt_noncoef_probs(); }
+//   }
+//   if (refresh_frame_context) save_probs(frame_context_idx);
+//
+// The two load calls deliberately discard the frame header's forward
+// updates from the adaptation prior: the prior is the saved context, which is
+// also why the intra-frame skip/tx forward updates survive (they are never
+// reloaded and are saved with everything else).
+//
+// frame_context_idx is the value after the §6.2 block (0 when
+// setup_past_independence ran). All mode flags are 0/1; interpolation_filter
+// is 0..4 and tx_mode 0..4.
+
+fn refresh_probs(cur as *Vp9Probs, counts as *Vp9Counts,
+                 ctxs as *Vp9ProbContexts, trees as *Vp9Trees,
+                 frame_context_idx as i64,
+                 error_resilient_mode as i64,
+                 frame_parallel_decoding_mode as i64,
+                 frame_is_intra as i64,
+                 refresh_frame_context as i64,
+                 last_frame_type as i64,
+                 interpolation_filter as i64,
+                 tx_mode as i64,
+                 allow_high_precision_mv as i64) as i64 {
+    if (cast(i64, cur) == 0 || cast(i64, counts) == 0 ||
+        cast(i64, ctxs) == 0 || cast(i64, trees) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (error_resilient_mode != 0 && error_resilient_mode != 1) {
+        return errno.I_BADPARAM;
+    }
+    if (frame_parallel_decoding_mode != 0 && frame_parallel_decoding_mode != 1) {
+        return errno.I_BADPARAM;
+    }
+    if (frame_is_intra != 0 && frame_is_intra != 1) { return errno.I_BADPARAM; }
+    if (refresh_frame_context != 0 && refresh_frame_context != 1) {
+        return errno.I_BADPARAM;
+    }
+    if (frame_context_idx < 0 || frame_context_idx >= VP9_FRAME_CONTEXTS) {
+        return errno.I_BADPARAM;
+    }
+
+    if (error_resilient_mode == 0 && frame_parallel_decoding_mode == 0) {
+        let is i64 as st with mut = load_probs(ctxs, frame_context_idx, cur);
+        if (st < 0) { return st; }
+
+        st = adapt_coef_probs(cur, counts, trees, frame_is_intra, last_frame_type);
+        if (st < 0) { return st; }
+
+        if (frame_is_intra == 0) {
+            st = load_probs2(ctxs, frame_context_idx, cur);
+            if (st < 0) { return st; }
+            st = adapt_noncoef_probs(cur, counts, trees, interpolation_filter,
+                                     tx_mode, allow_high_precision_mv);
+            if (st < 0) { return st; }
+        }
+    }
+
+    if (refresh_frame_context == 1) {
+        return save_probs(ctxs, frame_context_idx, cur);
+    }
+    return errno.I_OK;
+}

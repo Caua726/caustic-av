@@ -1,0 +1,338 @@
+// =======================================================
+// caustic-av/video/vp9/inter_tables.cst
+// Data and small shared helpers for VP9 inter prediction (section 8.5.2) and
+// motion vector prediction (section 6.5). Nothing here allocates, reads a
+// bitstream, or keeps state between calls.
+//
+// Provenance:
+//   SUBPEL_EIGHTTAP, SUBPEL_EIGHTTAP_SMOOTH, SUBPEL_EIGHTTAP_SHARP,
+//   SUBPEL_BILINEAR
+//       subpel_filters[4][16][8] from section 8.5.2.4, stored as four
+//       comma-separated decimal blobs of 128 entries each (16 phases of 8
+//       taps). Negative taps are kept as the specification prints them, so
+//       the table can be audited line by line against the spec text;
+//       it_blob_load walks the blob and reads the entries.
+//   MV_REF_BLOCKS
+//       mv_ref_blocks[BLOCK_SIZES][MVREF_NEIGHBOURS][2] from section 6.5.1:
+//       13 block sizes x 8 neighbours x 2 components, as printed. The first
+//       component of a pair is the MiRow delta, the second the MiCol delta,
+//       matching 6.5.1's `candidateR = MiRow + mv_ref_search[i][0]`.
+//   MODE_2_COUNTER, COUNTER_TO_CONTEXT, IDX_N_COLUMN
+//       mode_2_counter, counter_to_context and idx_n_column_to_subblock from
+//       sections 6.5.1 and 6.5.11. The spec prints counter_to_context with
+//       names; the numbers below are the mode-context values of section 3
+//       (BOTH_ZERO 0, ZERO_PLUS_PREDICTED 1, BOTH_PREDICTED 2,
+//       NEW_PLUS_NON_INTRA 3, BOTH_NEW 4, INTRA_PLUS_NON_INTRA 5,
+//       BOTH_INTRA 6, INVALID_CASE 9).
+//   Block geometry
+//       num_8x8_blocks_wide_lookup / num_8x8_blocks_high_lookup (section
+//       10.2) and get_plane_block_size / ss_size_lookup (section 6.4.23),
+//       written as conditionals over the 13 block sizes. The chroma plane
+//       size is the subsampled luma size with a floor of 4 samples per side,
+//       which reproduces every valid ss_size_lookup entry. Section 7.4.3
+//       makes it a conformance requirement that every subsize either is
+//       below BLOCK_8X8 - which 6.4.21 raises to BLOCK_8X8 before asking for
+//       a plane size - or has a chroma plane size other than BLOCK_INVALID.
+//       Profile 0 (4:2:0), the only one decoded here, has no invalid entries
+//       at all, so the caller never presents a shape this derivation would
+//       have to refuse.
+//
+// No generated blob is pending: every value here is the specification's,
+// typed in source. Each table was read back row by row against the
+// specification text when this module was completed (8.5.2.4 for the four
+// filters, 6.5.1 for mv_ref_blocks/mode_2_counter/counter_to_context, 6.5.11
+// for idx_n_column_to_subblock); no entry differs. That is a source audit,
+// not a decoded-frame check: nothing here is verified against a decoder.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+// ── limits and spec constants (section 3) ───────────────────────────
+//
+// IT_MAX_DIM is the largest frame side this library accepts (the same
+// ceiling core/frame.cst uses); IT_MAX_MI is that side in 8x8 mode-info
+// units. They guard indices that come from headers before any array is
+// touched.
+let is i64 as IT_MAX_DIM with imut = 65536;
+let is i64 as IT_MAX_MI  with imut = 8192;
+
+let is i64 as MI_SIZE                with imut = 8;
+let is i64 as MVREF_NEIGHBOURS       with imut = 8;
+let is i64 as MAX_MV_REF_CANDIDATES  with imut = 2;
+let is i64 as MV_BORDER              with imut = 128;
+let is i64 as INTERP_EXTEND          with imut = 4;
+let is i64 as BORDERINPIXELS         with imut = 160;
+let is i64 as COMPANDED_MVREF_THRESH with imut = 8;
+let is i64 as REFS_PER_FRAME         with imut = 3;
+let is i64 as MAX_REF_FRAMES         with imut = 4;
+let is i64 as MB_MODE_COUNT          with imut = 14;
+
+let is i64 as SUBPEL_BITS   with imut = 4;
+let is i64 as SUBPEL_SHIFTS with imut = 16;
+let is i64 as SUBPEL_MASK   with imut = 15;
+let is i64 as REF_SCALE_SHIFT with imut = 14;
+
+// Reference frame ids (section 7.4.12). NONE and INTRA_FRAME are both 0:
+// ref_frame[0] 0 means intra (not used here) and ref_frame[1] 0 means "no
+// second reference", which is the spec's isCompound = ref_frame[1] > NONE.
+let is i64 as NONE         with imut = 0;
+let is i64 as INTRA_FRAME  with imut = 0;
+let is i64 as LAST_FRAME   with imut = 1;
+let is i64 as GOLDEN_FRAME with imut = 2;
+let is i64 as ALTREF_FRAME with imut = 3;
+
+// ── interpolation filters (sections 6.2.7, 7.2.7 and 8.5.2.4) ──────
+let is i64 as EIGHTTAP         with imut = 0;
+let is i64 as EIGHTTAP_SMOOTH  with imut = 1;
+let is i64 as EIGHTTAP_SHARP   with imut = 2;
+let is i64 as BILINEAR         with imut = 3;
+let is i64 as SWITCHABLE       with imut = 4;   // frame level only
+let is i64 as SWITCHABLE_FILTERS with imut = 3;
+
+// ── shared spec maths (section 4.6) ─────────────────────────────────
+//
+// The same four helpers exist in stage 4's recon_tables.cst. They are
+// repeated here so this module stands alone on a branch that does not carry
+// the reconstruction kernel; the definitions are the spec's, not a second
+// interpretation. n >= 1 in every call.
+fn it_round2(x as i64, n as i64) as i64 {
+    return (x + (1 << (n - 1))) >> n;
+}
+
+fn it_clip3(lo as i64, hi as i64, v as i64) as i64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn it_clip1(x as i64) as i64 {
+    return it_clip3(0, 255, x);
+}
+
+fn it_abs(x as i64) as i64 {
+    if (x < 0) { return 0 - x; }
+    return x;
+}
+
+// ── motion vector value type ────────────────────────────────────────
+//
+// One motion vector component is 1/8 of a luma sample in the bitstream
+// (section 7.4.13), with the extra 1/8 bit present when UseHp is set. The
+// inter predictor converts the vector to 1/16 of a sample per plane in
+// section 8.5.2.2, so both modules need the same two-component type.
+struct Mv {
+    row as i64;
+    col as i64;
+}
+
+// ── block sizes (spec BLOCK_SIZES order, section 6.4) ───────────────
+let is i64 as BLOCK_4X4   with imut = 0;
+let is i64 as BLOCK_4X8   with imut = 1;
+let is i64 as BLOCK_8X4   with imut = 2;
+let is i64 as BLOCK_8X8   with imut = 3;
+let is i64 as BLOCK_8X16  with imut = 4;
+let is i64 as BLOCK_16X8  with imut = 5;
+let is i64 as BLOCK_16X16 with imut = 6;
+let is i64 as BLOCK_16X32 with imut = 7;
+let is i64 as BLOCK_32X16 with imut = 8;
+let is i64 as BLOCK_32X32 with imut = 9;
+let is i64 as BLOCK_32X64 with imut = 10;
+let is i64 as BLOCK_64X32 with imut = 11;
+let is i64 as BLOCK_64X64 with imut = 12;
+let is i64 as BLOCK_SIZES with imut = 13;
+// Sentinel the spec uses for an impossible partition/plane size (section 3).
+// No syntax element ever yields it; the derivations here reject it.
+let is i64 as BLOCK_INVALID with imut = 14;
+
+fn it_block_ok(bs as i64) as i64 {
+    if (bs < BLOCK_4X4 || bs > BLOCK_64X64) { return 0; }
+    return 1;
+}
+
+// num_8x8_blocks_wide_lookup[bs] and num_8x8_blocks_high_lookup[bs].
+// Section 10.2 prints them as
+//   wide = {1,1,1,1,1,2,2,2,4,4,4,8,8}
+//   high = {1,1,1,1,2,1,2,4,2,4,8,4,8}
+// in BLOCK_SIZES order. They count 8x8 units, so a BLOCK_8X4 is one unit
+// wide, not two: the block is 8 samples across. The irregular high row is why
+// this is not derived from the log2 tables.
+fn it_num_8x8_wide(bs as i64) as i64 {
+    if (it_block_ok(bs) == 0) { return 0; }
+    if (bs <= BLOCK_8X16) { return 1; }      // BLOCK_4X4..BLOCK_8X16
+    if (bs <= BLOCK_16X32) { return 2; }     // BLOCK_16X8..BLOCK_16X32
+    if (bs <= BLOCK_32X64) { return 4; }     // BLOCK_32X16..BLOCK_32X64
+    return 8;                                 // BLOCK_64X32, BLOCK_64X64
+}
+
+fn it_num_8x8_high(bs as i64) as i64 {
+    if (it_block_ok(bs) == 0) { return 0; }
+    if (bs <= BLOCK_8X8) { return 1; }        // BLOCK_4X4..BLOCK_8X8
+    if (bs == BLOCK_16X8) { return 1; }
+    if (bs == BLOCK_8X16 || bs == BLOCK_16X16 || bs == BLOCK_32X16) { return 2; }
+    if (bs == BLOCK_16X32 || bs == BLOCK_32X32 || bs == BLOCK_64X32) { return 4; }
+    return 8;                                 // BLOCK_32X64, BLOCK_64X64
+}
+
+// Luma dimensions of a block, in samples. This is the coded block shape, not
+// the mode-info cell: a BLOCK_8X4 is 8x4 even though it occupies one 8x8
+// mode-info cell, so the num_8x8 lookups (which count cells) are only the
+// right answer from BLOCK_8X8 upward.
+fn it_block_w(bs as i64) as i64 {
+    if (it_block_ok(bs) == 0) { return 0; }
+    if (bs == BLOCK_4X4 || bs == BLOCK_4X8) { return 4; }
+    return 8 * it_num_8x8_wide(bs);
+}
+
+fn it_block_h(bs as i64) as i64 {
+    if (it_block_ok(bs) == 0) { return 0; }
+    if (bs == BLOCK_4X4 || bs == BLOCK_8X4) { return 4; }
+    return 8 * it_num_8x8_high(bs);
+}
+
+// Dimensions of the plane block whose 4x4 units sections 6.4.21 (residual)
+// and 8.5.2 walk, i.e. get_plane_block_size(subsize, plane) with
+// subsize = (MiSize < BLOCK_8X8 ? BLOCK_8X8 : MiSize).
+//
+// For luma that is the luma block, except that a sub-8x8 MiSize reports the
+// enclosing 8x8 (the caller predicts 4x4 pieces of it). For chroma each side
+// is the luma side shifted by that axis' subsampling, floored at 4, because
+// the spec allows a 4x4 chroma block to cover a sub-8x8 luma block.
+fn it_plane_block_dims(mi_size as i64, plane as i64, sub_x as i64, sub_y as i64,
+                       out_w as *i64, out_h as *i64) as i64 {
+    if (cast(i64, out_w) == 0 || cast(i64, out_h) == 0) { return errno.I_BADPARAM; }
+    if (it_block_ok(mi_size) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (sub_x < 0 || sub_x > 1) { return errno.I_BADPARAM; }
+    if (sub_y < 0 || sub_y > 1) { return errno.I_BADPARAM; }
+
+    let is i64 as bs with mut = mi_size;
+    if (bs < BLOCK_8X8) { bs = BLOCK_8X8; }
+    let is i64 as w with mut = 8 * it_num_8x8_wide(bs);
+    let is i64 as h with mut = 8 * it_num_8x8_high(bs);
+    if (plane > 0) {
+        w = w >> sub_x;
+        if (w < 4) { w = 4; }
+        h = h >> sub_y;
+        if (h < 4) { h = 4; }
+    }
+    *out_w = w;
+    *out_h = h;
+    return errno.I_OK;
+}
+
+// ── blob reader ────────────────────────────────────────────────────
+//
+// Read `count` signed decimal entries starting at entry `first` from a
+// comma-separated blob, writing them to out[0..count-1]. The blobs above end
+// with the NUL of their string literal. A short or malformed blob is
+// I_CORRUPT; nothing is written past out[count-1]. Counts are small (16 per
+// motion-vector row, 128 per filter), so a linear walk is enough.
+fn it_blob_load(s as *u8, first as i64, count as i64, out as *i64) as i64 {
+    if (cast(i64, s) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (first < 0 || count < 0) { return errno.I_BADPARAM; }
+
+    let is i64 as i with mut = 0;    // byte position in the blob
+    let is i64 as k with mut = 0;    // entries skipped so far
+    while (k < first) {
+        if (cast(i64, s[i]) == 0) { return errno.I_CORRUPT; }
+        if (cast(i64, s[i]) == 44) { k = k + 1; }    // ','
+        i = i + 1;
+    }
+
+    let is i64 as n with mut = 0;
+    while (n < count) {
+        if (cast(i64, s[i]) == 0) { return errno.I_CORRUPT; }
+        let is i64 as sign with mut = 1;
+        if (cast(i64, s[i]) == 45) { sign = 0 - 1; i = i + 1; }   // '-'
+        let is i64 as v with mut = 0;
+        let is i64 as digits with mut = 0;
+        while (cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) {
+            v = v * 10 + (cast(i64, s[i]) - 48);
+            i = i + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0) { return errno.I_CORRUPT; }
+        out[n] = sign * v;
+        if (cast(i64, s[i]) == 44) { i = i + 1; }
+        n = n + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── subpel filter taps (spec 8.5.2.4) ───────────────────────────────
+//
+// One blob per filter, 16 phases x 8 taps in phase order. The taps sum to
+// 128 per phase in the spec, so the two passes round with n = 7.
+let is *u8 as SUBPEL_EIGHTTAP with imut = "0,0,0,128,0,0,0,0,0,1,-5,126,8,-3,1,0,-1,3,-10,122,18,-6,2,0,-1,4,-13,118,27,-9,3,-1,-1,4,-16,112,37,-11,4,-1,-1,5,-18,105,48,-14,4,-1,-1,5,-19,97,58,-16,5,-1,-1,6,-19,88,68,-18,5,-1,-1,6,-19,78,78,-19,6,-1,-1,5,-18,68,88,-19,6,-1,-1,5,-16,58,97,-19,5,-1,-1,4,-14,48,105,-18,5,-1,-1,4,-11,37,112,-16,4,-1,-1,3,-9,27,118,-13,4,-1,0,2,-6,18,122,-10,3,-1,0,1,-3,8,126,-5,1,0";
+let is *u8 as SUBPEL_EIGHTTAP_SMOOTH with imut = "0,0,0,128,0,0,0,0,-3,-1,32,64,38,1,-3,0,-2,-2,29,63,41,2,-3,0,-2,-2,26,63,43,4,-4,0,-2,-3,24,62,46,5,-4,0,-2,-3,21,60,49,7,-4,0,-1,-4,18,59,51,9,-4,0,-1,-4,16,57,53,12,-4,-1,-1,-4,14,55,55,14,-4,-1,-1,-4,12,53,57,16,-4,-1,0,-4,9,51,59,18,-4,-1,0,-4,7,49,60,21,-3,-2,0,-4,5,46,62,24,-3,-2,0,-4,4,43,63,26,-2,-2,0,-3,2,41,63,29,-2,-2,0,-3,1,38,64,32,-1,-3";
+let is *u8 as SUBPEL_EIGHTTAP_SHARP with imut = "0,0,0,128,0,0,0,0,-1,3,-7,127,8,-3,1,0,-2,5,-13,125,17,-6,3,-1,-3,7,-17,121,27,-10,5,-2,-4,9,-20,115,37,-13,6,-2,-4,10,-23,108,48,-16,8,-3,-4,10,-24,100,59,-19,9,-3,-4,11,-24,90,70,-21,10,-4,-4,11,-23,80,80,-23,11,-4,-4,10,-21,70,90,-24,11,-4,-3,9,-19,59,100,-24,10,-4,-3,8,-16,48,108,-23,10,-4,-2,6,-13,37,115,-20,9,-4,-2,5,-10,27,121,-17,7,-3,-1,3,-6,17,125,-13,5,-2,0,1,-3,8,127,-7,3,-1";
+let is *u8 as SUBPEL_BILINEAR with imut = "0,0,0,128,0,0,0,0,0,0,0,120,8,0,0,0,0,0,0,112,16,0,0,0,0,0,0,104,24,0,0,0,0,0,0,96,32,0,0,0,0,0,0,88,40,0,0,0,0,0,0,80,48,0,0,0,0,0,0,72,56,0,0,0,0,0,0,64,64,0,0,0,0,0,0,56,72,0,0,0,0,0,0,48,80,0,0,0,0,0,0,40,88,0,0,0,0,0,0,32,96,0,0,0,0,0,0,24,104,0,0,0,0,0,0,16,112,0,0,0,0,0,0,8,120,0,0,0";
+
+// Load one filter as 128 taps in phase-major order:
+// out[phase * 8 + tap] = subpel_filters[filter][phase][tap].
+// Returns I_BADPARAM for a filter index outside 0..3 (SWITCHABLE is a frame
+// header value, never a tap set) or a null out.
+fn it_filter_load(filter as i64, out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (filter < EIGHTTAP || filter > BILINEAR) { return errno.I_BADPARAM; }
+    let is *u8 as src with mut = SUBPEL_EIGHTTAP;
+    if (filter == EIGHTTAP_SMOOTH) { src = SUBPEL_EIGHTTAP_SMOOTH; }
+    if (filter == EIGHTTAP_SHARP) { src = SUBPEL_EIGHTTAP_SHARP; }
+    if (filter == BILINEAR) { src = SUBPEL_BILINEAR; }
+    return it_blob_load(src, 0, 128, out);
+}
+
+// ── motion-vector prediction tables (spec 6.5) ──────────────────────
+//
+// mv_ref_blocks[bs][neighbour][0 = row delta, 1 = column delta], block
+// sizes in BLOCK_SIZES order.
+let is *u8 as MV_REF_BLOCKS with imut = "-1,0,0,-1,-1,-1,-2,0,0,-2,-2,-1,-1,-2,-2,-2,-1,0,0,-1,-1,-1,-2,0,0,-2,-2,-1,-1,-2,-2,-2,-1,0,0,-1,-1,-1,-2,0,0,-2,-2,-1,-1,-2,-2,-2,-1,0,0,-1,-1,-1,-2,0,0,-2,-2,-1,-1,-2,-2,-2,0,-1,-1,0,1,-1,-1,-1,0,-2,-2,0,-2,-1,-1,-2,-1,0,0,-1,-1,1,-1,-1,-2,0,0,-2,-1,-2,-2,-1,-1,0,0,-1,-1,1,1,-1,-1,-1,-3,0,0,-3,-3,-3,0,-1,-1,0,2,-1,-1,-1,-1,1,0,-3,-3,0,-3,-3,-1,0,0,-1,-1,2,-1,-1,1,-1,-3,0,0,-3,-3,-3,-1,1,1,-1,-1,2,2,-1,-1,-1,-3,0,0,-3,-3,-3,0,-1,-1,0,4,-1,-1,2,-1,-1,0,-3,-3,0,2,-1,-1,0,0,-1,-1,4,2,-1,-1,-1,-3,0,0,-3,-1,2,-1,3,3,-1,-1,4,4,-1,-1,-1,-1,0,0,-1,-1,6";
+
+// mode_2_counter[MB_MODE_COUNT] (spec 6.5.1): 9 for every intra mode, 0 for
+// NEARESTMV/NEARMV, 3 for ZEROMV, 1 for NEWMV.
+let is *u8 as MODE_2_COUNTER with imut = "9,9,9,9,9,9,9,9,9,9,0,0,3,1";
+
+// counter_to_context[19], with INVALID_CASE written as 9.
+let is *u8 as COUNTER_TO_CONTEXT with imut = "2,3,4,1,3,9,0,9,9,5,5,9,5,9,9,9,9,9,6";
+
+// idx_n_column_to_subblock[4][2]: the row is the sub8x8 block index, the
+// column is (deltaCol == 0).
+let is *u8 as IDX_N_COLUMN with imut = "1,2,1,3,3,2,3,3";
+
+// Load the 16 offsets of mv_ref_blocks[bs] (8 neighbours, row then column)
+// into out[0..15]. Returns I_BADPARAM outside 0..12 or for a null out.
+fn it_mv_ref_load(bs as i64, out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (it_block_ok(bs) == 0) { return errno.I_BADPARAM; }
+    return it_blob_load(MV_REF_BLOCKS, bs * 16, 16, out);
+}
+
+// mode_2_counter[mode]. The caller has already rejected a mode outside
+// 0..MB_MODE_COUNT-1.
+fn it_mode2_counter(mode as i64, out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (mode < 0 || mode >= MB_MODE_COUNT) { return errno.I_BADPARAM; }
+    return it_blob_load(MODE_2_COUNTER, mode, 1, out);
+}
+
+// counter_to_context[contextCounter]. contextCounter is 0..18 because two
+// neighbours contribute at most 2 * 9.
+fn it_counter_to_context(ctx as i64, out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (ctx < 0 || ctx > 18) { return errno.I_BADPARAM; }
+    return it_blob_load(COUNTER_TO_CONTEXT, ctx, 1, out);
+}
+
+// idx_n_column_to_subblock[block][deltaCol == 0], or 3 for the spec's
+// `block < 0` case. block is a sub8x8 block index 0..3 in the former case.
+fn it_subblock_idx(block as i64, col_zero as i64, out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (block < 0) {
+        *out = 3;
+        return errno.I_OK;
+    }
+    if (block > 3) { return errno.I_BADPARAM; }
+    let is i64 as col with mut = 0;
+    if (col_zero != 0) { col = 1; }
+    return it_blob_load(IDX_N_COLUMN, block * 2 + col, 1, out);
+}

@@ -1,0 +1,402 @@
+// =======================================================
+// caustic-av/video/vp9/scale.cst
+// Scaled-reference geometry for VP9 inter prediction (section 8.5.2.3) and
+// the frame/reference size-ratio conformance checks (sections 7.2.5 and
+// 8.5.2.3).
+//
+// The specification fixes REF_SCALE_SHIFT to 14, so xScale and yScale are
+// Q14 fixed point: 1 << 14 means "reference and current frame are the same
+// size", not 1 << 16. The derived step is in 1/16 sample units, where 16 is
+// one reference sample per current sample. Every formula below is the
+// specification's, evaluated with i64 arithmetic and a truncating division
+// and an arithmetic right shift, exactly as printed:
+//
+//   xScale = (RefFrameWidth  << REF_SCALE_SHIFT) / FrameWidth
+//   yScale = (RefFrameHeight << REF_SCALE_SHIFT) / FrameHeight
+//   stepX  = (16 * xScale) >> REF_SCALE_SHIFT
+//   stepY  = (16 * yScale) >> REF_SCALE_SHIFT
+//
+// The module holds no state, allocates nothing and never touches pixels: a
+// caller fills Vp9Scale once per (frame, reference) pair and then asks for
+// the block start, the fractional offset, the scaled motion vector or the
+// reference-plane bounds. The reference dimensions passed here are the
+// *visible* RefFrameWidth/RefFrameHeight of section 8.10, never the padded
+// coded size: the prediction process clamps against the visible extent.
+//
+// Ratio conformance (section 8.5.2.3) is checked again here, because the
+// uncompressed header of stage 3 deliberately does not enforce it (see
+// Pending review note 1 in video/vp9/vp9.md). Section 7.2.5 only requires
+// that at least one of the three references satisfy the bounds, so a
+// frame-level check (vp9_scale_any_ratio_ok) exists beside the per-reference
+// check (vp9_scale_ratio_ok). A reference that fails the per-reference
+// bounds and is used by a block is a conformance violation and is reported
+// as I_CORRUPT here rather than being scaled into garbage.
+//
+// Nothing in this file has been compiled or run; see video/vp9/refs.md.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+// Section 3 constants.
+let is i64 as VP9_REF_SCALE_SHIFT with imut = 14;
+let is i64 as VP9_REF_SCALE_ONE   with imut = 16384;   // 1 << REF_SCALE_SHIFT
+let is i64 as VP9_SUBPEL_BITS     with imut = 4;
+let is i64 as VP9_SUBPEL_SHIFTS   with imut = 16;
+let is i64 as VP9_SUBPEL_MASK     with imut = 15;
+
+// Largest FrameWidth/FrameHeight a 16-bit frame_size can express. Both the
+// current and the reference dimensions are bounded by it before arithmetic.
+let is i64 as VP9_SCALE_MAX_DIM with imut = 65536;
+
+// The section 8.5.2.2 clamp keeps |clampedMv| below about 2^21; this limit
+// is an overflow guard for a caller that passes something else, not a
+// bitstream constraint.
+let is i64 as VP9_SCALE_MV_LIMIT with imut = 16777216;
+
+// With the section 8.5.2.3 ratio bounds, xScale lies in [1/16, 2], i.e.
+// [1024, 32768] in Q14, and xStep lies in [1, 32]. Checked after scaling so
+// an internal mistake cannot produce a division or a zero step.
+let is i64 as VP9_SCALE_MIN_SCALE with imut = 1024;
+let is i64 as VP9_SCALE_MAX_SCALE with imut = 32768;
+
+struct Vp9Scale {
+    frame_width   as i64;   // FrameWidth of the current frame
+    frame_height  as i64;   // FrameHeight of the current frame
+    ref_width     as i64;   // RefFrameWidth of the selected reference
+    ref_height    as i64;   // RefFrameHeight of the selected reference
+    subsampling_x as i64;   // subsampling_x of the current frame (0 or 1)
+    subsampling_y as i64;   // subsampling_y of the current frame (0 or 1)
+    x_scale       as i64;   // Q14, reference samples per current sample
+    y_scale       as i64;   // Q14
+    x_step        as i64;   // 1/16 sample units, 16 means 1:1
+    y_step        as i64;   // 1/16 sample units
+    scaled        as i64;   // 1 when a scale factor is not 1.0
+    valid         as i64;   // 1 once vp9_scale_setup succeeded
+}
+
+fn _scale_clear(sf as *Vp9Scale) as void {
+    sf.frame_width = 0;
+    sf.frame_height = 0;
+    sf.ref_width = 0;
+    sf.ref_height = 0;
+    sf.subsampling_x = 0;
+    sf.subsampling_y = 0;
+    sf.x_scale = 0;
+    sf.y_scale = 0;
+    sf.x_step = 0;
+    sf.y_step = 0;
+    sf.scaled = 0;
+    sf.valid = 0;
+}
+
+// A scale struct is usable only after a successful setup. Every query
+// returns I_BADPARAM rather than reading a half-filled struct.
+fn _scale_ready(sf as *Vp9Scale) as i64 {
+    if (cast(i64, sf) == 0) { return 0; }
+    if (sf.valid == 0) { return 0; }
+    return 1;
+}
+
+// ── size-ratio conformance ──────────────────────────────────────────
+
+// The four bounds of sections 7.2.5 and 8.5.2.3 for one reference. Returns
+// 1 when the reference may be scaled to the current frame, 0 otherwise.
+// Dimensions outside 1..VP9_SCALE_MAX_DIM are treated as not conforming
+// rather than as an error, because this is a predicate.
+fn vp9_scale_ratio_ok(fw as i64, fh as i64,
+                      rw as i64, rh as i64) as i64 {
+    if (fw < 1 || fw > VP9_SCALE_MAX_DIM) { return 0; }
+    if (fh < 1 || fh > VP9_SCALE_MAX_DIM) { return 0; }
+    if (rw < 1 || rw > VP9_SCALE_MAX_DIM) { return 0; }
+    if (rh < 1 || rh > VP9_SCALE_MAX_DIM) { return 0; }
+    if (2 * fw < rw) { return 0; }    // 2 * FrameWidth  >= RefFrameWidth
+    if (2 * fh < rh) { return 0; }    // 2 * FrameHeight >= RefFrameHeight
+    if (fw > 16 * rw) { return 0; }   // FrameWidth  <= 16 * RefFrameWidth
+    if (fh > 16 * rh) { return 0; }   // FrameHeight <= 16 * RefFrameHeight
+    return 1;
+}
+
+// Section 7.2.5 frame-level requirement: after FrameWidth/FrameHeight are
+// known, at least one of the three ref_frame_idx entries must satisfy the
+// bounds. The three sizes are passed in ref_frame_idx order. Returns 1 when
+// at least one qualifies, 0 otherwise.
+fn vp9_scale_any_ratio_ok(fw as i64, fh as i64,
+                          r0w as i64, r0h as i64,
+                          r1w as i64, r1h as i64,
+                          r2w as i64, r2h as i64) as i64 {
+    if (vp9_scale_ratio_ok(fw, fh, r0w, r0h) == 1) { return 1; }
+    if (vp9_scale_ratio_ok(fw, fh, r1w, r1h) == 1) { return 1; }
+    if (vp9_scale_ratio_ok(fw, fh, r2w, r2h) == 1) { return 1; }
+    return 0;
+}
+
+// ── setup ───────────────────────────────────────────────────────────
+
+// Fill sf for one reference of the current frame. rw/rh are the reference's
+// visible dimensions, fw/fh the current frame's. ss_x/ss_y are the current
+// frame's chroma subsampling and are needed only by vp9_scale_frac and the
+// plane-bound helpers.
+//
+// Returns 0, I_BADPARAM for a null struct or bad subsampling, I_DIMS for a
+// dimension outside 1..VP9_SCALE_MAX_DIM, or I_CORRUPT when the pair fails
+// the section 8.5.2.3 ratio bounds. On failure sf is cleared and valid is 0.
+fn vp9_scale_setup(sf as *Vp9Scale, fw as i64, fh as i64,
+                   rw as i64, rh as i64, ss_x as i64, ss_y as i64) as i64 {
+    if (cast(i64, sf) == 0) { return errno.I_BADPARAM; }
+    _scale_clear(sf);
+
+    if (fw < 1 || fw > VP9_SCALE_MAX_DIM) { return errno.I_DIMS; }
+    if (fh < 1 || fh > VP9_SCALE_MAX_DIM) { return errno.I_DIMS; }
+    if (rw < 1 || rw > VP9_SCALE_MAX_DIM) { return errno.I_DIMS; }
+    if (rh < 1 || rh > VP9_SCALE_MAX_DIM) { return errno.I_DIMS; }
+    if (ss_x < 0 || ss_x > 1) { return errno.I_BADPARAM; }
+    if (ss_y < 0 || ss_y > 1) { return errno.I_BADPARAM; }
+
+    if (vp9_scale_ratio_ok(fw, fh, rw, rh) == 0) { return errno.I_CORRUPT; }
+
+    let is i64 as xs = (rw << VP9_REF_SCALE_SHIFT) / fw;
+    let is i64 as ys = (rh << VP9_REF_SCALE_SHIFT) / fh;
+    if (xs < VP9_SCALE_MIN_SCALE || xs > VP9_SCALE_MAX_SCALE) {
+        return errno.I_CORRUPT;
+    }
+    if (ys < VP9_SCALE_MIN_SCALE || ys > VP9_SCALE_MAX_SCALE) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as xstep = (VP9_SUBPEL_SHIFTS * xs) >> VP9_REF_SCALE_SHIFT;
+    let is i64 as ystep = (VP9_SUBPEL_SHIFTS * ys) >> VP9_REF_SCALE_SHIFT;
+    // Section 8.5.2.4's NOTE says a step is at most 80; the ratio bounds
+    // above make 32 the largest value the formula can produce, so [1, 32]
+    // is the range actually reachable.
+    if (xstep < 1 || xstep > 2 * VP9_SUBPEL_SHIFTS) { return errno.I_CORRUPT; }
+    if (ystep < 1 || ystep > 2 * VP9_SUBPEL_SHIFTS) { return errno.I_CORRUPT; }
+
+    sf.frame_width = fw;
+    sf.frame_height = fh;
+    sf.ref_width = rw;
+    sf.ref_height = rh;
+    sf.subsampling_x = ss_x;
+    sf.subsampling_y = ss_y;
+    sf.x_scale = xs;
+    sf.y_scale = ys;
+    sf.x_step = xstep;
+    sf.y_step = ystep;
+    sf.scaled = 0;
+    // A one-pixel difference at a large size can round to exactly 1.0 in
+    // Q14; the specification's arithmetic then is the identity, so the
+    // unscaled path is the correct one (see refs.md).
+    if (xs != VP9_REF_SCALE_ONE || ys != VP9_REF_SCALE_ONE) { sf.scaled = 1; }
+    sf.valid = 1;
+    return errno.I_OK;
+}
+
+// 1 when either scale factor is not 1.0, 0 otherwise (including an unusable
+// struct). This is the condition for taking the scaled interpolation path.
+fn vp9_scale_is_scaled(sf as *Vp9Scale) as i64 {
+    if (_scale_ready(sf) == 0) { return 0; }
+    return sf.scaled;
+}
+
+// ── positions ───────────────────────────────────────────────────────
+
+// baseX = (x * xScale) >> REF_SCALE_SHIFT, likewise for y. x/y are the
+// plane coordinates of the block's top-left sample (section 8.5.2.3), so
+// for chroma they are chroma-sample coordinates while the scale factor is
+// the luma-derived one; that is what the specification prints.
+fn vp9_scale_base(sf as *Vp9Scale, x as i64, y as i64,
+                  out_x as *i64, out_y as *i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_x) == 0 || cast(i64, out_y) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (x < 0 || x > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    if (y < 0 || y > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    *out_x = (x * sf.x_scale) >> VP9_REF_SCALE_SHIFT;
+    *out_y = (y * sf.y_scale) >> VP9_REF_SCALE_SHIFT;
+    return errno.I_OK;
+}
+
+// lumaX = (plane > 0) ? x << subsampling_x : x, likewise for lumaY.
+fn vp9_scale_luma(sf as *Vp9Scale, plane as i64, x as i64, y as i64,
+                  out_x as *i64, out_y as *i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_x) == 0 || cast(i64, out_y) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (x < 0 || x > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    if (y < 0 || y > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    *out_x = x;
+    *out_y = y;
+    if (plane > 0) {
+        *out_x = x << sf.subsampling_x;
+        *out_y = y << sf.subsampling_y;
+    }
+    return errno.I_OK;
+}
+
+// fracX = ((16 * lumaX * xScale) >> REF_SCALE_SHIFT) & SUBPEL_MASK, and the
+// same for Y. Even for chroma the fractional part is derived from the luma
+// location (section 8.5.2.3, NOTE).
+fn vp9_scale_frac(sf as *Vp9Scale, plane as i64, x as i64, y as i64,
+                  out_x as *i64, out_y as *i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_x) == 0 || cast(i64, out_y) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (x < 0 || x > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    if (y < 0 || y > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+
+    let is i64 as luma_x with mut = x;
+    let is i64 as luma_y with mut = y;
+    if (plane > 0) {
+        luma_x = x << sf.subsampling_x;
+        luma_y = y << sf.subsampling_y;
+    }
+    *out_x = ((VP9_SUBPEL_SHIFTS * luma_x * sf.x_scale)
+              >> VP9_REF_SCALE_SHIFT) & VP9_SUBPEL_MASK;
+    *out_y = ((VP9_SUBPEL_SHIFTS * luma_y * sf.y_scale)
+              >> VP9_REF_SCALE_SHIFT) & VP9_SUBPEL_MASK;
+    return errno.I_OK;
+}
+
+// The complete start position of section 8.5.2.3:
+//
+//   dX     = ((clampedMv[1] * xScale) >> REF_SCALE_SHIFT) + fracX
+//   dY     = ((clampedMv[0] * yScale) >> REF_SCALE_SHIFT) + fracY
+//   startX = (baseX << SUBPEL_BITS) + dX
+//   startY = (baseY << SUBPEL_BITS) + dY
+//
+// clamped_mv_0 is the vertical (row) component and clamped_mv_1 the
+// horizontal (column) one, i.e. the specification's clampedMv[0] and
+// clampedMv[1]. The vector must already be clamped by section 8.5.2.2; that
+// is stage 5's job (mvpred.cst), not this module's.
+fn vp9_scale_start(sf as *Vp9Scale, plane as i64, x as i64, y as i64,
+                   clamped_mv_0 as i64, clamped_mv_1 as i64,
+                   out_start_x as *i64, out_start_y as *i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_start_x) == 0 || cast(i64, out_start_y) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (x < 0 || x > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    if (y < 0 || y > VP9_SCALE_MAX_DIM) { return errno.I_BADPARAM; }
+    if (clamped_mv_0 < 0 - VP9_SCALE_MV_LIMIT
+        || clamped_mv_0 > VP9_SCALE_MV_LIMIT) {
+        return errno.I_BADPARAM;
+    }
+    if (clamped_mv_1 < 0 - VP9_SCALE_MV_LIMIT
+        || clamped_mv_1 > VP9_SCALE_MV_LIMIT) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as base_x = (x * sf.x_scale) >> VP9_REF_SCALE_SHIFT;
+    let is i64 as base_y = (y * sf.y_scale) >> VP9_REF_SCALE_SHIFT;
+
+    let is i64 as luma_x with mut = x;
+    let is i64 as luma_y with mut = y;
+    if (plane > 0) {
+        luma_x = x << sf.subsampling_x;
+        luma_y = y << sf.subsampling_y;
+    }
+    let is i64 as frac_x = ((VP9_SUBPEL_SHIFTS * luma_x * sf.x_scale)
+                            >> VP9_REF_SCALE_SHIFT) & VP9_SUBPEL_MASK;
+    let is i64 as frac_y = ((VP9_SUBPEL_SHIFTS * luma_y * sf.y_scale)
+                            >> VP9_REF_SCALE_SHIFT) & VP9_SUBPEL_MASK;
+
+    let is i64 as dx = ((clamped_mv_1 * sf.x_scale)
+                        >> VP9_REF_SCALE_SHIFT) + frac_x;
+    let is i64 as dy = ((clamped_mv_0 * sf.y_scale)
+                        >> VP9_REF_SCALE_SHIFT) + frac_y;
+
+    *out_start_x = (base_x << VP9_SUBPEL_BITS) + dx;
+    *out_start_y = (base_y << VP9_SUBPEL_BITS) + dy;
+    return errno.I_OK;
+}
+
+// The scaled motion vector components in 1/16 sample units, without the
+// fractional block offset: out_0 = (mv[0] * yScale) >> REF_SCALE_SHIFT and
+// out_1 = (mv[1] * xScale) >> REF_SCALE_SHIFT. Useful for the integer part
+// of the reference location; vp9_scale_start additionally adds the
+// fractional part derived from the block position.
+fn vp9_scale_mv(sf as *Vp9Scale, mv_0 as i64, mv_1 as i64,
+                out_0 as *i64, out_1 as *i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_0) == 0 || cast(i64, out_1) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (mv_0 < 0 - VP9_SCALE_MV_LIMIT || mv_0 > VP9_SCALE_MV_LIMIT) {
+        return errno.I_BADPARAM;
+    }
+    if (mv_1 < 0 - VP9_SCALE_MV_LIMIT || mv_1 > VP9_SCALE_MV_LIMIT) {
+        return errno.I_BADPARAM;
+    }
+    *out_0 = (mv_0 * sf.y_scale) >> VP9_REF_SCALE_SHIFT;
+    *out_1 = (mv_1 * sf.x_scale) >> VP9_REF_SCALE_SHIFT;
+    return errno.I_OK;
+}
+
+// ── reference-plane bounds ──────────────────────────────────────────
+
+// lastX = ((RefFrameWidth + subX) >> subX) - 1, where subX is the plane's
+// subsampling (section 8.5.2.4). Returns the bound (>= 0) or a negative
+// error. The sample coordinate of the block end is
+// startX + (w - 1) * stepX, which the caller clips with vp9_scale_clip_x.
+fn vp9_scale_last_x(sf as *Vp9Scale, plane as i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    let is i64 as sub with mut = 0;
+    if (plane > 0) { sub = sf.subsampling_x; }
+    return ((sf.ref_width + sub) >> sub) - 1;
+}
+
+fn vp9_scale_last_y(sf as *Vp9Scale, plane as i64) as i64 {
+    if (_scale_ready(sf) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    let is i64 as sub with mut = 0;
+    if (plane > 0) { sub = sf.subsampling_y; }
+    return ((sf.ref_height + sub) >> sub) - 1;
+}
+
+// Clip3(0, lastX, v) for the reference plane.
+fn vp9_scale_clip_x(sf as *Vp9Scale, plane as i64, v as i64,
+                    out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    let is i64 as last = vp9_scale_last_x(sf, plane);
+    if (last < 0) { return last; }
+    let is i64 as c with mut = v;
+    if (c < 0) { c = 0; }
+    if (c > last) { c = last; }
+    *out = c;
+    return errno.I_OK;
+}
+
+fn vp9_scale_clip_y(sf as *Vp9Scale, plane as i64, v as i64,
+                    out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    let is i64 as last = vp9_scale_last_y(sf, plane);
+    if (last < 0) { return last; }
+    let is i64 as c with mut = v;
+    if (c < 0) { c = 0; }
+    if (c > last) { c = last; }
+    *out = c;
+    return errno.I_OK;
+}
+
+// The last sample of a span that starts at start and advances by step for
+// count samples: start + (count - 1) * step, the position the prediction
+// process reaches at the end of a row or column. Both the block walk of
+// section 8.5.2.4 and the intermediate-array height use this arithmetic.
+// Returns 0 or I_BADPARAM for a null out pointer, a non-positive count or
+// step, or a start outside the range the specification can produce.
+fn vp9_scale_end(start as i64, step as i64, count as i64,
+                 out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (count < 1 || count > VP9_SCALE_MV_LIMIT) { return errno.I_BADPARAM; }
+    if (step < 1 || step > VP9_SCALE_MV_LIMIT) { return errno.I_BADPARAM; }
+    if (start < 0 - VP9_SCALE_MV_LIMIT || start > VP9_SCALE_MV_LIMIT) {
+        return errno.I_BADPARAM;
+    }
+    *out = start + (count - 1) * step;
+    return errno.I_OK;
+}

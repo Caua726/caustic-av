@@ -1,15 +1,16 @@
 // =======================================================
 // caustic-av/video/vp9/block.cst
-// Per-block syntax and reconstruction for VP9 intra frames: the partition
-// tree of section 6.4.3, the intra-frame mode info of 6.4.4-6.4.10, and the
-// residual orchestration of 6.4.21 (prediction, token decode through the
-// residual module, inverse transform and residual add).
+// Per-block syntax and reconstruction for VP9 frames: the partition tree of
+// section 6.4.3, the mode info of 6.4.4-6.4.20 (intra and inter), motion
+// vector prediction through mvpred.cst, inter prediction through inter.cst,
+// and the residual orchestration of 6.4.21 (prediction, token decode through
+// the residual module, inverse transform and residual add).
 //
-// Scope: key frames and intra-only frames only. An inter frame reaches
-// _mode_info and is refused with I_UNSUPPORTED; stage 5 replaces that branch
-// with inter_frame_mode_info. Nothing here decodes a tile or allocates
-// memory: every array is a pointer into the caller's work block, set up by
-// decode.cst.
+// Scope: key frames, intra-only frames and inter frames, including compound
+// prediction, scaled references and intra blocks inside an inter frame.
+// Nothing here decodes a tile or allocates memory: every array is a pointer
+// into the caller's work block, set up by decode.cst; the reference pixel
+// views come from refs.cst through decode.cst.
 //
 // Block/transform geometry
 // ------------------------
@@ -29,12 +30,14 @@
 // Partial blocks at the frame edge
 // --------------------------------
 // A partition may produce a block that starts inside the coded frame and
-// ends past MiCols*8 / MiRows*8. Section 6.4.21 decodes every transform
-// block whose top-left corner is inside the plane, and 8.5.1 clamps the
-// above/left samples it reads to maxX/maxY while writing the whole block.
-// pred_intra implements exactly that, so the caller's planes must carry at
-// least size-1 padded samples right and below (decode.cst rounds the coded
-// size up to 64 and adds one 64-sample band).
+// ends past MiCols*8 / MiRows*8. Section 6.4.21 predicts the whole block:
+// pred_intra (8.5.1) clamps the above/left samples it reads to maxX/maxY and
+// writes the whole transform block; inter prediction (8.5.2) clamps the
+// reference reads and writes the whole plane block, with
+// 8.5.2.2 producing a possibly negative distance to the overhung edge. The
+// caller's planes therefore carry at least 64 padded samples right and
+// below (decode.cst rounds the coded size up to 64 and adds one 64-sample
+// band).
 // =======================================================
 
 use "../../core/errno.cst" as errno;
@@ -46,6 +49,10 @@ use "recon_tables.cst" as rt;
 use "transforms.cst" as tx;
 use "predict.cst" as pred;
 use "residual.cst" as res;
+use "inter.cst" as ip;
+use "inter_tables.cst" as it;
+use "mvpred.cst" as mvp;
+use "refs.cst" as refs;
 
 // Partition types (section 6.4.3).
 let is i64 as PART_NONE  with imut = 0;
@@ -129,6 +136,7 @@ struct Vp9Blk {
     mi_cols as i64;
     mi_rows as i64;
     mi_col_start as i64;
+    mi_col_end as i64;         // exclusive right edge of the current tile
     acols as i64;              // MiCols rounded up to 8
     arows as i64;              // MiRows rounded up to 8
     sub_x as i64;
@@ -139,9 +147,16 @@ struct Vp9Blk {
     tx_sizes as *u8;
     skips as *u8;
     segment_ids as *u8;
-    ref_frames as *u8;
+    ref_frames as *u8;         // two entries per mode-info block
     y_modes as *u8;
     sub_modes as *u8;
+    prev_seg_ids as *u8;       // PrevSegmentIds of the previous frame
+    interp_filters as *u8;     // one resolved filter per mode-info block
+
+    mvs as *i32;               // [mi][2 ref lists][2 components]
+    sub_mvs as *i32;           // [mi][2][4 sub blocks][2]
+    prev_ref_frames as *u8;    // [mi][2], previous coded frame
+    prev_mvs as *i32;          // [mi][2][2], previous coded frame
 
     above_part as *u8;
     left_part as *u8;
@@ -152,6 +167,8 @@ struct Vp9Blk {
     nz_above_stride as i64;
     nz_left_stride as i64;
 
+    refs as *refs.Vp9Refs;     // published reference pixel views
+    scratch as *u8;            // inter prediction intermediate buffer
     cc as *res.Vp9CoefCtx;
     coef as *i64;
 }
@@ -316,24 +333,58 @@ fn _read_tx_size(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
     return big;
 }
 
-// ── mode info (sections 6.4.4-6.4.10) ───────────────────────────────
+// ── mode info (sections 6.4.4-6.4.20) ──────────────────────────────
 
-// Decode segment_id, skip, tx_size, the intra modes and uv_mode for one
-// block of an intra frame. `sm` receives the four 4x4 sub-modes; every path
-// fills all four entries.
-fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
-              seg as *i64, skip as *i64, tx_sz as *i64,
-              y_mode as *i64, sm as *u8, uv_mode as *i64) as i64 {
-    if (b.h.frame_is_intra != 1) { return errno.I_UNSUPPORTED; }
+// Everything one block's mode info produces. `bmv` is the specification's
+// BlockMvs[refList][block][component]; `ref_frame[0]` is INTRA_FRAME for an
+// intra block and `ref_frame[1]` is NONE when the block is not compound.
+struct ModeInfo {
+    segment_id as i64;
+    skip       as i64;
+    tx_size    as i64;
+    is_inter   as i64;
+    y_mode     as i64;
+    uv_mode    as i64;
+    filter     as i64;
+    ref_frame  as [2]i64;
+    sm         as [4]u8;
+    bmv        as [2][4][2]i32;
+    nearest    as [2][2]i64;   // NearestMv[refList] (row, col)
+    near       as [2][2]i64;   // NearMv[refList]
+    best       as [2][2]i64;   // BestMv[refList] from 6.5.12
+}
 
-    let is i64 as segment_id with mut = 0;
-    if (b.h.seg_enabled == 1 && b.h.seg_update_map == 1) {
-        segment_id = _read_segment_id(br, &b.h.seg_tree_prob[0]);
-        if (segment_id < 0) { return segment_id; }
+// Boolean helpers for the context tables of section 9.3.2, where the
+// specification writes comparisons directly in arithmetic.
+fn _b_eq(a as i64, v as i64) as i64 {
+    if (a == v) { return 1; }
+    return 0;
+}
+
+fn _b_or(a as i64, v as i64) as i64 {
+    if (a != 0 || v != 0) { return 1; }
+    return 0;
+}
+
+fn _b_not(a as i64) as i64 {
+    if (a == 0) { return 1; }
+    return 0;
+}
+
+// size_group_lookup[MiSize] (section 9.3.2).
+fn _size_group(bs as i64) as i64 {
+    if (bs <= rt.BLOCK_8X4) { return 0; }
+    if (bs <= rt.BLOCK_16X8) { return 1; }
+    if (bs <= rt.BLOCK_32X16) { return 2; }
+    return 3;
+}
+
+// read_skip (section 6.4.8).
+fn _read_skip(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
+              segment_id as i64, out as *i64) as i64 {
+    if (segment_id < 0 || segment_id >= rt.MAX_SEGMENTS) {
+        return errno.I_CORRUPT;
     }
-    if (segment_id >= rt.MAX_SEGMENTS) { return errno.I_CORRUPT; }
-
-    // read_skip (6.4.8).
     let is i64 as sk with mut = 0;
     if (b.h.seg_enabled == 1
         && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_SKIP] == 1) {
@@ -345,22 +396,45 @@ fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
             ctx = ctx + cast(i64, b.skips[r * b.mi_cols + c - 1]);
         }
         if (ctx < 0 || ctx >= t.VP9_SKIP_CONTEXTS) { return errno.I_CORRUPT; }
-        let is i64 as bit = vb.vp9_bool_read(br, cast(i64, b.st.probs.skip[ctx]));
+        let is i64 as bit = vb.vp9_bool_read(br,
+                                             cast(i64, b.st.probs.skip[ctx]));
         if (bit < 0) { return bit; }
         sk = bit;
         b.st.counts.skip[ctx][sk] = b.st.counts.skip[ctx][sk] + 1;
     }
+    *out = sk;
+    return errno.I_OK;
+}
 
-    let is i64 as txs = _read_tx_size(b, br, r, c, bs, 1);
-    if (txs < 0) { return txs; }
-    if (txs > rt.TX_32X32) { return errno.I_CORRUPT; }
+// Decode one mode from intra_mode_tree with a caller-supplied probability
+// row (section 9.3.1/9.3.2).
+fn _read_intra_tree(br as *vb.Vp9Bool, probs as *u8) as i64 {
+    if (cast(i64, probs) == 0) { return errno.I_BADPARAM; }
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as p = cast(i64, probs[n >> 1]);
+        if (p < 1 || p > 255) { return errno.I_CORRUPT; }
+        let is i64 as bit = vb.vp9_bool_read(br, p);
+        if (bit < 0) { return bit; }
+        let is i64 as nx = _intra_next(n + bit);
+        if (nx <= 0) { return 0 - nx; }
+        n = nx;
+    }
+}
 
-    // Intra modes. MiSize >= BLOCK_8X8 uses one y_mode for the block;
-    // smaller sizes read one mode per 4x4 group with the contexts of
-    // section 9.3.2 (above: 2+idx of the block above, or the mode already
-    // read in this block; left: 1+2*idy of the block to the left, or the
-    // mode already read).
-    let is i64 as ym with mut = 0;
+// Intra modes for one block. `kf` selects the fixed keyframe tables of
+// section 10.4 (intra frames) or the adaptive tables of section 9.3.2 with
+// the count updates (intra blocks inside an inter frame). Every path fills
+// all four sub-modes.
+fn _read_intra_modes(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
+                     bs as i64, kf as i64, sm as *u8,
+                     ym as *i64, uvm as *i64) as i64 {
+    if (cast(i64, b) == 0 || cast(i64, sm) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, ym) == 0 || cast(i64, uvm) == 0) { return errno.I_BADPARAM; }
+    if (kf != 0 && kf != 1) { return errno.I_BADPARAM; }
+
+    let is i64 as group = _size_group(bs);
+    let is i64 as mode_y with mut = 0;
     if (bs >= rt.BLOCK_8X8) {
         let is i64 as above with mut = rt.MODE_DC;
         let is i64 as left with mut = rt.MODE_DC;
@@ -370,12 +444,21 @@ fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
         if (c > b.mi_col_start) {
             left = cast(i64, b.sub_modes[(r * b.mi_cols + c - 1) * 4 + 1]);
         }
-        ym = _read_kf_y_mode(br, above, left);
-        if (ym < 0) { return ym; }
-        sm[0] = cast(u8, ym);
-        sm[1] = cast(u8, ym);
-        sm[2] = cast(u8, ym);
-        sm[3] = cast(u8, ym);
+        if (kf == 1) {
+            mode_y = _read_kf_y_mode(br, above, left);
+        } else {
+            mode_y = _read_intra_tree(br, &b.st.probs.y_mode[group][0]);
+        }
+        if (mode_y < 0) { return mode_y; }
+        if (mode_y >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
+        if (kf == 0) {
+            b.st.counts.y_mode[group][mode_y] =
+                b.st.counts.y_mode[group][mode_y] + 1;
+        }
+        sm[0] = cast(u8, mode_y);
+        sm[1] = cast(u8, mode_y);
+        sm[2] = cast(u8, mode_y);
+        sm[3] = cast(u8, mode_y);
     } else {
         let is i64 as n4w = rt.recon_num_4x4_wide(bs);
         let is i64 as n4h = rt.recon_num_4x4_high(bs);
@@ -398,8 +481,17 @@ fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                     left = cast(i64,
                         b.sub_modes[(r * b.mi_cols + c - 1) * 4 + 1 + idy * 2]);
                 }
-                let is i64 as m = _read_kf_y_mode(br, above, left);
+                let is i64 as m with mut = 0;
+                if (kf == 1) {
+                    m = _read_kf_y_mode(br, above, left);
+                } else {
+                    m = _read_intra_tree(br, &b.st.probs.y_mode[0][0]);
+                }
                 if (m < 0) { return m; }
+                if (m >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
+                if (kf == 0) {
+                    b.st.counts.y_mode[0][m] = b.st.counts.y_mode[0][m] + 1;
+                }
                 let is i64 as y2 with mut = 0;
                 while (y2 < n4h) {
                     let is i64 as x2 with mut = 0;
@@ -409,23 +501,1269 @@ fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                     }
                     y2 = y2 + 1;
                 }
-                ym = m;
+                mode_y = m;
                 idx = idx + n4w;
             }
             idy = idy + n4h;
         }
     }
-    if (ym < 0 || ym >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
+    if (mode_y < 0 || mode_y >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
 
-    let is i64 as uvm = _read_kf_uv_mode(br, ym);
-    if (uvm < 0) { return uvm; }
-    if (uvm >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
+    let is i64 as mode_uv with mut = 0;
+    if (kf == 1) {
+        mode_uv = _read_kf_uv_mode(br, mode_y);
+    } else {
+        mode_uv = _read_intra_tree(br, &b.st.probs.uv_mode[mode_y][0]);
+    }
+    if (mode_uv < 0) { return mode_uv; }
+    if (mode_uv >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
+    if (kf == 0) {
+        b.st.counts.uv_mode[mode_y][mode_uv] =
+            b.st.counts.uv_mode[mode_y][mode_uv] + 1;
+    }
 
-    *seg = segment_id;
-    *skip = sk;
-    *tx_sz = txs;
-    *y_mode = ym;
-    *uv_mode = uvm;
+    *ym = mode_y;
+    *uvm = mode_uv;
+    return errno.I_OK;
+}
+
+// intra_frame_mode_info (section 6.4.6).
+fn _intra_frame_mode_info(b as *Vp9Blk, br as *vb.Vp9Bool,
+                          r as i64, c as i64, bs as i64,
+                          mi as *ModeInfo) as i64 {
+    let is i64 as segment_id with mut = 0;
+    if (b.h.seg_enabled == 1 && b.h.seg_update_map == 1) {
+        segment_id = _read_segment_id(br, &b.h.seg_tree_prob[0]);
+        if (segment_id < 0) { return segment_id; }
+    }
+    if (segment_id >= rt.MAX_SEGMENTS) { return errno.I_CORRUPT; }
+    mi.segment_id = segment_id;
+
+    let is i64 as sk with mut = 0;
+    let is i64 as st with mut = _read_skip(b, br, r, c, segment_id, &sk);
+    if (st < 0) { return st; }
+    mi.skip = sk;
+
+    let is i64 as txs = _read_tx_size(b, br, r, c, bs, 1);
+    if (txs < 0) { return txs; }
+    if (txs > rt.TX_32X32) { return errno.I_CORRUPT; }
+    mi.tx_size = txs;
+
+    mi.ref_frame[0] = rt.INTRA_FRAME;
+    mi.ref_frame[1] = rt.INTRA_FRAME;
+    mi.is_inter = 0;
+    mi.filter = 0;
+
+    let is i64 as ym with mut = 0;
+    let is i64 as uvm with mut = 0;
+    st = _read_intra_modes(b, br, r, c, bs, 1, cast(*u8, &mi.sm[0]),
+                           &ym, &uvm);
+    if (st < 0) { return st; }
+    mi.y_mode = ym;
+    mi.uv_mode = uvm;
+    return errno.I_OK;
+}
+
+// The reference frames of the neighbours and the four availability flags of
+// section 6.4.11. LeftRefFrame[1]/AboveRefFrame[1] are NONE (0) when the
+// neighbour is unavailable.
+struct NeighRefs {
+    avail_l as i64;
+    avail_u as i64;
+    ref_l   as [2]i64;
+    ref_u   as [2]i64;
+    intra_l as i64;
+    intra_u as i64;
+    single_l as i64;
+    single_u as i64;
+}
+
+fn _neigh_refs(b as *Vp9Blk, r as i64, c as i64, n as *NeighRefs) as void {
+    n.avail_l = 0;
+    if (c > b.mi_col_start) { n.avail_l = 1; }
+    n.avail_u = 0;
+    if (r > 0) { n.avail_u = 1; }
+
+    n.ref_l[0] = rt.INTRA_FRAME;
+    n.ref_l[1] = rt.INTRA_FRAME;
+    n.ref_u[0] = rt.INTRA_FRAME;
+    n.ref_u[1] = rt.INTRA_FRAME;
+    if (n.avail_l == 1) {
+        let is i64 as idx = (r * b.mi_cols + c - 1) * 2;
+        n.ref_l[0] = cast(i64, b.ref_frames[idx]);
+        n.ref_l[1] = cast(i64, b.ref_frames[idx + 1]);
+    }
+    if (n.avail_u == 1) {
+        let is i64 as idx = ((r - 1) * b.mi_cols + c) * 2;
+        n.ref_u[0] = cast(i64, b.ref_frames[idx]);
+        n.ref_u[1] = cast(i64, b.ref_frames[idx + 1]);
+    }
+
+    n.intra_l = 0;
+    if (n.ref_l[0] <= rt.INTRA_FRAME) { n.intra_l = 1; }
+    n.intra_u = 0;
+    if (n.ref_u[0] <= rt.INTRA_FRAME) { n.intra_u = 1; }
+    n.single_l = 0;
+    if (n.ref_l[1] <= it.NONE) { n.single_l = 1; }
+    n.single_u = 0;
+    if (n.ref_u[1] <= it.NONE) { n.single_u = 1; }
+}
+
+// read_is_inter (section 6.4.13).
+fn _read_is_inter(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
+                  n as *NeighRefs, out as *i64) as i64 {
+    if (b.h.seg_enabled == 1
+        && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_REF_FRAME] == 1) {
+        let is i64 as rf =
+            b.h.seg_feature_data[segment_id][t.VP9_SEG_LVL_REF_FRAME];
+        if (rf < rt.INTRA_FRAME || rf > it.ALTREF_FRAME) {
+            return errno.I_CORRUPT;
+        }
+        *out = 0;
+        if (rf != rt.INTRA_FRAME) { *out = 1; }
+        return errno.I_OK;
+    }
+
+    let is i64 as ctx with mut = 0;
+    if (n.avail_u == 1 && n.avail_l == 1) {
+        ctx = 0;
+        if (n.intra_l == 1 && n.intra_u == 1) { ctx = 3; }
+        else if (n.intra_l == 1 || n.intra_u == 1) { ctx = 1; }
+    } else if (n.avail_u == 1 || n.avail_l == 1) {
+        ctx = 2;
+        if (n.avail_u == 1) { ctx = 2 * n.intra_u; }
+        else { ctx = 2 * n.intra_l; }
+    } else {
+        ctx = 0;
+    }
+    if (ctx < 0 || ctx >= t.VP9_IS_INTER_CONTEXTS) { return errno.I_CORRUPT; }
+    let is i64 as bit = vb.vp9_bool_read(br,
+                                         cast(i64, b.st.probs.is_inter[ctx]));
+    if (bit < 0) { return bit; }
+    b.st.counts.is_inter[ctx][bit] = b.st.counts.is_inter[ctx][bit] + 1;
+    *out = bit;
+    return errno.I_OK;
+}
+
+// get_segment_id (section 6.4.14): the smallest PrevSegmentIds value over
+// the on-screen part of the block.
+fn _get_segment_id(b as *Vp9Blk, r as i64, c as i64, bs as i64) as i64 {
+    let is i64 as bw = rt.recon_num_8x8_wide(bs);
+    let is i64 as bh = rt.recon_num_8x8_high(bs);
+    if (bw < 1 || bh < 1) { return errno.I_CORRUPT; }
+    let is i64 as xmis = b.mi_cols - c;
+    let is i64 as ymis = b.mi_rows - r;
+    if (xmis > bw) { xmis = bw; }
+    if (ymis > bh) { ymis = bh; }
+    if (xmis < 1 || ymis < 1) { return errno.I_CORRUPT; }
+    let is i64 as seg with mut = 7;
+    let is i64 as y with mut = 0;
+    while (y < ymis) {
+        let is i64 as x with mut = 0;
+        while (x < xmis) {
+            let is i64 as v = cast(i64,
+                b.prev_seg_ids[(r + y) * b.mi_cols + (c + x)]);
+            if (v < 0 || v >= rt.MAX_SEGMENTS) { return errno.I_CORRUPT; }
+            if (v < seg) { seg = v; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return seg;
+}
+
+// inter_segment_id (section 6.4.12).
+fn _read_inter_segment_id(b as *Vp9Blk, br as *vb.Vp9Bool,
+                          r as i64, c as i64, bs as i64,
+                          out as *i64) as i64 {
+    if (b.h.seg_enabled == 0) { *out = 0; return errno.I_OK; }
+
+    let is i64 as predicted = _get_segment_id(b, r, c, bs);
+    if (predicted < 0) { return predicted; }
+
+    if (b.h.seg_update_map == 0) {
+        *out = predicted;
+        return errno.I_OK;
+    }
+
+    let is i64 as seg with mut = 0;
+    if (b.h.seg_temporal_update == 1) {
+        let is i64 as ctx = cast(i64, b.above_segpred[c])
+                          + cast(i64, b.left_segpred[r]);
+        if (ctx < 0 || ctx > 2) { return errno.I_CORRUPT; }
+        let is i64 as bit = vb.vp9_bool_read(br,
+            cast(i64, b.h.seg_pred_prob[ctx]));
+        if (bit < 0) { return bit; }
+        if (bit == 1) { seg = predicted; }
+        else {
+            seg = _read_segment_id(br, &b.h.seg_tree_prob[0]);
+            if (seg < 0) { return seg; }
+        }
+        let is i64 as n8w = rt.recon_num_8x8_wide(bs);
+        let is i64 as n8h = rt.recon_num_8x8_high(bs);
+        let is i64 as i with mut = 0;
+        while (i < n8w) {
+            b.above_segpred[c + i] = cast(u8, bit);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < n8h) {
+            b.left_segpred[r + i] = cast(u8, bit);
+            i = i + 1;
+        }
+    } else {
+        seg = _read_segment_id(br, &b.h.seg_tree_prob[0]);
+        if (seg < 0) { return seg; }
+    }
+    if (seg < 0 || seg >= rt.MAX_SEGMENTS) { return errno.I_CORRUPT; }
+    *out = seg;
+    return errno.I_OK;
+}
+
+// inter_mode (section 6.4.16 + 9.3.2).
+fn _read_inter_mode(b as *Vp9Blk, br as *vb.Vp9Bool, ctx as i64) as i64 {
+    if (ctx < 0 || ctx >= t.VP9_INTER_MODE_CONTEXTS) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as p0 = cast(i64, b.st.probs.inter_mode[ctx][0]);
+    let is i64 as b0 = vb.vp9_bool_read(br, p0);
+    if (b0 < 0) { return b0; }
+    let is i64 as mode with mut = 0;
+    if (b0 == 0) { mode = 2; }      // ZEROMV
+    else {
+        let is i64 as p1 = cast(i64, b.st.probs.inter_mode[ctx][1]);
+        let is i64 as b1 = vb.vp9_bool_read(br, p1);
+        if (b1 < 0) { return b1; }
+        if (b1 == 0) { mode = 0; }  // NEARESTMV
+        else {
+            let is i64 as p2 = cast(i64, b.st.probs.inter_mode[ctx][2]);
+            let is i64 as b2 = vb.vp9_bool_read(br, p2);
+            if (b2 < 0) { return b2; }
+            if (b2 == 0) { mode = 1; }  // NEARMV
+            else { mode = 3; }          // NEWMV
+        }
+    }
+    b.st.counts.inter_mode[ctx][mode] =
+        b.st.counts.inter_mode[ctx][mode] + 1;
+    return mode;
+}
+
+// interp_filter (section 6.4.16 + 9.3.2).
+fn _read_interp_filter(b as *Vp9Blk, br as *vb.Vp9Bool,
+                       n as *NeighRefs, r as i64, c as i64,
+                       out as *i64) as i64 {
+    if (b.h.interpolation_filter != t.VP9_SWITCHABLE) {
+        *out = b.h.interpolation_filter;
+        return errno.I_OK;
+    }
+
+    let is i64 as left with mut = 3;
+    let is i64 as above with mut = 3;
+    if (n.avail_l == 1 && n.ref_l[0] > rt.INTRA_FRAME) {
+        left = cast(i64, b.interp_filters[r * b.mi_cols + (c - 1)]);
+    }
+    if (n.avail_u == 1 && n.ref_u[0] > rt.INTRA_FRAME) {
+        above = cast(i64, b.interp_filters[(r - 1) * b.mi_cols + c]);
+    }
+
+    let is i64 as ctx with mut = 3;
+    if (left == above) { ctx = left; }
+    else if (left == 3 && above != 3) { ctx = above; }
+    else if (left != 3 && above == 3) { ctx = left; }
+    else { ctx = 3; }
+    if (ctx < 0 || ctx >= t.VP9_INTERP_FILTER_CONTEXTS) {
+        return errno.I_CORRUPT;
+    }
+
+    let is i64 as p0 = cast(i64, b.st.probs.interp_filter[ctx][0]);
+    let is i64 as bit = vb.vp9_bool_read(br, p0);
+    if (bit < 0) { return bit; }
+    let is i64 as f with mut = 0;
+    if (bit == 0) { f = it.EIGHTTAP; }
+    else {
+        let is i64 as p1 = cast(i64, b.st.probs.interp_filter[ctx][1]);
+        let is i64 as bit2 = vb.vp9_bool_read(br, p1);
+        if (bit2 < 0) { return bit2; }
+        if (bit2 == 0) { f = it.EIGHTTAP_SMOOTH; }
+        else { f = it.EIGHTTAP_SHARP; }
+    }
+    b.st.counts.interp_filter[ctx][f] =
+        b.st.counts.interp_filter[ctx][f] + 1;
+    *out = f;
+    return errno.I_OK;
+}
+
+// mv_class_tree[20] (section 9.3): leaf values are the negated class, even
+// node offsets otherwise. Node n uses mv_class_probs[comp][n >> 1].
+fn _mv_class_next(idx as i64) as i64 {
+    if (idx == 0)  { return 0 - 0; }
+    if (idx == 1)  { return 2; }
+    if (idx == 2)  { return 0 - 1; }
+    if (idx == 3)  { return 4; }
+    if (idx == 4)  { return 6; }
+    if (idx == 5)  { return 8; }
+    if (idx == 6)  { return 0 - 2; }
+    if (idx == 7)  { return 0 - 3; }
+    if (idx == 8)  { return 10; }
+    if (idx == 9)  { return 12; }
+    if (idx == 10) { return 0 - 4; }
+    if (idx == 11) { return 0 - 5; }
+    if (idx == 12) { return 0 - 6; }
+    if (idx == 13) { return 14; }
+    if (idx == 14) { return 16; }
+    if (idx == 15) { return 18; }
+    if (idx == 16) { return 0 - 7; }
+    if (idx == 17) { return 0 - 8; }
+    if (idx == 18) { return 0 - 9; }
+    return 0 - 10;
+}
+
+fn _read_mv_class(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64) as i64 {
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as p = cast(i64, b.st.probs.mv_class[comp][n >> 1]);
+        if (p < 1 || p > 255) { return errno.I_CORRUPT; }
+        let is i64 as bit = vb.vp9_bool_read(br, p);
+        if (bit < 0) { return bit; }
+        let is i64 as s = _mv_class_next(n + bit);
+        if (s <= 0) { return 0 - s; }
+        n = s;
+    }
+}
+
+// mv_fr_tree[6] (section 9.3): leaves 0..3.
+fn _mv_fr_next(idx as i64) as i64 {
+    if (idx == 0) { return 0; }
+    if (idx == 1) { return 2; }
+    if (idx == 2) { return 0 - 1; }
+    if (idx == 3) { return 4; }
+    if (idx == 4) { return 0 - 2; }
+    return 0 - 3;
+}
+
+fn _read_mv_fr(br as *vb.Vp9Bool, probs as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as p = cast(i64, probs[n >> 1]);
+        if (p < 1 || p > 255) { return errno.I_CORRUPT; }
+        let is i64 as bit = vb.vp9_bool_read(br, p);
+        if (bit < 0) { return bit; }
+        let is i64 as s = _mv_fr_next(n + bit);
+        if (s <= 0) { return 0 - s; }
+        n = s;
+    }
+}
+
+// mv_joint_tree[6] (section 9.3): leaves MV_JOINT_ZERO..MV_JOINT_HNZVNZ.
+fn _mv_joint_next(idx as i64) as i64 {
+    if (idx == 0) { return 0; }
+    if (idx == 1) { return 2; }
+    if (idx == 2) { return 0 - 1; }
+    if (idx == 3) { return 4; }
+    if (idx == 4) { return 0 - 2; }
+    return 0 - 3;
+}
+
+fn _read_mv_joint(b as *Vp9Blk, br as *vb.Vp9Bool) as i64 {
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as p = cast(i64, b.st.probs.mv_joint[n >> 1]);
+        if (p < 1 || p > 255) { return errno.I_CORRUPT; }
+        let is i64 as bit = vb.vp9_bool_read(br, p);
+        if (bit < 0) { return bit; }
+        let is i64 as s = _mv_joint_next(n + bit);
+        if (s <= 0) { return 0 - s; }
+        n = s;
+    }
+}
+
+// read_mv_component (section 6.4.20).
+fn _read_mv_component(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64,
+                      use_hp as i64, out as *i64) as i64 {
+    if (comp < 0 || comp > 1) { return errno.I_BADPARAM; }
+    if (use_hp != 0 && use_hp != 1) { return errno.I_BADPARAM; }
+
+    let is i64 as sign = vb.vp9_bool_read(br,
+        cast(i64, b.st.probs.mv_sign[comp]));
+    if (sign < 0) { return sign; }
+    b.st.counts.mv_sign[comp][sign] =
+        b.st.counts.mv_sign[comp][sign] + 1;
+
+    let is i64 as cls = _read_mv_class(b, br, comp);
+    if (cls < 0) { return cls; }
+    b.st.counts.mv_class[comp][cls] =
+        b.st.counts.mv_class[comp][cls] + 1;
+
+    let is i64 as mag with mut = 0;
+    if (cls == 0) {
+        let is i64 as bit = vb.vp9_bool_read(br,
+            cast(i64, b.st.probs.mv_class0_bit[comp]));
+        if (bit < 0) { return bit; }
+        b.st.counts.mv_class0_bit[comp][bit] =
+            b.st.counts.mv_class0_bit[comp][bit] + 1;
+        let is i64 as fr = _read_mv_fr(br,
+            &b.st.probs.mv_class0_fr[comp][bit][0]);
+        if (fr < 0) { return fr; }
+        b.st.counts.mv_class0_fr[comp][bit][fr] =
+            b.st.counts.mv_class0_fr[comp][bit][fr] + 1;
+        let is i64 as hp with mut = 1;
+        if (use_hp == 1) {
+            hp = vb.vp9_bool_read(br,
+                cast(i64, b.st.probs.mv_class0_hp[comp]));
+            if (hp < 0) { return hp; }
+            b.st.counts.mv_class0_hp[comp][hp] =
+                b.st.counts.mv_class0_hp[comp][hp] + 1;
+        }
+        mag = ((bit << 3) | (fr << 1) | hp) + 1;
+    } else {
+        let is i64 as d with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < cls) {
+            let is i64 as bit = vb.vp9_bool_read(br,
+                cast(i64, b.st.probs.mv_bits[comp][i]));
+            if (bit < 0) { return bit; }
+            b.st.counts.mv_bits[comp][i][bit] =
+                b.st.counts.mv_bits[comp][i][bit] + 1;
+            d = d | (bit << i);
+            i = i + 1;
+        }
+        mag = 2 << (cls + 2);
+        let is i64 as fr = _read_mv_fr(br, &b.st.probs.mv_fr[comp][0]);
+        if (fr < 0) { return fr; }
+        b.st.counts.mv_fr[comp][fr] = b.st.counts.mv_fr[comp][fr] + 1;
+        let is i64 as hp with mut = 1;
+        if (use_hp == 1) {
+            hp = vb.vp9_bool_read(br, cast(i64, b.st.probs.mv_hp[comp]));
+            if (hp < 0) { return hp; }
+            b.st.counts.mv_hp[comp][hp] =
+                b.st.counts.mv_hp[comp][hp] + 1;
+        }
+        mag = mag + ((d << 3) | (fr << 1) | hp) + 1;
+    }
+    if (sign == 1) { *out = 0 - mag; }
+    else { *out = mag; }
+    return errno.I_OK;
+}
+
+// read_mv (section 6.4.19). BestMv is the reference vector for this list.
+fn _read_mv(b as *Vp9Blk, br as *vb.Vp9Bool, ref_list as i64,
+            best_row as i64, best_col as i64,
+            out_row as *i64, out_col as *i64) as i64 {
+    if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
+    let is i64 as use_hp with mut = 0;
+    if (b.h.allow_high_precision_mv == 1
+        && mvp.mv_use_hp(best_row, best_col) == 1) {
+        use_hp = 1;
+    }
+
+    let is i64 as joint = _read_mv_joint(b, br);
+    if (joint < 0) { return joint; }
+    b.st.counts.mv_joint[joint] = b.st.counts.mv_joint[joint] + 1;
+
+    let is i64 as drow with mut = 0;
+    let is i64 as dcol with mut = 0;
+    if (joint == 2 || joint == 3) {
+        let is i64 as sr = _read_mv_component(b, br, 0, use_hp, &drow);
+        if (sr < 0) { return sr; }
+    }
+    if (joint == 1 || joint == 3) {
+        let is i64 as sc = _read_mv_component(b, br, 1, use_hp, &dcol);
+        if (sc < 0) { return sc; }
+    }
+
+    let is i64 as row = best_row + drow;
+    let is i64 as col = best_col + dcol;
+    // Section 7.4.13 conformance: -(1 << 14) < Mv < (1 << 14) - 1.
+    if (row <= 0 - 16384 || row >= 16383) { return errno.I_CORRUPT; }
+    if (col <= 0 - 16384 || col >= 16383) { return errno.I_CORRUPT; }
+    *out_row = row;
+    *out_col = col;
+    return errno.I_OK;
+}
+
+// assign_mv (section 6.4.18) for one reference list. The nearest/near
+// vectors may have been replaced by append_sub8x8_mvs for a sub-8x8 piece;
+// BestMv is the block-level 6.5.12 value and is never taken from append.
+fn _assign_mv_list(b as *Vp9Blk, br as *vb.Vp9Bool, y_mode as i64,
+                   list as i64, nr as i64, nc as i64, ar as i64, ac as i64,
+                   brr as i64, bc as i64, out_row as *i64,
+                   out_col as *i64) as i64 {
+    let is i64 as row with mut = 0;
+    let is i64 as col with mut = 0;
+    if (y_mode == rt.MODE_NEWMV) {
+        let is i64 as st = _read_mv(b, br, list, brr, bc, &row, &col);
+        if (st < 0) { return st; }
+    } else if (y_mode == rt.MODE_NEARESTMV) {
+        row = nr;
+        col = nc;
+    } else if (y_mode == rt.MODE_NEARMV) {
+        row = ar;
+        col = ac;
+    } else if (y_mode == rt.MODE_ZEROMV) {
+        row = 0;
+        col = 0;
+    } else {
+        return errno.I_CORRUPT;
+    }
+    *out_row = row;
+    *out_col = col;
+    return errno.I_OK;
+}
+
+// ── reference-frame and compound contexts (section 9.3.2) ───────────
+
+fn _comp_mode_ctx(h as *hd.Vp9Header, n as *NeighRefs) as i64 {
+    let is i64 as fixed = h.comp_fixed_ref;
+    let is i64 as u0 = n.ref_u[0];
+    let is i64 as l0 = n.ref_l[0];
+    let is i64 as ufix with mut = 0;
+    if (u0 == fixed) { ufix = 1; }
+    let is i64 as lfix with mut = 0;
+    if (l0 == fixed) { lfix = 1; }
+
+    if (n.avail_u == 1 && n.avail_l == 1) {
+        if (n.single_u == 1 && n.single_l == 1) { return ufix ^ lfix; }
+        if (n.single_u == 1) {
+            let is i64 as v = _b_or(ufix, n.intra_u);
+            return 2 + v;
+        }
+        if (n.single_l == 1) {
+            let is i64 as v = _b_or(lfix, n.intra_l);
+            return 2 + v;
+        }
+        return 4;
+    }
+    if (n.avail_u == 1) {
+        if (n.single_u == 1) { return ufix; }
+        return 3;
+    }
+    if (n.avail_l == 1) {
+        if (n.single_l == 1) { return lfix; }
+        return 3;
+    }
+    return 1;
+}
+
+fn _comp_ref_ctx(h as *hd.Vp9Header, n as *NeighRefs) as i64 {
+    let is i64 as fixed = h.comp_fixed_ref;
+    let is i64 as v0 = h.comp_var_ref[0];
+    let is i64 as v1 = h.comp_var_ref[1];
+    let is i64 as fix_idx with mut = 0;
+    if (h.ref_frame_sign_bias[fixed] != 0) { fix_idx = 1; }
+    let is i64 as var_idx = 1 - fix_idx;
+    let is i64 as ur0 = n.ref_u[0];
+    let is i64 as ul0 = n.ref_l[0];
+    let is i64 as vrfa with mut = 0;
+    if (n.single_u == 1) { vrfa = ur0; } else { vrfa = n.ref_u[var_idx]; }
+    let is i64 as vrfl with mut = 0;
+    if (n.single_l == 1) { vrfl = ul0; } else { vrfl = n.ref_l[var_idx]; }
+
+    if (n.avail_u == 1 && n.avail_l == 1) {
+        if (n.intra_u == 1 && n.intra_l == 1) { return 2; }
+        if (n.intra_l == 1) {
+            if (n.single_u == 1) { return 1 + 2 * _b_not(_b_eq(ur0, v1)); }
+            return 1 + 2 * _b_not(_b_eq(n.ref_u[var_idx], v1));
+        }
+        if (n.intra_u == 1) {
+            if (n.single_l == 1) { return 1 + 2 * _b_not(_b_eq(ul0, v1)); }
+            return 1 + 2 * _b_not(_b_eq(n.ref_l[var_idx], v1));
+        }
+        let is i64 as same with mut = 0;
+        if (vrfa == vrfl) { same = 1; }
+        if (same == 1 && v1 == vrfa) { return 0; }
+        if (n.single_l == 1 && n.single_u == 1) {
+            if ((vrfa == fixed && vrfl == v0)
+                || (vrfl == fixed && vrfa == v0)) { return 4; }
+            if (vrfa == vrfl) { return 3; }
+            return 1;
+        }
+        if (n.single_l == 1 || n.single_u == 1) {
+            let is i64 as vrfc with mut = 0;
+            let is i64 as rfs with mut = 0;
+            if (n.single_l == 1) { vrfc = vrfa; } else { vrfc = vrfl; }
+            if (n.single_u == 1) { rfs = vrfa; } else { rfs = vrfl; }
+            if (vrfc == v1 && rfs != v1) { return 1; }
+            if (rfs == v1 && vrfc != v1) { return 2; }
+            return 4;
+        }
+        if (vrfa == vrfl) { return 4; }
+        return 2;
+    }
+    if (n.avail_u == 1) {
+        if (n.intra_u == 1) { return 2; }
+        if (n.single_u == 1) { return 3 * _b_not(_b_eq(ur0, v1)); }
+        return 4 * _b_not(_b_eq(n.ref_u[var_idx], v1));
+    }
+    if (n.avail_l == 1) {
+        if (n.intra_l == 1) { return 2; }
+        if (n.single_l == 1) { return 3 * _b_not(_b_eq(ul0, v1)); }
+        return 4 * _b_not(_b_eq(n.ref_l[var_idx], v1));
+    }
+    return 2;
+}
+
+fn _single_p1_ctx(n as *NeighRefs) as i64 {
+    let is i64 as ur0 = n.ref_u[0];
+    let is i64 as ur1 = n.ref_u[1];
+    let is i64 as ul0 = n.ref_l[0];
+    let is i64 as ul1 = n.ref_l[1];
+
+    if (n.avail_u == 1 && n.avail_l == 1) {
+        if (n.intra_u == 1 && n.intra_l == 1) { return 2; }
+        if (n.intra_l == 1) {
+            if (n.single_u == 1) { return 4 * _b_eq(ur0, it.LAST_FRAME); }
+            return 1 + _b_or(_b_eq(ur0, it.LAST_FRAME),
+                             _b_eq(ur1, it.LAST_FRAME));
+        }
+        if (n.intra_u == 1) {
+            if (n.single_l == 1) { return 4 * _b_eq(ul0, it.LAST_FRAME); }
+            return 1 + _b_or(_b_eq(ul0, it.LAST_FRAME),
+                             _b_eq(ul1, it.LAST_FRAME));
+        }
+        if (n.single_u == 1 && n.single_l == 1) {
+            return 2 * _b_eq(ur0, it.LAST_FRAME)
+                 + 2 * _b_eq(ul0, it.LAST_FRAME);
+        }
+        if (n.single_u == 0 && n.single_l == 0) {
+            let is i64 as u = _b_or(_b_eq(ur0, it.LAST_FRAME),
+                                    _b_eq(ur1, it.LAST_FRAME));
+            let is i64 as l = _b_or(_b_eq(ul0, it.LAST_FRAME),
+                                    _b_eq(ul1, it.LAST_FRAME));
+            return 1 + _b_or(u, l);
+        }
+        let is i64 as rfs with mut = 0;
+        let is i64 as crf1 with mut = 0;
+        let is i64 as crf2 with mut = 0;
+        if (n.single_u == 1) { rfs = ur0; crf1 = ul0; crf2 = ul1; }
+        else { rfs = ul0; crf1 = ur0; crf2 = ur1; }
+        let is i64 as c = _b_or(_b_eq(crf1, it.LAST_FRAME),
+                                _b_eq(crf2, it.LAST_FRAME));
+        if (rfs == it.LAST_FRAME) { return 3 + c; }
+        return c;
+    }
+    if (n.avail_u == 1) {
+        if (n.intra_u == 1) { return 2; }
+        if (n.single_u == 1) { return 4 * _b_eq(ur0, it.LAST_FRAME); }
+        return 1 + _b_or(_b_eq(ur0, it.LAST_FRAME),
+                         _b_eq(ur1, it.LAST_FRAME));
+    }
+    if (n.avail_l == 1) {
+        if (n.intra_l == 1) { return 2; }
+        if (n.single_l == 1) { return 4 * _b_eq(ul0, it.LAST_FRAME); }
+        return 1 + _b_or(_b_eq(ul0, it.LAST_FRAME),
+                         _b_eq(ul1, it.LAST_FRAME));
+    }
+    return 2;
+}
+
+fn _single_p2_ctx(n as *NeighRefs) as i64 {
+    let is i64 as ur0 = n.ref_u[0];
+    let is i64 as ur1 = n.ref_u[1];
+    let is i64 as ul0 = n.ref_l[0];
+    let is i64 as ul1 = n.ref_l[1];
+    let is i64 as G = it.GOLDEN_FRAME;
+    let is i64 as A = it.ALTREF_FRAME;
+    let is i64 as L = it.LAST_FRAME;
+
+    if (n.avail_u == 1 && n.avail_l == 1) {
+        if (n.intra_u == 1 && n.intra_l == 1) { return 2; }
+        if (n.intra_l == 1) {
+            if (n.single_u == 1) {
+                if (ur0 == L) { return 3; }
+                return 4 * _b_eq(ur0, G);
+            }
+            return 1 + 2 * _b_or(_b_eq(ur0, G), _b_eq(ur1, G));
+        }
+        if (n.intra_u == 1) {
+            if (n.single_l == 1) {
+                if (ul0 == L) { return 3; }
+                return 4 * _b_eq(ul0, G);
+            }
+            return 1 + 2 * _b_or(_b_eq(ul0, G), _b_eq(ul1, G));
+        }
+        if (n.single_u == 1 && n.single_l == 1) {
+            if (ur0 == L && ul0 == L) { return 3; }
+            if (ur0 == L) { return 4 * _b_eq(ul0, G); }
+            if (ul0 == L) { return 4 * _b_eq(ur0, G); }
+            return 2 * _b_eq(ur0, G) + 2 * _b_eq(ul0, G);
+        }
+        if (n.single_u == 0 && n.single_l == 0) {
+            if (ur0 == ul0 && ur1 == ul1) {
+                return 3 * _b_or(_b_eq(ur0, G), _b_eq(ur1, G));
+            }
+            return 2;
+        }
+        let is i64 as rfs with mut = 0;
+        let is i64 as crf1 with mut = 0;
+        let is i64 as crf2 with mut = 0;
+        if (n.single_u == 1) { rfs = ur0; crf1 = ul0; crf2 = ul1; }
+        else { rfs = ul0; crf1 = ur0; crf2 = ur1; }
+        let is i64 as c = _b_or(_b_eq(crf1, G), _b_eq(crf2, G));
+        if (rfs == G) { return 3 + c; }
+        if (rfs == A) { return c; }
+        return 1 + 2 * c;
+    }
+    if (n.avail_u == 1) {
+        if (n.intra_u == 1 || (ur0 == L && n.single_u == 1)) { return 2; }
+        if (n.single_u == 1) { return 4 * _b_eq(ur0, G); }
+        return 3 * _b_or(_b_eq(ur0, G), _b_eq(ur1, G));
+    }
+    if (n.avail_l == 1) {
+        if (n.intra_l == 1 || (ul0 == L && n.single_l == 1)) { return 2; }
+        if (n.single_l == 1) { return 4 * _b_eq(ul0, G); }
+        return 3 * _b_or(_b_eq(ul0, G), _b_eq(ul1, G));
+    }
+    return 2;
+}
+
+// read_ref_frames (section 6.4.17).
+fn _read_ref_frames(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
+                    n as *NeighRefs, mi as *ModeInfo) as i64 {
+    if (b.h.seg_enabled == 1
+        && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_REF_FRAME] == 1) {
+        let is i64 as rf =
+            b.h.seg_feature_data[segment_id][t.VP9_SEG_LVL_REF_FRAME];
+        if (rf < it.INTRA_FRAME || rf > it.ALTREF_FRAME) {
+            return errno.I_CORRUPT;
+        }
+        mi.ref_frame[0] = rf;
+        mi.ref_frame[1] = it.NONE;
+        return errno.I_OK;
+    }
+
+    let is i64 as comp_mode with mut = 0;
+    if (b.h.reference_mode == t.VP9_REFERENCE_MODE_SELECT) {
+        let is i64 as ctx = _comp_mode_ctx(b.h, n);
+        if (ctx < 0 || ctx >= t.VP9_COMP_MODE_CONTEXTS) {
+            return errno.I_CORRUPT;
+        }
+        let is i64 as bit = vb.vp9_bool_read(br,
+            cast(i64, b.st.probs.comp_mode[ctx]));
+        if (bit < 0) { return bit; }
+        b.st.counts.comp_mode[ctx][bit] =
+            b.st.counts.comp_mode[ctx][bit] + 1;
+        comp_mode = bit;
+    } else {
+        comp_mode = b.h.reference_mode;
+    }
+
+    if (comp_mode == t.VP9_COMPOUND_REFERENCE) {
+        let is i64 as fixed = b.h.comp_fixed_ref;
+        let is i64 as idx with mut = 0;
+        if (b.h.ref_frame_sign_bias[fixed] != 0) { idx = 1; }
+        let is i64 as ctx = _comp_ref_ctx(b.h, n);
+        if (ctx < 0 || ctx >= t.VP9_REF_CONTEXTS) { return errno.I_CORRUPT; }
+        let is i64 as bit = vb.vp9_bool_read(br,
+            cast(i64, b.st.probs.comp_ref[ctx]));
+        if (bit < 0) { return bit; }
+        b.st.counts.comp_ref[ctx][bit] =
+            b.st.counts.comp_ref[ctx][bit] + 1;
+        mi.ref_frame[idx] = fixed;
+        mi.ref_frame[1 - idx] = b.h.comp_var_ref[bit];
+    } else if (comp_mode == t.VP9_SINGLE_REFERENCE) {
+        let is i64 as ctx0 = _single_p1_ctx(n);
+        if (ctx0 < 0 || ctx0 >= t.VP9_REF_CONTEXTS) {
+            return errno.I_CORRUPT;
+        }
+        let is i64 as bit0 = vb.vp9_bool_read(br,
+            cast(i64, b.st.probs.single_ref[ctx0][0]));
+        if (bit0 < 0) { return bit0; }
+        b.st.counts.single_ref[ctx0][0][bit0] =
+            b.st.counts.single_ref[ctx0][0][bit0] + 1;
+        if (bit0 == 1) {
+            let is i64 as ctx1 = _single_p2_ctx(n);
+            if (ctx1 < 0 || ctx1 >= t.VP9_REF_CONTEXTS) {
+                return errno.I_CORRUPT;
+            }
+            let is i64 as bit1 = vb.vp9_bool_read(br,
+                cast(i64, b.st.probs.single_ref[ctx1][1]));
+            if (bit1 < 0) { return bit1; }
+            b.st.counts.single_ref[ctx1][1][bit1] =
+                b.st.counts.single_ref[ctx1][1][bit1] + 1;
+            if (bit1 == 1) { mi.ref_frame[0] = it.ALTREF_FRAME; }
+            else { mi.ref_frame[0] = it.GOLDEN_FRAME; }
+        } else {
+            mi.ref_frame[0] = it.LAST_FRAME;
+        }
+        mi.ref_frame[1] = it.NONE;
+    } else {
+        return errno.I_CORRUPT;
+    }
+
+    if (mi.ref_frame[0] < it.LAST_FRAME || mi.ref_frame[0] > it.ALTREF_FRAME) {
+        return errno.I_CORRUPT;
+    }
+    if (mi.ref_frame[1] != it.NONE
+        && (mi.ref_frame[1] < it.LAST_FRAME
+            || mi.ref_frame[1] > it.ALTREF_FRAME)) {
+        return errno.I_CORRUPT;
+    }
+    return errno.I_OK;
+}
+
+// ModeContext from the nearest two neighbours of 6.5.1. Computed once per
+// inter block, before any inter_mode is read: append_sub8x8_mvs runs
+// find_mv_refs again and overwrites the module's ModeContext, but the
+// entropy context of every 4x4 inter_mode stays the one computed here (the
+// reference decoders compute it once as well).
+fn _inter_mode_ctx(b as *Vp9Blk, r as i64, c as i64, bs as i64) as i64 {
+    let is [16]i64 as search;
+    let is i64 as st with mut = it.it_mv_ref_load(bs, cast(*i64, &search[0]));
+    if (st < 0) { return st; }
+    let is i64 as counter with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 2) {
+        let is i64 as cr = r + search[i * 2];
+        let is i64 as cc = c + search[i * 2 + 1];
+        let is i64 as inside with mut = 0;
+        if (cr >= 0 && cr < b.mi_rows && cc >= b.mi_col_start
+            && cc < b.mi_col_end) {
+            inside = 1;
+        }
+        if (inside == 1) {
+            let is i64 as mode = cast(i64, b.y_modes[cr * b.mi_cols + cc]);
+            let is i64 as m2 with mut = 0;
+            st = it.it_mode2_counter(mode, &m2);
+            if (st < 0) { return st; }
+            counter = counter + m2;
+        }
+        i = i + 1;
+    }
+    let is i64 as ctx with mut = 0;
+    st = it.it_counter_to_context(counter, &ctx);
+    if (st < 0) { return st; }
+    return ctx;
+}
+
+// Fill the motion-vector prediction context of 6.5 for this block.
+fn _fill_mv_ctx(b as *Vp9Blk, r as i64, c as i64, bs as i64,
+                bias as *u8, mc as *mvp.MvRefCtx) as void {
+    mc.mi_rows = b.mi_rows;
+    mc.mi_cols = b.mi_cols;
+    mc.mi_col_start = b.mi_col_start;
+    mc.mi_col_end = b.mi_col_end;
+    mc.mi_row = r;
+    mc.mi_col = c;
+    mc.mi_size = bs;
+    mc.use_prev_frame_mvs = b.h.use_prev_frame_mvs;
+    mc.ref_sign_bias = bias;
+    mc.y_modes = b.y_modes;
+    mc.ref_frames = b.ref_frames;
+    mc.mvs = b.mvs;
+    mc.sub_mvs = b.sub_mvs;
+    mc.prev_ref_frames = b.prev_ref_frames;
+    mc.prev_mvs = b.prev_mvs;
+}
+
+// inter_block_mode_info (section 6.4.16).
+fn _inter_block_mode_info(b as *Vp9Blk, br as *vb.Vp9Bool,
+                          r as i64, c as i64, bs as i64,
+                          segment_id as i64, n as *NeighRefs,
+                          mi as *ModeInfo) as i64 {
+    let is i64 as st with mut = _read_ref_frames(b, br, segment_id, n, mi);
+    if (st < 0) { return st; }
+
+    let is i64 as is_comp with mut = 0;
+    if (mi.ref_frame[1] > it.NONE) { is_comp = 1; }
+
+    // ref_frame_sign_bias as bytes for mvpred's candidate scaling.
+    let is [4]u8 as bias;
+    let is i64 as bi with mut = 0;
+    while (bi < 4) {
+        bias[bi] = cast(u8, b.h.ref_frame_sign_bias[bi]);
+        bi = bi + 1;
+    }
+    let is mvp.MvRefCtx as mc;
+    _fill_mv_ctx(b, r, c, bs, cast(*u8, &bias[0]), &mc);
+
+    let is i64 as j with mut = 0;
+    while (j < 2) {
+        if (mi.ref_frame[j] > it.INTRA_FRAME) {
+            let is mvp.MvCandList as list;
+            let is i64 as mctx with mut = 0;
+            st = mvp.mv_find_refs(&mc, mi.ref_frame[j], -1, &list, &mctx);
+            if (st < 0) { return st; }
+            let is mvp.MvSet as set;
+            st = mvp.mv_find_best_ref_mvs(&mc, b.h.allow_high_precision_mv,
+                                          &list, &set);
+            if (st < 0) { return st; }
+            mi.nearest[j][0] = set.nearest_row;
+            mi.nearest[j][1] = set.nearest_col;
+            mi.near[j][0] = set.near_row;
+            mi.near[j][1] = set.near_col;
+            mi.best[j][0] = set.best_row;
+            mi.best[j][1] = set.best_col;
+        }
+        j = j + 1;
+    }
+
+    let is i64 as mode_ctx = _inter_mode_ctx(b, r, c, bs);
+    if (mode_ctx < 0) { return mode_ctx; }
+
+    let is i64 as seg_skip with mut = 0;
+    if (b.h.seg_enabled == 1
+        && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_SKIP] == 1) {
+        seg_skip = 1;
+    }
+
+    if (seg_skip == 1) {
+        // Section 7.4.11: SEG_LVL_SKIP is only conformant from BLOCK_8X8 up.
+        if (bs < rt.BLOCK_8X8) { return errno.I_CORRUPT; }
+        mi.y_mode = rt.MODE_ZEROMV;
+    } else if (bs >= rt.BLOCK_8X8) {
+        let is i64 as off = _read_inter_mode(b, br, mode_ctx);
+        if (off < 0) { return off; }
+        mi.y_mode = rt.MODE_NEARESTMV + off;
+    }
+
+    let is i64 as filter with mut = 0;
+    st = _read_interp_filter(b, br, n, r, c, &filter);
+    if (st < 0) { return st; }
+    mi.filter = filter;
+
+    let is [2]i64 as mrow;
+    let is [2]i64 as mcol;
+
+    if (bs < rt.BLOCK_8X8) {
+        let is i64 as n4w = rt.recon_num_4x4_wide(bs);
+        let is i64 as n4h = rt.recon_num_4x4_high(bs);
+        if (n4w < 1 || n4h < 1) { return errno.I_CORRUPT; }
+        let is i64 as idy with mut = 0;
+        while (idy < 2) {
+            let is i64 as idx with mut = 0;
+            while (idx < 2) {
+                let is i64 as block = idy * 2 + idx;
+                let is i64 as off = _read_inter_mode(b, br, mode_ctx);
+                if (off < 0) { return off; }
+                let is i64 as ym = rt.MODE_NEARESTMV + off;
+                mi.y_mode = ym;
+
+                let is [2]i64 as nr;
+                let is [2]i64 as nc;
+                let is [2]i64 as ar;
+                let is [2]i64 as ac;
+                let is i64 as q with mut = 0;
+                while (q < 2) {
+                    nr[q] = mi.nearest[q][0];
+                    nc[q] = mi.nearest[q][1];
+                    ar[q] = mi.near[q][0];
+                    ac[q] = mi.near[q][1];
+                    q = q + 1;
+                }
+                if (ym == rt.MODE_NEARESTMV || ym == rt.MODE_NEARMV) {
+                    let is i64 as rl with mut = 0;
+                    while (rl < 1 + is_comp) {
+                        let is mvp.MvSet as s2;
+                        let is i64 as dummy with mut = 0;
+                        st = mvp.mv_append_sub8x8_mvs(&mc, mi.ref_frame[rl],
+                                                      block, rl,
+                                                      cast(*i32, &mi.bmv[0][0][0]),
+                                                      &s2, &dummy);
+                        if (st < 0) { return st; }
+                        if (ym == rt.MODE_NEARESTMV) {
+                            nr[rl] = s2.nearest_row;
+                            nc[rl] = s2.nearest_col;
+                        } else {
+                            ar[rl] = s2.near_row;
+                            ac[rl] = s2.near_col;
+                        }
+                        rl = rl + 1;
+                    }
+                }
+
+                let is i64 as rl with mut = 0;
+                while (rl < 1 + is_comp) {
+                    st = _assign_mv_list(b, br, ym, rl, nr[rl], nc[rl],
+                                         ar[rl], ac[rl],
+                                         mi.best[rl][0], mi.best[rl][1],
+                                         &mrow[rl], &mcol[rl]);
+                    if (st < 0) { return st; }
+                    rl = rl + 1;
+                }
+                let is i64 as y2 with mut = 0;
+                while (y2 < n4h) {
+                    let is i64 as x2 with mut = 0;
+                    while (x2 < n4w) {
+                        let is i64 as blk = (idy + y2) * 2 + idx + x2;
+                        rl = 0;
+                        while (rl < 1 + is_comp) {
+                            mi.bmv[rl][blk][0] = cast(i32, mrow[rl]);
+                            mi.bmv[rl][blk][1] = cast(i32, mcol[rl]);
+                            rl = rl + 1;
+                        }
+                        x2 = x2 + 1;
+                    }
+                    y2 = y2 + 1;
+                }
+                idx = idx + n4w;
+            }
+            idy = idy + n4h;
+        }
+    } else {
+        let is i64 as rl with mut = 0;
+        while (rl < 1 + is_comp) {
+            if (mi.ref_frame[rl] <= it.INTRA_FRAME) {
+                return errno.I_CORRUPT;
+            }
+            st = _assign_mv_list(b, br, mi.y_mode, rl,
+                                 mi.nearest[rl][0], mi.nearest[rl][1],
+                                 mi.near[rl][0], mi.near[rl][1],
+                                 mi.best[rl][0], mi.best[rl][1],
+                                 &mrow[rl], &mcol[rl]);
+            if (st < 0) { return st; }
+            rl = rl + 1;
+        }
+        let is i64 as rl2 with mut = 0;
+        while (rl2 < 1 + is_comp) {
+            let is i64 as blk with mut = 0;
+            while (blk < 4) {
+                mi.bmv[rl2][blk][0] = cast(i32, mrow[rl2]);
+                mi.bmv[rl2][blk][1] = cast(i32, mcol[rl2]);
+                blk = blk + 1;
+            }
+            rl2 = rl2 + 1;
+        }
+    }
+    return errno.I_OK;
+}
+
+// inter_frame_mode_info (section 6.4.11).
+fn _inter_frame_mode_info(b as *Vp9Blk, br as *vb.Vp9Bool,
+                          r as i64, c as i64, bs as i64,
+                          mi as *ModeInfo) as i64 {
+    let is NeighRefs as n;
+    _neigh_refs(b, r, c, &n);
+
+    let is i64 as st with mut = _read_inter_segment_id(b, br, r, c, bs,
+                                                      &mi.segment_id);
+    if (st < 0) { return st; }
+    st = _read_skip(b, br, r, c, mi.segment_id, &mi.skip);
+    if (st < 0) { return st; }
+
+    st = _read_is_inter(b, br, mi.segment_id, &n, &mi.is_inter);
+    if (st < 0) { return st; }
+
+    let is i64 as allow_select with mut = 0;
+    if (mi.skip == 0 || mi.is_inter == 0) { allow_select = 1; }
+    let is i64 as txs = _read_tx_size(b, br, r, c, bs, allow_select);
+    if (txs < 0) { return txs; }
+    if (txs > rt.TX_32X32) { return errno.I_CORRUPT; }
+    mi.tx_size = txs;
+
+    if (mi.is_inter == 1) {
+        return _inter_block_mode_info(b, br, r, c, bs, mi.segment_id,
+                                      &n, mi);
+    }
+
+    mi.ref_frame[0] = rt.INTRA_FRAME;
+    mi.ref_frame[1] = rt.INTRA_FRAME;
+    mi.filter = 0;
+    let is i64 as ym with mut = 0;
+    let is i64 as uvm with mut = 0;
+    st = _read_intra_modes(b, br, r, c, bs, 0, cast(*u8, &mi.sm[0]),
+                           &ym, &uvm);
+    if (st < 0) { return st; }
+    mi.y_mode = ym;
+    mi.uv_mode = uvm;
+    return errno.I_OK;
+}
+
+// mode_info (section 6.4.5).
+fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
+              mi as *ModeInfo) as i64 {
+    if (cast(i64, mi) == 0) { return errno.I_BADPARAM; }
+    _zero(cast(*u8, mi), sizeof(ModeInfo));
+    if (b.h.frame_is_intra == 1) {
+        return _intra_frame_mode_info(b, br, r, c, bs, mi);
+    }
+    return _inter_frame_mode_info(b, br, r, c, bs, mi);
+}
+
+// ── inter prediction at block level (sections 8.5.2, 6.4.21) ────────
+
+// Fetch one reference plane view for prediction. ref_list is 0 or 1 of the
+// block's ref_frame array; the view is the published slot named by
+// ref_frame_idx[ref_frame - LAST_FRAME].
+fn _ref_plane(b as *Vp9Blk, ref_frame as i64, plane as i64,
+              out as *ip.InterRefPlane) as i64 {
+    if (cast(i64, b.refs) == 0) { return errno.I_BADPARAM; }
+    if (ref_frame < it.LAST_FRAME || ref_frame > it.ALTREF_FRAME) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as idx = b.h.ref_frame_idx[ref_frame - it.LAST_FRAME];
+    if (idx < 0 || idx >= 8) { return errno.I_CORRUPT; }
+    let is refs.Vp9RefView as v;
+    let is i64 as st with mut = refs.vp9_refs_get(b.refs, idx, &v);
+    if (st < 0) { return st; }
+    st = refs.vp9_refs_check_use(b.refs, idx, b.h.profile, b.h.bit_depth,
+                                 b.h.subsampling_x, b.h.subsampling_y,
+                                 b.h.color_space);
+    if (st < 0) { return st; }
+
+    out.width = v.view.width;
+    out.height = v.view.height;
+    if (plane == 0) {
+        out.data = v.view.y;
+        out.stride = v.view.stride_y;
+    } else if (plane == 1) {
+        out.data = v.view.u;
+        out.stride = v.view.stride_u;
+    } else {
+        out.data = v.view.v;
+        out.stride = v.view.stride_v;
+    }
+    if (cast(i64, out.data) == 0) { return errno.I_BADPARAM; }
+    return errno.I_OK;
+}
+
+// Predict one plane of an inter block. The specification predicts the whole
+// plane block (or one 4x4 piece per call for MiSize < BLOCK_8X8) even when
+// the block overhangs MiCols*8 / MiRows*8; decode.cst pads the coded plane
+// by 64 samples on the right and bottom, and the block top-left is always
+// inside the grid, so the write stays inside the caller's allocation.
+fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
+                        mi as *ModeInfo) as i64 {
+    if (cast(i64, b.refs) == 0 || cast(i64, b.scratch) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (mi.is_inter != 1) { return errno.I_BADPARAM; }
+
+    let is ip.InterFrame as f;
+    f.width = b.h.width;
+    f.height = b.h.height;
+    f.sub_x = b.sub_x;
+    f.sub_y = b.sub_y;
+    f.mi_rows = b.mi_rows;
+    f.mi_cols = b.mi_cols;
+    f.mi_row = r;
+    f.mi_col = c;
+    f.mi_size = bs;
+    f.filter = mi.filter;
+    if (ip.inter_frame_ok(&f) == 0) { return errno.I_CORRUPT; }
+
+    let is [128]i64 as taps;
+    let is i64 as st with mut = ip.inter_load_filter(mi.filter,
+                                                    cast(*i64, &taps[0]));
+    if (st < 0) { return st; }
+
+    let is i64 as is_comp with mut = 0;
+    if (mi.ref_frame[1] > it.NONE) { is_comp = 1; }
+
+    // Second prediction of a compound block; at most one 64x64 block.
+    let is [4096]u8 as pred1buf;
+
+    let is i64 as plane with mut = 0;
+    while (plane < 3) {
+        let is i64 as subx with mut = 0;
+        let is i64 as suby with mut = 0;
+        if (plane > 0) { subx = b.sub_x; suby = b.sub_y; }
+
+        let is ip.InterRefPlane as rp0;
+        st = _ref_plane(b, mi.ref_frame[0], plane, &rp0);
+        if (st < 0) { return st; }
+        let is ip.InterRefPlane as rp1;
+        if (is_comp == 1) {
+            st = _ref_plane(b, mi.ref_frame[1], plane, &rp1);
+            if (st < 0) { return st; }
+        }
+
+        let is i64 as pw with mut = 0;
+        let is i64 as ph with mut = 0;
+        st = it.it_plane_block_dims(bs, plane, subx, suby, &pw, &ph);
+        if (st < 0) { return st; }
+
+        let is i64 as base_x = (c * 8) >> subx;
+        let is i64 as base_y = (r * 8) >> suby;
+        let is i64 as maxx = (b.mi_cols * 8) >> subx;
+        let is i64 as maxy = (b.mi_rows * 8) >> suby;
+
+        let is *u8 as pl with mut = b.fr.y;
+        let is i64 as stride with mut = b.fr.stride_y;
+        if (plane == 1) { pl = b.fr.u; stride = b.fr.stride_u; }
+        else if (plane == 2) { pl = b.fr.v; stride = b.fr.stride_v; }
+        if (cast(i64, pl) == 0) { return errno.I_BADPARAM; }
+
+        // decode.cst allocates round64(MiCols*8) + 64 (halved for chroma),
+        // so a block that starts inside the grid has room for its whole
+        // extent. Reject a caller whose plane is not that wide.
+        let is i64 as pad = 64 >> subx;
+        if (stride < maxx + pad) { return errno.I_BADPARAM; }
+        if (base_x >= maxx || base_y >= maxy) { return errno.I_CORRUPT; }
+
+        if (bs < rt.BLOCK_8X8) {
+            let is i64 as nw = pw >> 2;
+            let is i64 as nh = ph >> 2;
+            if (nw < 1 || nh < 1) { return errno.I_CORRUPT; }
+            let is i64 as by with mut = 0;
+            while (by < nh) {
+                let is i64 as bx with mut = 0;
+                while (bx < nw) {
+                    let is i64 as block_idx = by * nw + bx;
+                    let is i64 as px = base_x + bx * 4;
+                    let is i64 as py = base_y + by * 4;
+                    let is *u8 as dst = cast(*u8, cast(i64, pl)
+                                             + py * stride + px);
+                    st = ip.inter_predict_taps(&f, plane, &rp0, 1,
+                        px, py, 4, 4, block_idx,
+                        cast(*i32, &mi.bmv[0][0][0]),
+                        cast(*i64, &taps[0]), dst, stride, b.scratch);
+                    if (st < 0) { return st; }
+                    if (is_comp == 1) {
+                        st = ip.inter_predict_taps(&f, plane, &rp1, 1,
+                            px, py, 4, 4, block_idx,
+                            cast(*i32, &mi.bmv[1][0][0]),
+                            cast(*i64, &taps[0]),
+                            cast(*u8, &pred1buf[0]), 4, b.scratch);
+                        if (st < 0) { return st; }
+                        let is i64 as rr with mut = 0;
+                        while (rr < 4) {
+                            let is i64 as cc with mut = 0;
+                            while (cc < 4) {
+                                let is i64 as a = cast(i64,
+                                    dst[rr * stride + cc]);
+                                let is i64 as b2 = cast(i64,
+                                    pred1buf[rr * 4 + cc]);
+                                dst[rr * stride + cc] =
+                                    cast(u8, (a + b2 + 1) >> 1);
+                                cc = cc + 1;
+                            }
+                            rr = rr + 1;
+                        }
+                    }
+                    bx = bx + 1;
+                }
+                by = by + 1;
+            }
+        } else {
+            let is *u8 as dst = cast(*u8, cast(i64, pl)
+                                     + base_y * stride + base_x);
+            st = ip.inter_predict_taps(&f, plane, &rp0, 1,
+                base_x, base_y, pw, ph, 0,
+                cast(*i32, &mi.bmv[0][0][0]),
+                cast(*i64, &taps[0]), dst, stride, b.scratch);
+            if (st < 0) { return st; }
+            if (is_comp == 1) {
+                st = ip.inter_predict_taps(&f, plane, &rp1, 1,
+                    base_x, base_y, pw, ph, 0,
+                    cast(*i32, &mi.bmv[1][0][0]),
+                    cast(*i64, &taps[0]),
+                    cast(*u8, &pred1buf[0]), pw, b.scratch);
+                if (st < 0) { return st; }
+                let is i64 as rr with mut = 0;
+                while (rr < ph) {
+                    let is i64 as cc with mut = 0;
+                    while (cc < pw) {
+                        let is i64 as a = cast(i64, dst[rr * stride + cc]);
+                        let is i64 as b2 = cast(i64, pred1buf[rr * pw + cc]);
+                        dst[rr * stride + cc] = cast(u8, (a + b2 + 1) >> 1);
+                        cc = cc + 1;
+                    }
+                    rr = rr + 1;
+                }
+            }
+        }
+        plane = plane + 1;
+    }
     return errno.I_OK;
 }
 
@@ -445,14 +1783,27 @@ fn _qindex(b as *Vp9Blk, segment_id as i64) as i64 {
 }
 
 // Decode and reconstruct every transform block of one prediction block.
+// `mi` carries the block's mode info from inter_frame_mode_info or
+// intra_frame_mode_info. For an inter block the prediction of all three
+// planes runs once, before the transform-block loop of section 6.4.21; for
+// an intra block every transform block is predicted in place.
 // Returns the sum of the per-transform-block `nonzero` flags (EobTotal).
 fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
-             segment_id as i64, skip as i64, tx_sz as i64,
-             y_mode as i64, sm as *u8, uv_mode as i64) as i64 {
-    if (skip != 0 && skip != 1) { return errno.I_CORRUPT; }
-    if (tx_sz < rt.TX_4X4 || tx_sz > rt.TX_32X32) { return errno.I_CORRUPT; }
+             mi as *ModeInfo) as i64 {
+    if (cast(i64, mi) == 0) { return errno.I_BADPARAM; }
+    if (mi.skip != 0 && mi.skip != 1) { return errno.I_CORRUPT; }
+    if (mi.tx_size < rt.TX_4X4 || mi.tx_size > rt.TX_32X32) {
+        return errno.I_CORRUPT;
+    }
     if (cast(i64, b.cc) == 0) { return errno.I_BADPARAM; }
     if (cast(i64, b.coef) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as segment_id = mi.segment_id;
+    let is i64 as skip = mi.skip;
+    let is i64 as tx_sz = mi.tx_size;
+    let is i64 as y_mode = mi.y_mode;
+    let is i64 as uv_mode = mi.uv_mode;
+    let is *u8 as sm = cast(*u8, &mi.sm[0]);
 
     let is i64 as qidx = _qindex(b, segment_id);
     let is res.Vp9Quant as q;
@@ -467,6 +1818,11 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
     let is [1024]i32 as dqbuf;
     let is *i32 as dq = cast(*i32, &dqbuf);
     let is i64 as eob_total with mut = 0;
+
+    if (mi.is_inter == 1) {
+        let is i64 as stp = _inter_predict_plane(b, r, c, bs, mi);
+        if (stp < 0) { return stp; }
+    }
 
     let is i64 as plane with mut = 0;
     while (plane < 3) {
@@ -519,8 +1875,10 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                     if (bs >= rt.BLOCK_8X8) { mode = y_mode; }
                     else { mode = cast(i64, sm[y * 2 + x]); }
                 }
-                if (mode < rt.MODE_DC || mode > rt.MODE_TM) {
-                    return errno.I_CORRUPT;
+                if (mi.is_inter == 0) {
+                    if (mode < rt.MODE_DC || mode > rt.MODE_TM) {
+                        return errno.I_CORRUPT;
+                    }
                 }
 
                 let is i64 as have_l with mut = 0;
@@ -531,7 +1889,7 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                 if (x + step < n4w) { not_right = 1; }
 
                 let is i64 as st with mut = 0;
-                if (b.h.frame_is_intra == 1) {
+                if (mi.is_inter == 0) {
                     let is pred.IntraEdge as e;
                     e.have_left = have_l;
                     e.have_above = have_a;
@@ -540,17 +1898,17 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                     e.max_y = maxy - 1;
                     st = pred.pred_intra(pl, stride, sx, sy, txs, mode, &e);
                     if (st < 0) { return st; }
-                } else {
-                    return errno.I_UNSUPPORTED;
                 }
 
                 let is i64 as nonzero with mut = 0;
                 if (skip == 0) {
                     let is i64 as txt = res.vp9_tx_type(plane, txs,
-                                                        b.lossless, 0, mode);
+                                                        b.lossless,
+                                                        mi.is_inter, mode);
                     if (txt < 0) { return txt; }
                     st = res.vp9_residual_decode(br, &b.st.probs, &b.st.counts,
-                                                 &q, plane, txs, txt, 0,
+                                                 &q, plane, txs, txt,
+                                                 mi.is_inter,
                                                  sx, sy, b.cc, b.coef,
                                                  &nonzero);
                     if (st < 0) { return st; }
@@ -613,26 +1971,32 @@ fn _decode_block(b as *Vp9Blk, br as *vb.Vp9Bool,
     if (y_mis > bh8) { y_mis = bh8; }
     if (x_mis < 1 || y_mis < 1) { return errno.I_CORRUPT; }
 
-    let is [4]u8 as sm;
-    let is i64 as segment_id with mut = 0;
-    let is i64 as skip with mut = 0;
-    let is i64 as tx_sz with mut = 0;
-    let is i64 as y_mode with mut = 0;
-    let is i64 as uv_mode with mut = 0;
-    let is i64 as st with mut = _mode_info(b, br, r, c, bs,
-                                           &segment_id, &skip, &tx_sz,
-                                           &y_mode, cast(*u8, &sm),
-                                           &uv_mode);
+    let is ModeInfo as mi;
+    let is i64 as st = _mode_info(b, br, r, c, bs, &mi);
     if (st < 0) { return st; }
 
-    let is i64 as eob = _residual(b, br, r, c, bs, segment_id, skip, tx_sz,
-                                  y_mode, cast(*u8, &sm), uv_mode);
+    let is i64 as eob = _residual(b, br, r, c, bs, &mi);
     if (eob < 0) { return eob; }
 
-    // Section 6.4.4: an inter block with no coefficients becomes a skip
-    // block. Intra frames never take this branch (is_inter is 0).
-    if (b.h.frame_is_intra == 0 && bs >= rt.BLOCK_8X8 && eob == 0) {
-        skip = 1;
+    // Section 6.4.4: an inter block of BLOCK_8X8 or larger with no
+    // coefficients becomes a skip block.
+    if (mi.is_inter == 1 && bs >= rt.BLOCK_8X8 && eob == 0) {
+        mi.skip = 1;
+    }
+
+    // Section 6.4.4's write-back goes through mvpred.cst: Mvs[cell][list] =
+    // BlockMvs[list][3] and SubMvs[cell][list][b] = BlockMvs[list][b]. Both
+    // lists are written for an inter block, so a single-reference block
+    // stores its zeroed BlockMvs[1].
+    let is [4]u8 as bias;
+    let is mvp.MvRefCtx as mc;
+    if (mi.is_inter == 1) {
+        let is i64 as bi with mut = 0;
+        while (bi < 4) {
+            bias[bi] = cast(u8, b.h.ref_frame_sign_bias[bi]);
+            bi = bi + 1;
+        }
+        _fill_mv_ctx(b, r, c, bs, cast(*u8, &bias[0]), &mc);
     }
 
     let is i64 as y with mut = 0;
@@ -641,15 +2005,26 @@ fn _decode_block(b as *Vp9Blk, br as *vb.Vp9Bool,
         while (x < x_mis) {
             let is i64 as idx = (r + y) * b.mi_cols + (c + x);
             b.mi_sizes[idx] = cast(u8, bs);
-            b.tx_sizes[idx] = cast(u8, tx_sz);
-            b.skips[idx] = cast(u8, skip);
-            b.segment_ids[idx] = cast(u8, segment_id);
-            b.ref_frames[idx] = cast(u8, rt.INTRA_FRAME);
-            b.y_modes[idx] = cast(u8, y_mode);
-            b.sub_modes[idx * 4] = sm[0];
-            b.sub_modes[idx * 4 + 1] = sm[1];
-            b.sub_modes[idx * 4 + 2] = sm[2];
-            b.sub_modes[idx * 4 + 3] = sm[3];
+            b.tx_sizes[idx] = cast(u8, mi.tx_size);
+            b.skips[idx] = cast(u8, mi.skip);
+            b.segment_ids[idx] = cast(u8, mi.segment_id);
+            b.ref_frames[idx * 2] = cast(u8, mi.ref_frame[0]);
+            b.ref_frames[idx * 2 + 1] = cast(u8, mi.ref_frame[1]);
+            b.y_modes[idx] = cast(u8, mi.y_mode);
+            b.interp_filters[idx] = cast(u8, mi.filter);
+            if (mi.is_inter == 1) {
+                let is i64 as mst with mut = mvp.mv_store_block_mvs(
+                    &mc, r + y, c + x, 0, cast(*i32, &mi.bmv[0][0][0]));
+                if (mst < 0) { return mst; }
+                mst = mvp.mv_store_block_mvs(
+                    &mc, r + y, c + x, 1, cast(*i32, &mi.bmv[0][0][0]));
+                if (mst < 0) { return mst; }
+            } else {
+                b.sub_modes[idx * 4] = mi.sm[0];
+                b.sub_modes[idx * 4 + 1] = mi.sm[1];
+                b.sub_modes[idx * 4 + 2] = mi.sm[2];
+                b.sub_modes[idx * 4 + 3] = mi.sm[3];
+            }
             x = x + 1;
         }
         y = y + 1;

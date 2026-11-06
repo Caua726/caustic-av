@@ -1,0 +1,702 @@
+// =======================================================
+// caustic-av/video/vp9/inter.cst
+// VP9 inter prediction, from the VP9 Bitstream & Decoding Process
+// Specification section 8.5.2, with the reference-frame scaling of 8.5.2.3
+// and the two-pass subpel filter of 8.5.2.4. It predicts 8-bit samples into a
+// plane the caller owns; it reads no bitstream, allocates nothing, and keeps
+// no state between calls.
+//
+// The pieces of the process
+// -------------------------
+//   8.5.2.1  inter_mv_select   which luma BlockMvs entry applies to this
+//                              plane and 4x4 piece, averaging for chroma
+//   8.5.2.2  inter_mv_clamp    convert 1/8 MVs to the plane's 1/16 precision
+//                              and clamp against the frame and interpolation
+//                              border
+//   8.5.2.3  inter_mv_scale    reference-frame scaling: start position and
+//                              per-sample step in 1/16 samples
+//   8.5.2.4  inter_block_pred  horizontal then vertical 8-tap convolution
+//   8.5.2    inter_predict     the two above joined per reference list, plus
+//                              the single/compound write into the frame
+//
+// inter_predict_block mirrors the calling process in 6.4.21's residual(): it
+// derives the plane block size with get_plane_block_size and, for MiSize
+// smaller than BLOCK_8X8, predicts the plane block as 4x4 pieces with
+// blockIdx = y * num4x4w + x.
+//
+// Invariants the caller keeps
+// ---------------------------
+// `out` points at the first sample of the region (not at the plane origin)
+// and out_stride is that plane's row stride; `scratch` is a caller-owned
+// buffer of at least INTER_SCRATCH_BYTES bytes (see the constant). The plane
+// buffers must cover the mode-info grid: MiCols*8 by MiRows*8 luma samples,
+// which is what section 6.4.21 predicts over, including the coded padding to
+// the right and bottom of an odd-sized frame.
+//
+// Bit depth
+// ---------
+// Everything here is 8-bit, as core/frame.cst's I420 layout is. Profile 2
+// (10/12-bit) is rejected by the header parser before this module is reached;
+// a 16-bit plane would need a different kernel, not a different parameter.
+//
+// Filter choice
+// -------------
+// `InterFrame.filter` is the block's resolved interp_filter (0..3). A frame
+// with interpolation_filter == SWITCHABLE reads it per block; passing the
+// SWITCHABLE value itself is I_UNSUPPORTED because there is no tap set for it.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "inter_tables.cst" as it;
+
+// Worst case intermediate array of 8.5.2.4: h = 64 samples, yStep = 80
+// (the specification's ceiling), giving (((64-1)*80 + 15) >> 4) + 8 = 323
+// rows of at most w = 64 samples.
+let is i64 as INTER_MAX_W             with imut = 64;
+let is i64 as INTER_MAX_H             with imut = 64;
+let is i64 as INTER_MAX_INTERMEDIATE  with imut = 323;
+// 323 * 64. The product is written out because `with imut` globals in this
+// tree are literals, not compile-time expressions.
+let is i64 as INTER_SCRATCH_BYTES     with imut = 20672;
+let is i64 as INTER_MAX_STEP          with imut = 80;
+
+// ── caller-supplied geometry ────────────────────────────────────────
+//
+// width/height are the current frame's FrameWidth/FrameHeight in luma
+// samples. sub_x/sub_y are its subsampling_x/subsampling_y. The mi_* fields
+// are the current block's position and size, as section 6.4.3 names them.
+struct InterFrame {
+    width    as i64;
+    height   as i64;
+    sub_x    as i64;
+    sub_y    as i64;
+    mi_rows  as i64;
+    mi_cols  as i64;
+    mi_row   as i64;
+    mi_col   as i64;
+    mi_size  as i64;   // BLOCK_*
+    filter   as i64;   // resolved per-block interpolation filter, 0..3
+}
+
+// One reference plane as 8.5.2.4 indexes it. width/height are the reference
+// frame's luma dimensions (RefFrameWidth/RefFrameHeight), not the plane's.
+struct InterRefPlane {
+    data   as *u8;
+    stride as i64;
+    width  as i64;
+    height as i64;
+}
+
+// 8.5.2.3's output: where to start in the reference plane and how far to step
+// per predicted sample, both in 1/16 samples.
+struct InterPos {
+    start_x as i64;
+    start_y as i64;
+    step_x  as i64;
+    step_y  as i64;
+}
+
+// ── validation ──────────────────────────────────────────────────────
+
+// A block's top-left must be inside the mode-info grid; the block itself may
+// overhang MiCols*8 / MiRows*8 at the frame edge, which the specification
+// allows (6.4.21 predicts the whole block and 8.5.2.2 clamps with a possibly
+// negative distance to the edge). The write stays inside the caller's padded
+// plane; the caller owns that guarantee. This is a stage 5 integration
+// change: the adopted inter slice required the block to fit.
+fn inter_frame_ok(f as *InterFrame) as i64 {
+    if (cast(i64, f) == 0) { return 0; }
+    if (f.width <= 0 || f.width > it.IT_MAX_DIM) { return 0; }
+    if (f.height <= 0 || f.height > it.IT_MAX_DIM) { return 0; }
+    if (f.sub_x < 0 || f.sub_x > 1 || f.sub_y < 0 || f.sub_y > 1) { return 0; }
+    if (f.mi_rows <= 0 || f.mi_rows > it.IT_MAX_MI) { return 0; }
+    if (f.mi_cols <= 0 || f.mi_cols > it.IT_MAX_MI) { return 0; }
+    if (it.it_block_ok(f.mi_size) == 0) { return 0; }
+    if (f.mi_row < 0 || f.mi_col < 0) { return 0; }
+    if (f.mi_row >= f.mi_rows || f.mi_col >= f.mi_cols) { return 0; }
+    if (f.filter < it.EIGHTTAP || f.filter > it.SWITCHABLE) { return 0; }
+    return 1;
+}
+
+fn inter_ref_fields_ok(data as *u8, stride as i64,
+                       width as i64, height as i64) as i64 {
+    if (cast(i64, data) == 0) { return 0; }
+    if (stride <= 0) { return 0; }
+    if (width <= 0 || width > it.IT_MAX_DIM) { return 0; }
+    if (height <= 0 || height > it.IT_MAX_DIM) { return 0; }
+    return 1;
+}
+
+fn inter_ref_ok(r as *InterRefPlane) as i64 {
+    if (cast(i64, r) == 0) { return 0; }
+    return inter_ref_fields_ok(r.data, r.stride, r.width, r.height);
+}
+
+// Largest sample index written in a plane, from the mode-info grid. Luma is
+// MiCols*8 by MiRows*8; chroma halves each axis.
+fn inter_plane_max(f as *InterFrame, plane as i64,
+                   out_w as *i64, out_h as *i64) as i64 {
+    if (cast(i64, out_w) == 0 || cast(i64, out_h) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    let is i64 as sx with mut = 0;
+    let is i64 as sy with mut = 0;
+    if (plane > 0) {
+        sx = f.sub_x;
+        sy = f.sub_y;
+    }
+    *out_w = (f.mi_cols * it.MI_SIZE) >> sx;
+    *out_h = (f.mi_rows * it.MI_SIZE) >> sy;
+    return errno.I_OK;
+}
+
+// Largest valid blockIdx for this plane and MiSize, from the plane block
+// get_plane_block_size selects (6.4.23). 6.4.21 predicts a luma block of
+// MiSize, and for MiSize < BLOCK_8X8 it predicts the enclosing 8x8 as 4x4
+// pieces; the same section raises MiSize to BLOCK_8X8 before asking for a
+// plane size. For a sub-8x8 MiSize that plane block holds four pieces on luma
+// or an unsubsampled chroma plane, two on an 8x4 or 4x8 chroma plane and one
+// on 4:2:0 chroma. A larger MiSize has more pieces, but 6.4.21 predicts it in
+// a single call with blockIdx 0.
+//
+// The index is capped at 3 because BlockMvs carries four luma pieces per
+// reference list. A bound of "0..3" alone would let a sub-8x8 call on a
+// subsampled chroma plane read blockIdx+1 or blockIdx+2 from the next 4x4
+// piece - or, for refList 1, from past the sixteen-entry array - and change
+// the motion vector of a conforming block.
+fn inter_block_idx_max(f as *InterFrame, plane as i64, out as *i64) as i64 {
+    if (cast(i64, f) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    let is i64 as pw with mut = 0;
+    let is i64 as ph with mut = 0;
+    let is i64 as rc = it.it_plane_block_dims(f.mi_size, plane, f.sub_x, f.sub_y,
+                                              &pw, &ph);
+    if (rc < 0) { return rc; }
+    let is i64 as limit = ((pw >> 2) * (ph >> 2)) - 1;
+    if (limit > 3) {
+        *out = 3;
+        return errno.I_OK;
+    }
+    *out = limit;
+    return errno.I_OK;
+}
+
+// 8.5.2.1's averaging functions. `/` truncates toward zero (specification
+// section 4.1), so the adjustment makes both signs round away from zero.
+fn inter_round_mv_q2(value as i64) as i64 {
+    if (value < 0) { return (value - 1) / 2; }
+    return (value + 1) / 2;
+}
+
+fn inter_round_mv_q4(value as i64) as i64 {
+    if (value < 0) { return (value - 2) / 4; }
+    return (value + 2) / 4;
+}
+
+// ── filter taps ─────────────────────────────────────────────────────
+//
+// Load one filter as 128 taps in phase-major order. SWITCHABLE is a frame
+// header value with no tap set of its own, so it is I_UNSUPPORTED rather than
+// a bad parameter: the caller must resolve the block's filter first.
+fn inter_load_filter(filter as i64, taps as *i64) as i64 {
+    if (cast(i64, taps) == 0) { return errno.I_BADPARAM; }
+    if (filter == it.SWITCHABLE) { return errno.I_UNSUPPORTED; }
+    if (filter < it.EIGHTTAP || filter > it.BILINEAR) { return errno.I_BADPARAM; }
+    return it.it_filter_load(filter, taps);
+}
+
+// ── 8.5.2.1 Motion vector selection ─────────────────────────────────
+//
+// block_mvs is BlockMvs laid out [refList][4][2] (row then column), i32 in
+// 1/8 luma samples. For luma, or for any block of BLOCK_8X8 or larger, the
+// block's own vector applies. Only a sub-8x8 block on a chroma plane averages
+// the four 4x4 vectors, and the averaging pattern is that plane's subsampling:
+//   (0,1) blockIdx and blockIdx + 2
+//   (1,0) blockIdx and blockIdx + 1
+//   (1,1) all four, regardless of blockIdx
+// The (0,0) case is the block's own vector. blockIdx is the 4x4 index inside
+// the plane block, exactly what 6.4.21 passes to predict_inter: a sub-8x8
+// luma block predicts the enclosing 8x8 in pieces 0..3, an 8x4 or 4x8 chroma
+// plane block has pieces 0..1, and a 4:2:0 chroma plane block has only piece
+// 0. Larger luma blocks are predicted in one call with blockIdx 0; the cap of
+// 3 is BlockMvs' four entries per reference list.
+fn inter_mv_select(f as *InterFrame, plane as i64, ref_list as i64,
+                   block_idx as i64, block_mvs as *i32,
+                   out_row as *i64, out_col as *i64) as i64 {
+    if (inter_frame_ok(f) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, block_mvs) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_row) == 0 || cast(i64, out_col) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
+    let is i64 as max_idx with mut = 0;
+    let is i64 as rc = inter_block_idx_max(f, plane, &max_idx);
+    if (rc < 0) { return rc; }
+    if (block_idx < 0 || block_idx > max_idx) { return errno.I_BADPARAM; }
+
+    let is i64 as base = (ref_list * 4 + block_idx) * 2;
+    if (plane == 0 || f.mi_size >= it.BLOCK_8X8) {
+        *out_row = cast(i64, block_mvs[base]);
+        *out_col = cast(i64, block_mvs[base + 1]);
+        return errno.I_OK;
+    }
+    if (f.sub_x == 0 && f.sub_y == 0) {
+        *out_row = cast(i64, block_mvs[base]);
+        *out_col = cast(i64, block_mvs[base + 1]);
+        return errno.I_OK;
+    }
+    let is i64 as row0 = cast(i64, block_mvs[base]);
+    let is i64 as col0 = cast(i64, block_mvs[base + 1]);
+    if (f.sub_x == 0 && f.sub_y == 1) {
+        let is i64 as r2 = cast(i64, block_mvs[base + 2 * 2]);
+        let is i64 as c2 = cast(i64, block_mvs[base + 2 * 2 + 1]);
+        *out_row = inter_round_mv_q2(row0 + r2);
+        *out_col = inter_round_mv_q2(col0 + c2);
+        return errno.I_OK;
+    }
+    if (f.sub_x == 1 && f.sub_y == 0) {
+        let is i64 as r1 = cast(i64, block_mvs[base + 1 * 2]);
+        let is i64 as c1 = cast(i64, block_mvs[base + 1 * 2 + 1]);
+        *out_row = inter_round_mv_q2(row0 + r1);
+        *out_col = inter_round_mv_q2(col0 + c1);
+        return errno.I_OK;
+    }
+
+    // 4:2:0: sum every luma piece of the 8x8 block for this reference list.
+    // blockIdx is ignored here, as the specification's q4 branch does.
+    let is i64 as rbase = ref_list * 4 * 2;
+    let is i64 as r0 = cast(i64, block_mvs[rbase]);
+    let is i64 as c0 = cast(i64, block_mvs[rbase + 1]);
+    let is i64 as r1 = cast(i64, block_mvs[rbase + 1 * 2]);
+    let is i64 as c1 = cast(i64, block_mvs[rbase + 1 * 2 + 1]);
+    let is i64 as r2 = cast(i64, block_mvs[rbase + 2 * 2]);
+    let is i64 as c2 = cast(i64, block_mvs[rbase + 2 * 2 + 1]);
+    let is i64 as r3 = cast(i64, block_mvs[rbase + 3 * 2]);
+    let is i64 as c3 = cast(i64, block_mvs[rbase + 3 * 2 + 1]);
+    *out_row = inter_round_mv_q4(r0 + r1 + r2 + r3);
+    *out_col = inter_round_mv_q4(c0 + c1 + c2 + c3);
+    return errno.I_OK;
+}
+
+// ── 8.5.2.2 Motion vector clamping ──────────────────────────────────
+//
+// Converts the 1/8-sample vector to the plane's 1/16 samples ((2*mv) >> sub)
+// and clamps it so the 8-tap window stays inside the interpolation border.
+// spelLeft/spelTop measure from the block to the frame edge using the *luma*
+// block extent (bw, bh) subsampled for this plane, as the specification
+// writes it.
+fn inter_mv_clamp(f as *InterFrame, plane as i64, mv_row as i64, mv_col as i64,
+                  out_row as *i64, out_col as *i64) as i64 {
+    if (inter_frame_ok(f) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_row) == 0 || cast(i64, out_col) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+
+    let is i64 as sx with mut = 0;
+    let is i64 as sy with mut = 0;
+    if (plane > 0) {
+        sx = f.sub_x;
+        sy = f.sub_y;
+    }
+
+    let is i64 as bh = it.it_num_8x8_high(f.mi_size);
+    let is i64 as bw = it.it_num_8x8_wide(f.mi_size);
+
+    let is i64 as to_top = (0 - ((f.mi_row * it.MI_SIZE) * 16)) >> sy;
+    let is i64 as to_bottom = (((f.mi_rows - bh - f.mi_row) * it.MI_SIZE) * 16) >> sy;
+    let is i64 as to_left = (0 - ((f.mi_col * it.MI_SIZE) * 16)) >> sx;
+    let is i64 as to_right = (((f.mi_cols - bw - f.mi_col) * it.MI_SIZE) * 16) >> sx;
+
+    let is i64 as spel_left = (it.INTERP_EXTEND + ((bw * it.MI_SIZE) >> sx)) << it.SUBPEL_BITS;
+    let is i64 as spel_right = spel_left - it.SUBPEL_SHIFTS;
+    let is i64 as spel_top = (it.INTERP_EXTEND + ((bh * it.MI_SIZE) >> sy)) << it.SUBPEL_BITS;
+    let is i64 as spel_bottom = spel_top - it.SUBPEL_SHIFTS;
+
+    *out_row = it.it_clip3(to_top - spel_top, to_bottom + spel_bottom, (2 * mv_row) >> sy);
+    *out_col = it.it_clip3(to_left - spel_left, to_right + spel_right, (2 * mv_col) >> sx);
+    return errno.I_OK;
+}
+
+// The four conformance inequalities of 8.5.2.3, which depend only on the
+// current and reference frame sizes. inter_predict_taps calls this for every
+// reference before predicting, so a bad second reference cannot leave the
+// first prediction in the frame.
+fn inter_scale_ok(f as *InterFrame, ref_w as i64, ref_h as i64) as i64 {
+    if (2 * f.width < ref_w) { return 0; }
+    if (2 * f.height < ref_h) { return 0; }
+    if (f.width > 16 * ref_w) { return 0; }
+    if (f.height > 16 * ref_h) { return 0; }
+    return 1;
+}
+
+// ── 8.5.2.3 Motion vector scaling ───────────────────────────────────
+//
+// Computes the reference sampling location for this plane and region. The
+// four conformance inequalities of 8.5.2.3 are checked here and reported as
+// I_CORRUPT: a stream whose frame sizes break them is not decodable.
+//
+// start and step are in 1/16 samples. baseX/baseY use the plane coordinate x
+// while fracX/fracY use the luma coordinate lumaX/lumaY, which the
+// specification calls out explicitly: even for chroma the fractional part is
+// based on the luma block location.
+fn inter_mv_scale(f as *InterFrame, plane as i64, x as i64, y as i64,
+                  mv_row as i64, mv_col as i64, ref_w as i64, ref_h as i64,
+                  out_start_x as *i64, out_start_y as *i64,
+                  out_step_x as *i64, out_step_y as *i64) as i64 {
+    if (inter_frame_ok(f) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_start_x) == 0 || cast(i64, out_start_y) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (cast(i64, out_step_x) == 0 || cast(i64, out_step_y) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (x < 0 || y < 0) { return errno.I_BADPARAM; }
+    if (ref_w <= 0 || ref_w > it.IT_MAX_DIM) { return errno.I_BADPARAM; }
+    if (ref_h <= 0 || ref_h > it.IT_MAX_DIM) { return errno.I_BADPARAM; }
+
+    // 8.5.2.3 conformance requirements on the current/reference sizes.
+    if (inter_scale_ok(f, ref_w, ref_h) == 0) { return errno.I_CORRUPT; }
+
+    let is i64 as xscale = (ref_w << it.REF_SCALE_SHIFT) / f.width;
+    let is i64 as yscale = (ref_h << it.REF_SCALE_SHIFT) / f.height;
+
+    let is i64 as base_x = (x * xscale) >> it.REF_SCALE_SHIFT;
+    let is i64 as base_y = (y * yscale) >> it.REF_SCALE_SHIFT;
+
+    let is i64 as luma_x = x;
+    let is i64 as luma_y = y;
+    if (plane > 0) {
+        luma_x = x << f.sub_x;
+        luma_y = y << f.sub_y;
+    }
+
+    let is i64 as frac_x = ((16 * luma_x * xscale) >> it.REF_SCALE_SHIFT) & it.SUBPEL_MASK;
+    let is i64 as frac_y = ((16 * luma_y * yscale) >> it.REF_SCALE_SHIFT) & it.SUBPEL_MASK;
+
+    let is i64 as dx = ((mv_col * xscale) >> it.REF_SCALE_SHIFT) + frac_x;
+    let is i64 as dy = ((mv_row * yscale) >> it.REF_SCALE_SHIFT) + frac_y;
+
+    *out_step_x = (16 * xscale) >> it.REF_SCALE_SHIFT;
+    *out_step_y = (16 * yscale) >> it.REF_SCALE_SHIFT;
+    *out_start_x = (base_x << it.SUBPEL_BITS) + dx;
+    *out_start_y = (base_y << it.SUBPEL_BITS) + dy;
+    return errno.I_OK;
+}
+
+// ── 8.5.2.4 Block inter prediction ──────────────────────────────────
+//
+// The horizontal pass builds `intermediate` from the reference plane, clamped
+// to the reference's last column/row; the vertical pass filters that array
+// without further clamping, because intermediateHeight covers every row the
+// second pass can read:
+//   intermediateHeight = (((h - 1) * yStep + 15) >> 4) + 8
+//
+// Both passes round with Round2(s, 7) and clip to 0..255, which is why the
+// intermediate array can be stored as u8: Clip1 makes the value exact.
+//
+// Negative start positions rely on two's-complement arithmetic exactly as the
+// specification does: `p & 15` selects the phase 0..15 and `p >> 4` floors
+// toward minus infinity, then Clip3(0, lastX, ...) chooses the edge sample.
+fn inter_block_pred(taps as *i64, ref as *InterRefPlane, plane as i64,
+                    sub_x as i64, sub_y as i64, pos as *InterPos,
+                    w as i64, h as i64, pred as *u8, pred_stride as i64,
+                    scratch as *u8) as i64 {
+    if (cast(i64, taps) == 0 || cast(i64, pos) == 0) { return errno.I_BADPARAM; }
+    if (inter_ref_ok(ref) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, pred) == 0 || cast(i64, scratch) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (sub_x < 0 || sub_x > 1 || sub_y < 0 || sub_y > 1) { return errno.I_BADPARAM; }
+    if (w < 4 || w > INTER_MAX_W || h < 4 || h > INTER_MAX_H) { return errno.I_DIMS; }
+    if ((w & 3) != 0 || (h & 3) != 0) { return errno.I_BADPARAM; }
+    if (pos.step_x < 1 || pos.step_x > INTER_MAX_STEP) { return errno.I_DIMS; }
+    if (pos.step_y < 1 || pos.step_y > INTER_MAX_STEP) { return errno.I_DIMS; }
+    if (pred_stride < w) { return errno.I_BADPARAM; }
+
+    let is i64 as subx with mut = 0;
+    let is i64 as suby with mut = 0;
+    if (plane > 0) {
+        subx = sub_x;
+        suby = sub_y;
+    }
+
+    let is i64 as last_x = ((ref.width + subx) >> subx) - 1;
+    let is i64 as last_y = ((ref.height + suby) >> suby) - 1;
+    if (last_x < 0 || last_y < 0) { return errno.I_BADPARAM; }
+    if (ref.stride < last_x + 1) { return errno.I_BADPARAM; }
+
+    let is i64 as ih = (((h - 1) * pos.step_y + 15) >> 4) + 8;
+    if (ih > INTER_MAX_INTERMEDIATE) { return errno.I_DIMS; }
+
+    // Horizontal pass: one row of the reference plane feeds one row of the
+    // intermediate array.
+    let is i64 as r with mut = 0;
+    while (r < ih) {
+        let is i64 as src_row = it.it_clip3(0, last_y, (pos.start_y >> 4) + r - 3);
+        let is i64 as c with mut = 0;
+        while (c < w) {
+            let is i64 as p = pos.start_x + pos.step_x * c;
+            let is i64 as phase = (p & it.SUBPEL_MASK) * 8;
+            let is i64 as base_col = (p >> 4) - 3;
+            let is i64 as s with mut = 0;
+            let is i64 as t with mut = 0;
+            while (t < 8) {
+                let is i64 as src_col = it.it_clip3(0, last_x, base_col + t);
+                s = s + taps[phase + t]
+                        * cast(i64, ref.data[src_row * ref.stride + src_col]);
+                t = t + 1;
+            }
+            scratch[r * w + c] = cast(u8, it.it_clip1(it.it_round2(s, 7)));
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    // Vertical pass: the intermediate row index (p >> 4) + t is always within
+    // intermediateHeight for the validated h and yStep.
+    r = 0;
+    while (r < h) {
+        let is i64 as p = (pos.start_y & it.SUBPEL_MASK) + pos.step_y * r;
+        let is i64 as phase = (p & it.SUBPEL_MASK) * 8;
+        let is i64 as row0 = p >> 4;
+        let is i64 as c with mut = 0;
+        while (c < w) {
+            let is i64 as s with mut = 0;
+            let is i64 as t with mut = 0;
+            while (t < 8) {
+                s = s + taps[phase + t]
+                        * cast(i64, scratch[(row0 + t) * w + c]);
+                t = t + 1;
+            }
+            pred[r * pred_stride + c] = cast(u8, it.it_clip1(it.it_round2(s, 7)));
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── 8.5.2 Inter prediction ──────────────────────────────────────────
+//
+// The full process for one plane region: for each reference list in turn,
+// select, clamp and scale the motion vector, then predict. For a compound
+// block the two predictions are averaged with Round2(a + b, 1); both are
+// already in 0..255, so the result needs no further clip.
+//
+// `taps` lets a caller that predicts many blocks with one filter load the
+// 128 coefficients once (inter_load_filter); inter_predict does it per call.
+fn inter_predict_taps(f as *InterFrame, plane as i64, refs as *InterRefPlane,
+                      ref_count as i64, x as i64, y as i64,
+                      w as i64, h as i64, block_idx as i64,
+                      block_mvs as *i32, taps as *i64,
+                      out as *u8, out_stride as i64,
+                      scratch as *u8) as i64 {
+    if (inter_frame_ok(f) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, refs) == 0 || cast(i64, block_mvs) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, taps) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, scratch) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (ref_count < 1 || ref_count > 2) { return errno.I_BADPARAM; }
+    if (w < 4 || w > INTER_MAX_W || h < 4 || h > INTER_MAX_H) { return errno.I_DIMS; }
+    if ((w & 3) != 0 || (h & 3) != 0) { return errno.I_BADPARAM; }
+    if (out_stride < w) { return errno.I_BADPARAM; }
+    if (x < 0 || y < 0) { return errno.I_BADPARAM; }
+
+    let is i64 as maxw with mut = 0;
+    let is i64 as maxh with mut = 0;
+    let is i64 as rc with mut = inter_plane_max(f, plane, &maxw, &maxh);
+    if (rc < 0) { return rc; }
+    let is i64 as max_idx with mut = 0;
+    rc = inter_block_idx_max(f, plane, &max_idx);
+    if (rc < 0) { return rc; }
+    if (block_idx < 0 || block_idx > max_idx) { return errno.I_BADPARAM; }
+
+    // Stage 5 integration change: the top-left sample must be inside the
+    // frame's mode-info grid, but the written block may extend past
+    // MiCols*8 / MiRows*8 by at most the caller's padding band (64 luma
+    // samples on each axis, halved for a subsampled plane). The caller
+    // allocated that band.
+    let is i64 as psubx with mut = 0;
+    let is i64 as psuby with mut = 0;
+    if (plane > 0) {
+        psubx = f.sub_x;
+        psuby = f.sub_y;
+    }
+    if (x < 0 || y < 0 || x >= maxw || y >= maxh) {
+        return errno.I_BADPARAM;
+    }
+    if (x + w > maxw + (64 >> psubx)) { return errno.I_BADPARAM; }
+    if (y + h > maxh + (64 >> psuby)) { return errno.I_BADPARAM; }
+    if (inter_ref_fields_ok(refs[0].data, refs[0].stride,
+                            refs[0].width, refs[0].height) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (inter_scale_ok(f, refs[0].width, refs[0].height) == 0) {
+        return errno.I_CORRUPT;
+    }
+    if (refs[0].stride < ((refs[0].width + psubx) >> psubx)) {
+        return errno.I_BADPARAM;
+    }
+    if (ref_count == 2) {
+        if (inter_ref_fields_ok(refs[1].data, refs[1].stride,
+                                refs[1].width, refs[1].height) == 0) {
+            return errno.I_BADPARAM;
+        }
+        if (inter_scale_ok(f, refs[1].width, refs[1].height) == 0) {
+            return errno.I_CORRUPT;
+        }
+        if (refs[1].stride < ((refs[1].width + psubx) >> psubx)) {
+            return errno.I_BADPARAM;
+        }
+    }
+
+    let is i64 as is_compound with mut = 0;
+    if (ref_count == 2) { is_compound = 1; }
+
+    // Second prediction holds one 64x64 block at most.
+    let is [4096]u8 as pred1buf;
+    let is *u8 as pred1 = cast(*u8, &pred1buf);
+
+    let is i64 as ref_list with mut = 0;
+    while (ref_list < ref_count) {
+        let is InterRefPlane as rp;
+        rp.data = refs[ref_list].data;
+        rp.stride = refs[ref_list].stride;
+        rp.width = refs[ref_list].width;
+        rp.height = refs[ref_list].height;
+        if (inter_ref_ok(&rp) == 0) { return errno.I_BADPARAM; }
+
+        let is i64 as mv_row with mut = 0;
+        let is i64 as mv_col with mut = 0;
+        rc = inter_mv_select(f, plane, ref_list, block_idx, block_mvs,
+                             &mv_row, &mv_col);
+        if (rc < 0) { return rc; }
+
+        let is i64 as cl_row with mut = 0;
+        let is i64 as cl_col with mut = 0;
+        rc = inter_mv_clamp(f, plane, mv_row, mv_col, &cl_row, &cl_col);
+        if (rc < 0) { return rc; }
+
+        let is i64 as sx with mut = 0;
+        let is i64 as sy with mut = 0;
+        let is i64 as stx with mut = 0;
+        let is i64 as sty with mut = 0;
+        rc = inter_mv_scale(f, plane, x, y, cl_row, cl_col,
+                            rp.width, rp.height,
+                            &sx, &sy, &stx, &sty);
+        if (rc < 0) { return rc; }
+
+        let is InterPos as pos;
+        pos.start_x = sx;
+        pos.start_y = sy;
+        pos.step_x = stx;
+        pos.step_y = sty;
+
+        let is *u8 as dst with mut = out;
+        let is i64 as dst_stride with mut = out_stride;
+        if (ref_list > 0) {
+            dst = pred1;
+            dst_stride = w;
+        }
+        rc = inter_block_pred(taps, &rp, plane, f.sub_x, f.sub_y, &pos,
+                              w, h, dst, dst_stride, scratch);
+        if (rc < 0) { return rc; }
+
+        ref_list = ref_list + 1;
+    }
+
+    if (is_compound == 1) {
+        let is i64 as rr with mut = 0;
+        while (rr < h) {
+            let is i64 as cc with mut = 0;
+            while (cc < w) {
+                let is i64 as a = cast(i64, out[rr * out_stride + cc]);
+                let is i64 as b = cast(i64, pred1[rr * w + cc]);
+                out[rr * out_stride + cc] = cast(u8, (a + b + 1) >> 1);
+                cc = cc + 1;
+            }
+            rr = rr + 1;
+        }
+    }
+    return errno.I_OK;
+}
+
+// inter_predict_taps with the filter loaded from f.filter for this call.
+fn inter_predict(f as *InterFrame, plane as i64, refs as *InterRefPlane,
+                 ref_count as i64, x as i64, y as i64,
+                 w as i64, h as i64, block_idx as i64,
+                 block_mvs as *i32, out as *u8, out_stride as i64,
+                 scratch as *u8) as i64 {
+    if (inter_frame_ok(f) == 0) { return errno.I_BADPARAM; }
+    let is [128]i64 as taps;
+    let is i64 as rc = inter_load_filter(f.filter, cast(*i64, &taps));
+    if (rc < 0) { return rc; }
+    return inter_predict_taps(f, plane, refs, ref_count, x, y, w, h, block_idx,
+                              block_mvs, cast(*i64, &taps), out, out_stride,
+                              scratch);
+}
+
+// One plane's prediction block, following the caller in 6.4.21:
+//   plane block size = get_plane_block_size(MiSize, plane)
+//   MiSize < BLOCK_8X8: one 4x4 prediction per 4x4 piece, blockIdx raster
+//   otherwise:          one prediction of the whole plane block, blockIdx 0
+// x and y are the plane coordinates of the block's top-left sample
+// (baseX/baseY in 6.4.21); `out` points at that sample.
+fn inter_predict_block(f as *InterFrame, plane as i64, refs as *InterRefPlane,
+                       ref_count as i64, x as i64, y as i64,
+                       block_mvs as *i32, out as *u8, out_stride as i64,
+                       scratch as *u8) as i64 {
+    if (inter_frame_ok(f) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, refs) == 0 || cast(i64, block_mvs) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out) == 0 || cast(i64, scratch) == 0) { return errno.I_BADPARAM; }
+    if (ref_count < 1 || ref_count > 2) { return errno.I_BADPARAM; }
+    if (x < 0 || y < 0) { return errno.I_BADPARAM; }
+
+    let is i64 as pw with mut = 0;
+    let is i64 as ph with mut = 0;
+    let is i64 as rc with mut = it.it_plane_block_dims(f.mi_size, plane, f.sub_x, f.sub_y,
+                                              &pw, &ph);
+    if (rc < 0) { return rc; }
+    if (out_stride < pw) { return errno.I_BADPARAM; }
+
+    // Stage 5 integration change, same proof as inter_predict_taps: start
+    // inside the grid, write into the caller's padded band.
+    let is i64 as maxw with mut = 0;
+    let is i64 as maxh with mut = 0;
+    rc = inter_plane_max(f, plane, &maxw, &maxh);
+    if (rc < 0) { return rc; }
+    if (x >= maxw || y >= maxh) { return errno.I_BADPARAM; }
+    let is i64 as psubx with mut = 0;
+    let is i64 as psuby with mut = 0;
+    if (plane > 0) { psubx = f.sub_x; psuby = f.sub_y; }
+    if (x + pw > maxw + (64 >> psubx)) { return errno.I_BADPARAM; }
+    if (y + ph > maxh + (64 >> psuby)) { return errno.I_BADPARAM; }
+
+    let is [128]i64 as taps;
+    rc = inter_load_filter(f.filter, cast(*i64, &taps));
+    if (rc < 0) { return rc; }
+
+    if (f.mi_size >= it.BLOCK_8X8) {
+        return inter_predict_taps(f, plane, refs, ref_count, x, y, pw, ph, 0,
+                                  block_mvs, cast(*i64, &taps), out, out_stride,
+                                  scratch);
+    }
+
+    // Sub-8x8: pw and ph are 4 or 8 (see it_plane_block_dims), so the plane
+    // block is a 1x1, 1x2, 2x1 or 2x2 grid of 4x4 pieces.
+    let is i64 as nw = pw >> 2;
+    let is i64 as nh = ph >> 2;
+    let is i64 as by with mut = 0;
+    while (by < nh) {
+        let is i64 as bx with mut = 0;
+        while (bx < nw) {
+            let is i64 as block_idx = by * nw + bx;
+            let is *u8 as q = cast(*u8, cast(i64, out)
+                                      + (by * 4) * out_stride + bx * 4);
+            rc = inter_predict_taps(f, plane, refs, ref_count,
+                                    x + bx * 4, y + by * 4, 4, 4, block_idx,
+                                    block_mvs, cast(*i64, &taps), q, out_stride,
+                                    scratch);
+            if (rc < 0) { return rc; }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return errno.I_OK;
+}

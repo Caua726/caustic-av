@@ -6,7 +6,9 @@
 // byte range per tile, indexed row-major in decode_tiles order. This module
 // walks those ranges in the same order, gives each tile its own Boolean
 // decoder over exactly its slice, and drives the partition tree of
-// block.cst for the tile's superblock rectangle.
+// block.cst for the tile's superblock rectangle. Key, intra-only and inter
+// frames share this walk; block.cst dispatches on FrameIsIntra and on the
+// per-block is_inter.
 //
 // Context lifetime follows sections 7.4.1 and 7.4.2:
 //   * the above contexts (partition, nonzero, segment prediction) are
@@ -112,6 +114,7 @@ fn tile_decode_all(b as *blk.Vp9Blk, data as *u8, len as i64) as i64 {
             if (tlen > len - off) { return errno.I_CORRUPT; }
 
             b.mi_col_start = col_start;
+            b.mi_col_end = col_end;
             let is vb.Vp9Bool as br;
             let is i64 as st with mut = vb.vp9_bool_init(&br,
                 cast(*u8, cast(i64, data) + off), tlen);

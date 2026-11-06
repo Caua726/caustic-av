@@ -1,10 +1,14 @@
-# VP9: headers, superframes and the Boolean decoder
+# VP9: full frame decoding
 
-Stage 3 of the VP9 decoder. It turns a packet into everything the frame
-decoder needs except the pixels: the frame's uncompressed and compressed
-headers, the reference and segmentation state that survives between frames,
-the probability contexts, and the byte ranges of the tiles. It does not
-decode a tile, reconstruct a frame, or filter one.
+Stages 3-5 of the VP9 decoder. Stage 3 turns a packet into the frame's
+uncompressed and compressed headers, the reference and segmentation state
+that survives between frames, the probability contexts, and the byte ranges
+of the tiles. Stage 4 adds the tile walk, intra prediction, residual
+decoding, inverse transforms and the loop filter. Stage 5 adds inter frames
+(6.4.11-6.4.20 and 6.5), compound and scaled prediction (8.5.2), backward
+probability adaptation (8.3-8.4), and the pixel reference slots of 8.9-8.10.
+`decode.cst` is the frame driver; show_existing_frame and display order are
+stage 6.
 
 Only profile 0 is accepted. The syntax of profiles 1-3 is different enough
 (4:2:2/4:4:4, 10/12-bit, an extra reserved bit after the profile bits) that
@@ -19,6 +23,19 @@ guessing would be worse than refusing: `vp9_header_parse` returns
 | `video/vp9/vp9_tables.cst` | Dimensions and constants, fixed lookup tables, `Vp9ProbCtx`, `Vp9Counts`, `Vp9State`, and the probability-context operations (defaults, load, load2, save, clear, publish). |
 | `video/vp9/vp9_tables_data.cst` | The probability blobs. **Generated** by `tools/gen_vp9_tables.py`; currently pending (see below). |
 | `video/vp9/header.cst` | Annex B superframe split, the uncompressed header, the compressed header, and the tile size table. |
+| `video/vp9/tile.cst` | Tile byte ranges and the per-tile Boolean decoder, one per tile, over the partition tree. |
+| `video/vp9/block.cst` | Partition tree, intra and inter mode info (6.4.4-6.4.20), motion-vector syntax, inter prediction calls, residual orchestration (6.4.21). |
+| `video/vp9/residual.cst`, `residual_tables.cst` | Token decode, coefficient contexts, dequantisation (8.6, 9.3.4) and the scan/band tables. |
+| `video/vp9/transforms.cst` | Inverse transforms of 8.7 and residual addition. |
+| `video/vp9/predict.cst` | Intra prediction of 8.5.1. |
+| `video/vp9/inter.cst`, `inter_tables.cst` | Inter prediction of 8.5.2, its subpel filters and fixed tables. |
+| `video/vp9/mvpred.cst` | Motion-vector prediction of 6.5.1-6.5.14. |
+| `video/vp9/refs.cst` | The eight reference slots, publish (8.10) and the show-existing view (8.9). |
+| `video/vp9/scale.cst` | Scaled-reference geometry and the 7.2.5/8.5.2.3 size-ratio bounds. |
+| `video/vp9/adapt.cst` | Backward probability adaptation of 8.3-8.4 over its own i64 tables. |
+| `video/vp9/adapt_bridge.cst` | Copies between `vp9_tables.cst`'s u8/byte layout and `adapt.cst`'s i64 layout and runs one `refresh_probs` (6.1.2). |
+| `video/vp9/loopfilter.cst` | The loop filter of 8.8. |
+| `video/vp9/decode.cst` | The frame driver: pool selection, tile walk, adaptation, loop filter, segment/mv bookkeeping, publish. |
 | `tools/gen_vp9_tables.py` | Reads the specification text, validates every table's dimension and value range, and writes `vp9_tables_data.cst`. |
 
 The specification used is `.work/vp9/spec/clean.txt` (VP9 Bitstream &
@@ -58,6 +75,142 @@ copies every table and marks the context initialised;
 `vp9_state_clear_counts` zeroes `Vp9Counts`. A context that has never been
 saved is corrupt input: libvpx calls it "uninitialized entropy context", and
 `vp9_state_load_probs` returns `I_CORRUPT` for it.
+
+## Frame decoding (stage 4-5)
+
+`Vp9Decoder` owns `Vp9State`, the eight `refs.cst` slots, a reference pixel
+pool and the work block. The caller allocates the decoder object, a persistent
+work block (`vp9_work_size`) and up to nine pixel buffers
+(`vp9_decoder_add_buffer`); the library allocates nothing. `Vp9Decoder` is
+large (the `Vp9State` probability contexts plus `adapt.cst`'s i64 working set
+and counts, roughly 140 KiB), so it belongs in caller storage, not on a small
+stack.
+
+### Reference pixel lifetime
+
+Each pool buffer is a caller-owned range. A decode picks a buffer whose pool
+index is named by no published slot (`refs.in_use`) and whose capacity holds
+`vp9_frame_size(width, height)`; if none is free and large enough the call
+returns `I_NOMEM` with `d.frame_need`, and the caller may
+`vp9_decoder_replace_buffer` on an index returned by
+`vp9_decoder_free_buffer`. There are nine buffers: eight can be named by the
+reference slots at once, so at least one is always a free decode target (a
+superframe's shown-but-unpublished slice is held for the rest of that call).
+With fewer than nine registered buffers an inter stream can reach `I_NOMEM`
+when every reference slot is live. Decoding never writes a published
+reference.
+
+After the loop filter the frame is published with `refs.vp9_refs_publish`:
+every slot named by `refresh_frame_flags` stores a view of the decoded
+buffer (8.10's `FrameStore[i] = CurrFrame`, represented as a view because the
+pixels already are the frame), and `Vp9State.ref_*` is updated by the same
+call. `refresh_frame_flags == 0` publishes nothing and leaves the buffer
+free. A frame may reference the very slot it later refreshes; publish is
+after the tiles, so the old pixels are only replaced once prediction is
+finished. `vp9_refs_buffer_in_use(map, id)` tells the caller when a buffer
+may be reused or freed. An output view of a frame that was not published
+(`show_frame == 1` with `refresh_frame_flags == 0`) stays valid only until
+the next decode call or until its buffer is replaced.
+
+`coded_w = round64(MiCols*8) + 64`, likewise for height; the 64-sample band
+on the right and bottom is what 6.4.21's overhanging edge blocks write.
+`core/frame.cst`'s `FRAME_MAX_DIM` currently caps the coded size, so a
+visible side of exactly 65536 cannot be represented with its padding (see
+Pending review notes).
+
+### Per-slice order
+
+`vp9_decoder_decode` splits a superframe (Annex B) and calls `_decode_slice`
+for each frame in order. One slice:
+
+1. `vp9_header_parse` (6.2-6.3), then the format, pending-table and
+   compressed-header checks.
+2. For an inter frame: `vp9_refs_check_header` against the pixel slots and
+   the 7.2.5 size-ratio requirement (at least one reference must satisfy
+   `scale.vp9_scale_ratio_ok`); the per-reference bound of 8.5.2.3 is
+   enforced again by `inter.cst` at every prediction.
+3. Select a free pool buffer, form the coded frame view, zero it.
+4. Carve the per-frame work arrays. For an intra or error-resilient frame,
+   clear `PrevSegmentIds` (7.2), independently of the header's
+   `seg_map_clear`. Clear the current frame's `Mvs`/`SubMvs` (6.5 reads both
+   lists of a candidate before deciding, and 8.10 copies the field for the
+   next frame).
+5. `tile_decode_all` (6.4): one Boolean decoder per tile, above contexts
+   once per frame, left contexts once per 8x8 row. For each block,
+   `block.cst` decodes the partition tree, mode info, prediction and
+   residual, and writes the mode-info arrays through `mvpred.cst`.
+6. `adapt_bridge.vp9_adapt_frame`: 6.1.2 exactly. If
+   `error_resilient_mode == 0 && frame_parallel_decoding_mode == 0`, load
+   the frame context (discarding the header's forward updates from the
+   adaptation prior), `adapt_coef_probs`, and for an inter frame load
+   `load_probs2` and `adapt_noncoef_probs`; then, if
+   `refresh_frame_context == 1`, save the context. `LastFrameType`,
+   `FrameIsIntra`, `interpolation_filter`, `tx_mode` and
+   `allow_high_precision_mv` all come from the parsed header. Counts were
+   cleared per frame and were accumulated by the tiles.
+7. Loop filter (8.8), then 8.1 step 3 (`PrevSegmentIds`), then 8.10 step 2
+   (`PrevRefFrames`/`PrevMvs` from the current arrays).
+8. Publish (8.10 step 1). If `show_frame == 1`, the output view is the
+   decoded frame; otherwise the output stays cleared.
+
+### Inter mode info
+
+`block.cst` implements `inter_frame_mode_info` (6.4.11): neighbour reference
+frames and the `LeftIntra`/`AboveIntra`/`LeftSingle`/`AboveSingle` flags,
+`inter_segment_id`, skip, is-inter, the conditional `read_tx_size`, then
+either `inter_block_mode_info` or `intra_block_mode_info` with the adaptive
+intra tables and their counts. `read_ref_frames` (6.4.17) covers single,
+compound and `SEG_LVL_REF_FRAME`; `find_mv_refs`/`find_best_ref_mvs` (6.5)
+fill NearestMv/NearMv/BestMv, and `read_mv` (6.4.19-20) reads the joint,
+class, class0/fr/hp and bit syntax. `append_sub8x8_mvs` supplies only
+NearestMv/NearMv for a 4x4 piece; BestMv always stays the whole-block 6.5.12
+value. The inter-mode entropy context is the 6.5.1 counter over the two
+nearest neighbours, computed once per block before any inter_mode read (the
+reference decoders do the same; the appends' internal `find_mv_refs` calls
+must not move it). Sub-8x8 blocks read one inter_mode per 4x4 piece and
+write `BlockMvs`; `mv_store_block_mvs` writes Mvs/SubMvs for every covered
+mode-info cell and both reference lists (single-reference blocks present the
+zeroed list 1).
+
+Prediction is `inter.cst` (8.5.2): per plane, per reference list, MV
+selection, clamping, scaling and the two-pass 8-tap filter; compound blocks
+average with `Round2(a+b, 1)`. `blockIdx` is derived from the plane block
+(`it_plane_block_dims`), never from the MiSize alone, so the 8.5.2.1
+averages cannot read another piece's vector or the next reference list.
+
+### Stage 5 integration changes
+
+These touch adopted stage 4-5 modules and are required for ordinary frame
+sizes; they do not change valid-stream output:
+
+- `MiRows`/`MiCols` are `ceil(height/8)`/`ceil(width/8)`, so a partition at
+  the right or bottom edge can yield a block whose top-left is inside the
+  mode-info grid but whose body overhangs it (1080p and 720p both do).
+  `inter_frame_ok` and `mvpred.mv_ctx_ok` accept such a block (start inside,
+  overhang allowed), where the adopted slices required the block to fit.
+  `inter_predict_taps`/`inter_predict_block` let the written region extend
+  into the caller's 64-sample padding band instead of rejecting
+  `x + w > MiCols*8`. `mvpred`'s clamps then see the negative distance to
+  the overhung edge that 6.5.4/6.5.5 print. The added tests live in
+  `inter.cst`/`mvpred.cst` and are marked as stage 5 integration changes.
+- `loopfilter.cst`'s `LfBlockInfo` gained `ref_stride`: `ref_frames` now has
+  two entries per mode-info cell (list 0 and list 1), and the filter reads
+  list 0 at `idx * ref_stride`.
+- `decode.cst`'s public decode call no longer takes a per-call output block:
+  the output is a view into the selected pool buffer, and the caller
+  registers buffers up front. `frame_need`/`work_need` report the sizes to
+  grow.
+
+### Coefficient and probability counts
+
+`block.cst` and `residual.cst` update the section 9.3.4 counters in the
+`vp9_tables.cst` layout: partition, skip, tx size, is-inter, comp mode,
+single/compound reference, inter mode, switchable filter, the MV tables, and
+the token/more_coefs tables (the E2 rule). `adapt_bridge.cst` copies those
+counts and the working probabilities into `adapt.cst`'s layout, calls its
+`refresh_probs`, and copies back; the four saved contexts are not touched
+except the one the frame loads/saves. The extra copies are per frame, not
+per block.
 
 ## Headers
 
@@ -253,7 +406,10 @@ checks the header does not perform.
    frame whose references all fail them ("Referenced frame has invalid
    size"). Stage 4/6 must not assume the header bounded the scale ratio:
    recheck it where the scale factors are built and treat a ratio outside
-   1/2..16 as `I_CORRUPT`.
+   1/2..16 as `I_CORRUPT`. **Stage 5 does:** `_decode_slice` requires at
+   least one of the three references to pass `scale.vp9_scale_ratio_ok`,
+   and `inter.cst` rechecks each reference it actually uses before
+   predicting.
 2. **Profile-0 intra-only `color_range`.** The value is set to 0 as the
    references do, but the specification never assigns it. Recorded as E4,
    UNCONFIRMED.
@@ -271,55 +427,91 @@ checks the header does not perform.
    that `compute_image_size` performs when the frame size is first seen or
    changes (section 7.2.6). `setup_past_independence` (section 7.2) also
    clears `PrevSegmentIds` for the whole frame with no size condition and
-   does not touch `SegmentId` for the current frame. Stage 4 must apply the
-   latter when `frame_is_intra == 1 || error_resilient_mode == 1`,
-   independently of `seg_map_clear`.
+   does not touch `SegmentId` for the current frame. Stage 5's
+   `_decode_slice` now applies the latter when `frame_is_intra == 1 ||
+   error_resilient_mode == 1`, independently of `seg_map_clear`. The
+   stage-4 `_update_seg_map` also zeroes `PrevSegmentIds` on a size change
+   when segmentation did not update the map; the specification does not
+   explicitly ask for that, but indexing the old map at new dimensions would
+   be undefined, so it stays. Stage 5 additionally clears the current grid
+   of `PrevSegmentIds` at frame start when `h.seg_map_clear == 1`, before
+   any block reads it. Both are recorded as UNCONFIRMED.
+
+5. **Reference pool API changed.** `vp9_decoder_decode` no longer takes a
+   per-call `mem`/`cap`: the output is a view into a pool buffer registered
+   with `vp9_decoder_add_buffer`. A caller that only wants one frame can
+   register one buffer, but then it cannot decode an inter frame (which
+   needs published references). Stage 6 may want a `show_existing` entry
+   point that copies a slot view without a decode target.
+
+6. **Coded size at the dimension ceiling.** `coded_w = round64(MiCols*8) +
+   64` exceeds `core/frame.cst`'s `FRAME_MAX_DIM` when the visible side is
+   exactly 65536, so such a frame returns `I_DIMS`. The ceiling is the core
+   module's, not VP9's.
+
+7. **`adapt_bridge.cst` copies per frame.** The bridge is a layout adapter,
+   not a second probability model: it converts the working set, one saved
+   context and the counts, runs `adapt.cst`'s `refresh_probs`, and converts
+   back. A later pass could make `adapt.cst` operate on the
+   `vp9_tables.cst` layout directly, removing the copy and the duplicated
+   i64 working set in `Vp9Decoder`.
+
+8. **Stage 5 integration changes in adopted modules.** As recorded above,
+   `inter.cst` and `mvpred.cst` accept an edge block that overhangs
+   `MiCols*8`/`MiRows*8`, and `loopfilter.cst`'s `LfBlockInfo` gained
+   `ref_stride`. These are documented at their definitions and in
+   `inter.md`'s pending notes; they do not change valid-stream output.
 
 ## Limitations and deferred work
 
-- Profile 0 only; other profiles return `I_UNSUPPORTED`.
-- No tile or frame decoding. `decode_tiles`, partition decoding, residual
-  decoding, loop filtering and reference reconstruction belong to stages 4-6.
-- `refresh_probs` / `adapt_coef_probs` / `adapt_noncoef_probs` are stage 5:
-  stage 3 parses the updates into the working context and leaves adaptation
-  after the tiles to the next stage.
+- Profile 0 only, 8-bit 4:2:0; other profiles return `I_UNSUPPORTED`.
+- `show_existing_frame` returns `I_UNSUPPORTED`. Stage 6 adds it through
+  `refs.vp9_refs_show_existing`, plus presentation order and the display
+  handoff for superframes.
 - The three probability blobs are pending (above). Until they are generated,
-  tile decoding is blocked by design.
+  tile decoding is blocked by design; header parsing and the mode-info
+  syntax are unaffected.
 - The planning brief's stage-3 test file (`tests/test_vp9_headers.cst`, its
   IVF/raw fixtures and the `trace_headers` oracle commands) was **not
   written**: the coordinator removed the test phase and instructed that no
   new test suites or oracle scripts be added. `tests/run.cst` is untouched.
+  No stage 4/5 tests were added for the same reason.
 
 ## Reference implementations read
 
-Only for behaviour and to settle the two errata; no code was copied, ported
-or transcribed.
+Only for behaviour; no code was copied, ported or transcribed.
 
-- libvpx `main`: `vp9/decoder/vp9_decodeframe.c` (uncompressed and compressed
-  header parsing including the `ref_frame_idx` loop and
-  `setup_frame_size_with_refs`, tile sizes), `vp9/decoder/vp9_dsubexp.c`
-  (term subexp / inverse remap), `vp9/decoder/vp9_detokenize.c`
-  (coefficient counting), `vp9/common/vp9_entropymode.c` (defaults,
-  `setup_past_independence`), `vp9/common/vp9_onyxc_int.h`
-  (`set_partition_probs`, `vp9_init_macroblockd`),
-  `vp9/encoder/vp9_tokenize.c` (encoder-side branch counts),
-  `vp9/vp9_cx_iface.c` and `vp9/decoder/vp9_decoder.c` (superframe index
-  writer and parser), `vpx_dsp/bitreader.h`, `vpx_dsp/bitreader.c`
-  (Boolean decoder window).
-- FFmpeg `master`: `libavcodec/vp9.c` (`decode_frame_header` including the
-  three-refidx availability and reference pixel-format checks, compressed
-  header updates, keyframe partition-table selection in `decode_sb`),
-  `libavcodec/vp9block.c` (block-level prob/count usage).
-- FFmpeg `n6.1`: `libavcodec/vp9_superframe_split_bsf.c` (superframe index
-  byte order and split checks).
-- SerenityOS `master`, a third, from-scratch VP9 decoder:
-  `Userland/Libraries/LibMedia/Video/VP9/Parser.cpp` (the token loop),
-  `TreeParser.cpp` (counting `counts_more_coefs` once per read, by value)
-  and `SyntaxElementCounter.h`/`SyntaxElementCounter.cpp` (counter sizes).
-  Read to confirm the E2 rule; no code was copied.
+Stage 5 read these four files straight from their upstream URLs:
+
+- libvpx `main`, `vp9/decoder/vp9_decodeframe.c` (tile decode, per-tile
+  `init_bool`, `decode_block`/`decode_partition`, `dec_build_inter_predictors_sb`
+  call site, skip-on-zero-Eob handling);
+- libvpx `main`, `vp9/decoder/vp9_decodemv.c` (inter frame mode info,
+  reference-frame and compound contexts, `read_mv`, MVs and interp filter
+  contexts, `append_sub8x8_mvs` call site, multi-list ModeContext use);
+- FFmpeg `master`, `libavcodec/vp9.c` (reference frame allocation and
+  replacement, per-frame `ff_progress_frame` reference lifetime);
+- FFmpeg `master`, `libavcodec/vp9block.c` (`decode_mode`, block contexts,
+  inter mode and MV syntax, filters, intra-in-inter mode groups).
+
+Earlier stages additionally read, for behaviour and to settle the errata:
+
+- libvpx `main`: `vp9/decoder/vp9_dsubexp.c`, `vp9/decoder/vp9_detokenize.c`,
+  `vp9/common/vp9_entropymode.c`, `vp9/common/vp9_onyxc_int.h`,
+  `vp9/encoder/vp9_tokenize.c`, `vp9/vp9_cx_iface.c`,
+  `vp9/decoder/vp9_decoder.c`, `vpx_dsp/bitreader.h`,
+  `vpx_dsp/bitreader.c`.
+- FFmpeg `master`: `libavcodec/vp9.c` (header parsing and reference checks),
+  `libavcodec/vp9block.c`; FFmpeg `n6.1`:
+  `libavcodec/vp9_superframe_split_bsf.c`.
+- SerenityOS `master`: `LibMedia/Video/VP9/Parser.cpp`, `TreeParser.cpp`,
+  `SyntaxElementCounter.*` (E2).
+- The inter slice also read libvpx `vp9/common/vp9_reconinter.c` and
+  `vp9/common/vp9_mvref_common.c`, and FFmpeg `libavcodec/vp9mvs.c` and
+  `libavcodec/vp9recon.c`.
 
 ## Status
 
 WRITTEN, NOT VERIFIED. Nothing in this directory has been compiled or run.
-The MD5 and `trace_headers` checks above are recorded for the test phase and
-have not been executed.
+The MD5, `trace_headers`, `ffprobe`, `opus_compare` and FFmpeg-difference
+checks above are recorded for the test phase and have not been executed.

@@ -1,0 +1,658 @@
+// =======================================================
+// caustic-av/video/vp9/refs.cst
+// The eight VP9 reference slots (section 5.10), the reference frame update
+// process (section 8.10) and the show-existing output path (section 8.9).
+//
+// Model and ownership
+// -------------------
+// Vp9Refs.map is exactly the specification's reference arrays: index i is
+// the 3-bit value carried by ref_frame_idx and by frame_to_show_map_idx, and
+// the entry holds the frame that RefFrameWidth[i]/FrameStore[i] describe.
+// Each entry is a Vp9RefView: a frame.Frame view over memory the caller
+// allocated, plus the format and render geometry of that frame, whether the
+// slot has ever been published, and the caller's frame id and order. The
+// library never allocates: the caller owns every buffer, keeps it alive
+// while any slot still names its id, and frees it by whatever owner supplied
+// it. vp9_refs_buffer_in_use answers when that is safe.
+//
+// A slot is only ever a published view, never a decode target. Section 8.10
+// copies CurrFrame into FrameStore[i]; this module represents that copy by
+// publishing a view of the caller's reconstructed buffer. Reconstruction must
+// therefore happen in a buffer that no published slot names: decoding into a
+// slot's memory would rewrite a reference that the same frame may still
+// select through ref_frame_idx, and the specification has no meaning for a
+// reference whose pixels changed underneath it. With eight distinct live
+// references the frame needs a ninth buffer that no slot names; after
+// publish, the buffers the refreshed slots stopped naming may be freed or
+// reused once vp9_refs_buffer_in_use returns 0, so a pool of nine buffers
+// (reallocated as sizes demand while free) serves the stream. Both reference
+// decoders keep the current frame separate from the reference set (libvpx's
+// new_fb_idx from its buffer pool, FFmpeg's CUR_FRAME from s->s.refs) and
+// never reconstruct over a reference.
+//
+// The module does not model libvpx's extra frame-buffer pool indirection
+// (ref_frame_map plus a pool of RefCntBuffers). That indirection exists to
+// refcount buffers when many map entries share one decoded frame, which the
+// caller can do here with the id/order fields and "in use" query without a
+// second lookup layer. One decoded frame may back any number of slots; all
+// of them then carry the same id, pixels, geometry and format.
+//
+// What publish updates
+// --------------------
+// vp9_refs_publish(state, slot_map, frame) applies section 8.10 step 1 to
+// the slots named by refresh_frame_flags and mirrors the same geometry and
+// format into Vp9State.ref_*, because the stage 3 header reads those arrays
+// when it validates ref_frame_idx and when frame_size_with_refs takes a
+// reference's dimensions. vp9_state_publish must not be called separately:
+// this function is the single writer, so the two views cannot drift.
+//
+// Section 8.10 uses FrameWidth/FrameHeight (visible), not the coded size.
+// The coded size is kept only as the buffer's allocation geometry. Publish
+// validates a source frame before touching either structure: a frame whose
+// decode failed (valid == 0), whose geometry or layout is inconsistent with
+// its capacity, whose format is not the profile-0 format this library
+// decodes, or whose buffer is named by any published slot is rejected and
+// nothing is written. That last check enforces the decode-target rule above,
+// including the case where the frame refreshes the very slot it selected as
+// a reference: refreshing a slot does not make its old pixels disposable
+// during reconstruction.
+//
+// Frame size changes
+// ------------------
+// A new FrameWidth/FrameHeight or render size does not invalidate a
+// reference slot. References of a different size are legal and are the
+// whole point of scaled prediction (sections 7.2.5 and 8.5.2.3), so slots
+// keep their own geometry. Only the *current* frame needs a buffer for its
+// own size; vp9_refs_frame_bytes gives the byte count (bounded and
+// overflow-checked) and vp9_refs_buffer_needs_resize says whether a free
+// buffer's capacity can host another geometry. Render size is output
+// metadata only (section 7.2.4) and never affects a buffer.
+//
+// Show-existing
+// -------------
+// vp9_refs_show_existing copies the stored view of one slot; it does not
+// recompute pixels and does not change any slot (the header sets
+// refresh_frame_flags to 0 on that path). Section 8.9 takes w, h,
+// subsampling and bit depth from the reference slot, so the caller must not
+// read Vp9Header.width/height/render_*/color fields on a show-existing
+// frame: they stay zero and are meaningless (stage 3 Pending note 3). The
+// stored color space and range come from the frame that filled the slot and
+// are carried through unchanged for the caller.
+//
+// Scripts, tile decoding and inter prediction are not in this file. scale.cst
+// holds the scaled-reference geometry; inter prediction and the tile walk
+// belong to stages 4 and 5.
+//
+// Nothing in this file has been compiled or run; see video/vp9/refs.md.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "../../core/frame.cst" as fr;
+use "header.cst" as hdr;
+use "vp9_tables.cst" as t;
+
+// Largest visible dimension a 16-bit frame_size can express.
+let is i64 as VP9_REF_MAX_DIM with imut = 65536;
+
+// One reference slot: a view over caller memory plus what sections 8.9 and
+// 8.10 need to know about the frame stored there. Field names that repeat
+// frame.Frame (width/height/stride/...) live under view.
+struct Vp9RefView {
+    valid         as i64;    // 1 once a frame has been published here
+    view          as fr.Frame;  // caller-owned pixels; visible and coded size
+    profile       as i64;    // 0 for every frame this library decodes
+    bit_depth     as i64;
+    subsampling_x as i64;
+    subsampling_y as i64;
+    color_space   as i64;
+    color_range   as i64;
+    render_width  as i64;    // display hint of the stored frame (7.2.4)
+    render_height as i64;
+    id            as i64;    // caller's frame counter, unique per buffer
+    order         as i64;    // caller's presentation-order hint
+}
+
+// The reference map of section 8.10. Slot i is selected by bit i of
+// refresh_frame_flags, by ref_frame_idx[j] and by frame_to_show_map_idx.
+struct Vp9Refs {
+    map as [8]Vp9RefView;
+}
+
+// A reconstructed current frame offered to the update process. Its view must
+// cover a free/transient buffer that no published slot names; publish rejects
+// any overlap, including a slot this frame refreshes. The caller fills this
+// from the parsed header and its own bookkeeping; publish copies nothing from
+// Vp9Header directly so the module stays independent of where the values came
+// from.
+struct Vp9RefFrame {
+    valid         as i64;    // 0 rejects the publish (failed reconstruction)
+    key_frame     as i64;    // 1 for frame_type == KEY_FRAME
+    view          as fr.Frame;  // decoded pixels, caller-owned
+    refresh_flags as i64;    // h.refresh_frame_flags, 0..255
+    profile       as i64;
+    bit_depth     as i64;
+    subsampling_x as i64;
+    subsampling_y as i64;
+    color_space   as i64;
+    color_range   as i64;
+    render_width  as i64;
+    render_height as i64;
+    id            as i64;
+    order         as i64;
+}
+
+// ── slot bookkeeping ────────────────────────────────────────────────
+
+fn _view_clear(v as *Vp9RefView) as void {
+    fr.frame_free(&v.view);
+    v.valid = 0;
+    v.profile = 0;
+    v.bit_depth = 0;
+    v.subsampling_x = 0;
+    v.subsampling_y = 0;
+    v.color_space = 0;
+    v.color_range = 0;
+    v.render_width = 0;
+    v.render_height = 0;
+    v.id = 0 - 1;
+    v.order = 0 - 1;
+}
+
+// Copy every field. frame.Frame is a value struct of scalars and pointers,
+// so a field-by-field copy avoids depending on whole-struct assignment and
+// makes the ownership explicit: only the view moves, the memory does not.
+fn _view_copy(d as *Vp9RefView, s as *Vp9RefView) as void {
+    d.view.width = s.view.width;
+    d.view.height = s.view.height;
+    d.view.coded_width = s.view.coded_width;
+    d.view.coded_height = s.view.coded_height;
+    d.view.y = s.view.y;
+    d.view.u = s.view.u;
+    d.view.v = s.view.v;
+    d.view.stride_y = s.view.stride_y;
+    d.view.stride_u = s.view.stride_u;
+    d.view.stride_v = s.view.stride_v;
+    d.view.pixels = s.view.pixels;
+    d.view.cap = s.view.cap;
+
+    d.profile = s.profile;
+    d.bit_depth = s.bit_depth;
+    d.subsampling_x = s.subsampling_x;
+    d.subsampling_y = s.subsampling_y;
+    d.color_space = s.color_space;
+    d.color_range = s.color_range;
+    d.render_width = s.render_width;
+    d.render_height = s.render_height;
+    d.id = s.id;
+    d.order = s.order;
+    d.valid = 1;
+}
+
+// Store a reconstructed frame's view into one slot.
+fn _view_store(d as *Vp9RefView, f as *Vp9RefFrame) as void {
+    d.view.width = f.view.width;
+    d.view.height = f.view.height;
+    d.view.coded_width = f.view.coded_width;
+    d.view.coded_height = f.view.coded_height;
+    d.view.y = f.view.y;
+    d.view.u = f.view.u;
+    d.view.v = f.view.v;
+    d.view.stride_y = f.view.stride_y;
+    d.view.stride_u = f.view.stride_u;
+    d.view.stride_v = f.view.stride_v;
+    d.view.pixels = f.view.pixels;
+    d.view.cap = f.view.cap;
+
+    d.profile = f.profile;
+    d.bit_depth = f.bit_depth;
+    d.subsampling_x = f.subsampling_x;
+    d.subsampling_y = f.subsampling_y;
+    d.color_space = f.color_space;
+    d.color_range = f.color_range;
+    d.render_width = f.render_width;
+    d.render_height = f.render_height;
+    d.id = f.id;
+    d.order = f.order;
+    d.valid = 1;
+}
+
+// Clear the eight slots. The caller's memory is untouched and remains the
+// caller's to release.
+fn vp9_refs_init(slot_map as *Vp9Refs) as void {
+    if (cast(i64, slot_map) == 0) { return; }
+    let is i64 as i with mut = 0;
+    while (i < t.VP9_REF_FRAMES) {
+        _view_clear(&slot_map.map[i]);
+        i = i + 1;
+    }
+}
+
+// Clear the slots and the Vp9State reference mirror together, for decoder
+// open or for a resync path that discards every reference. The probability
+// contexts and the last-frame record are not touched; a full decode reset
+// still calls vp9_state_init. Anything referencing the old frames is gone,
+// so no subsequent inter frame can select a stale slot.
+fn vp9_refs_reset(state as *t.Vp9State, slot_map as *Vp9Refs) as i64 {
+    if (cast(i64, state) == 0 || cast(i64, slot_map) == 0) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as i with mut = 0;
+    while (i < t.VP9_REF_FRAMES) {
+        _view_clear(&slot_map.map[i]);
+        state.ref_width[i] = 0;
+        state.ref_height[i] = 0;
+        state.ref_valid[i] = 0;
+        state.ref_profile[i] = 0;
+        state.ref_bit_depth[i] = 0;
+        state.ref_ss_x[i] = 0;
+        state.ref_ss_y[i] = 0;
+        state.ref_color_space[i] = 0;
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// 1 when slot idx holds a published frame, 0 otherwise (including a null
+// map or an out-of-range index; this is a predicate, not a validator).
+fn vp9_refs_valid(slot_map as *Vp9Refs, idx as i64) as i64 {
+    if (cast(i64, slot_map) == 0) { return 0; }
+    if (idx < 0 || idx >= t.VP9_REF_FRAMES) { return 0; }
+    return slot_map.map[idx].valid;
+}
+
+// Copy one slot's view out. Used by inter prediction before it builds a
+// predictor, and by anything that needs the reference geometry. Returns 0,
+// I_BADPARAM for a null argument or index outside 0..7, or I_CORRUPT when
+// the slot has never been published.
+fn vp9_refs_get(slot_map as *Vp9Refs, idx as i64,
+                out as *Vp9RefView) as i64 {
+    if (cast(i64, slot_map) == 0 || cast(i64, out) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (idx < 0 || idx >= t.VP9_REF_FRAMES) { return errno.I_BADPARAM; }
+    if (slot_map.map[idx].valid == 0) { return errno.I_CORRUPT; }
+    _view_copy(out, &slot_map.map[idx]);
+    return errno.I_OK;
+}
+
+// 1 when slot idx is published and matches the current frame in the five
+// properties section 7.2 requires: profile, bit depth, both subsampling
+// flags and color space. Color range is not part of the requirement.
+fn vp9_refs_format_matches(slot_map as *Vp9Refs, idx as i64,
+                           profile as i64, bit_depth as i64,
+                           ss_x as i64, ss_y as i64,
+                           color_space as i64) as i64 {
+    if (cast(i64, slot_map) == 0) { return 0; }
+    if (idx < 0 || idx >= t.VP9_REF_FRAMES) { return 0; }
+    if (slot_map.map[idx].valid == 0) { return 0; }
+    if (slot_map.map[idx].profile != profile) { return 0; }
+    if (slot_map.map[idx].bit_depth != bit_depth) { return 0; }
+    if (slot_map.map[idx].subsampling_x != ss_x) { return 0; }
+    if (slot_map.map[idx].subsampling_y != ss_y) { return 0; }
+    if (slot_map.map[idx].color_space != color_space) { return 0; }
+    return 1;
+}
+
+// Validate one reference at use time. Returns 0, I_BADPARAM for a null map
+// or an index outside 0..7, or I_CORRUPT when the slot is unpublished or
+// its format disagrees with the current frame. This repeats at use what the
+// stage 3 header already checked, because the tile decoder may only read a
+// slot that publish filled.
+fn vp9_refs_check_use(slot_map as *Vp9Refs, idx as i64,
+                      profile as i64, bit_depth as i64,
+                      ss_x as i64, ss_y as i64,
+                      color_space as i64) as i64 {
+    if (cast(i64, slot_map) == 0) { return errno.I_BADPARAM; }
+    if (idx < 0 || idx >= t.VP9_REF_FRAMES) { return errno.I_BADPARAM; }
+    if (slot_map.map[idx].valid == 0) { return errno.I_CORRUPT; }
+    if (vp9_refs_format_matches(slot_map, idx, profile, bit_depth,
+                                ss_x, ss_y, color_space) == 0) {
+        return errno.I_CORRUPT;
+    }
+    return errno.I_OK;
+}
+
+// Validate all three ref_frame_idx entries of an inter frame against the
+// current frame's format. show_existing frames and intra frames select no
+// references and return 0. The size-ratio requirement of section 7.2.5 is
+// not part of this check; scale.cst owns it.
+fn vp9_refs_check_header(slot_map as *Vp9Refs,
+                         h as *hdr.Vp9Header) as i64 {
+    if (cast(i64, slot_map) == 0 || cast(i64, h) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (h.show_existing_frame == 1) { return errno.I_OK; }
+    if (h.frame_is_intra == 1) { return errno.I_OK; }
+
+    let is i64 as i with mut = 0;
+    while (i < t.VP9_REFS_PER_FRAME) {
+        let is i64 as idx = h.ref_frame_idx[i];
+        if (idx < 0 || idx >= t.VP9_REF_FRAMES) { return errno.I_CORRUPT; }
+        if (slot_map.map[idx].valid == 0) { return errno.I_CORRUPT; }
+        if (slot_map.map[idx].profile != h.profile) { return errno.I_CORRUPT; }
+        if (slot_map.map[idx].bit_depth != h.bit_depth) {
+            return errno.I_CORRUPT;
+        }
+        if (slot_map.map[idx].subsampling_x != h.subsampling_x) {
+            return errno.I_CORRUPT;
+        }
+        if (slot_map.map[idx].subsampling_y != h.subsampling_y) {
+            return errno.I_CORRUPT;
+        }
+        if (slot_map.map[idx].color_space != h.color_space) {
+            return errno.I_CORRUPT;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── buffer geometry ─────────────────────────────────────────────────
+
+// Coded size for a visible width x height, rounded up to the 8-sample
+// motion-vector grid the reconstruction walks (MiCols * 8 x MiRows * 8).
+// Blocks may extend past the visible edge into that grid, never past it.
+// Returns 0, I_BADPARAM for a null out pointer, or I_DIMS for a dimension
+// outside 1..VP9_REF_MAX_DIM. Both outputs are written only on success.
+fn vp9_refs_coded_size(width as i64, height as i64,
+                       out_width as *i64, out_height as *i64) as i64 {
+    if (cast(i64, out_width) == 0 || cast(i64, out_height) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (width < 1 || width > VP9_REF_MAX_DIM) { return errno.I_DIMS; }
+    if (height < 1 || height > VP9_REF_MAX_DIM) { return errno.I_DIMS; }
+    let is i64 as cw = ((width + 7) / 8) * 8;
+    let is i64 as ch = ((height + 7) / 8) * 8;
+    if (cw > VP9_REF_MAX_DIM || ch > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    *out_width = cw;
+    *out_height = ch;
+    return errno.I_OK;
+}
+
+// Bytes an I420 frame of this visible size needs at the coded size above.
+// The count is computed by core/frame with overflow checks and is bounded by
+// FRAME_MAX_DIM, so a hostile 16-bit header can never turn into a huge
+// allocation request. Returns a positive count or a negative error.
+fn vp9_refs_frame_bytes(width as i64, height as i64) as i64 {
+    let is i64 as cw with mut = 0;
+    let is i64 as ch with mut = 0;
+    let is i64 as r = vp9_refs_coded_size(width, height, &cw, &ch);
+    if (r < 0) { return r; }
+    return fr.frame_size(cw, ch);
+}
+
+// 1 when the free range at mem, cap bytes long, cannot host a frame of
+// width x height and the caller must allocate, 0 when its capacity suffices
+// and the caller only has to form the view with frame_alloc_coded. A null
+// pointer answers 1 (nothing is allocated) when the capacity itself is
+// valid. This is the capacity half of the transient-buffer contract: the
+// range must already be free, because reconstruction never reuses a
+// published slot (see vp9_refs_buffer_publishable). Returns a negative code
+// for bad arguments.
+fn vp9_refs_buffer_needs_resize(mem as *u8, cap as i64,
+                                width as i64, height as i64) as i64 {
+    let is i64 as bytes = vp9_refs_frame_bytes(width, height);
+    if (bytes < 0) { return bytes; }
+    if (cap < 0 || cap > fr.FRAME_MAX_BYTES) { return errno.I_BADPARAM; }
+    if (cast(i64, mem) == 0) { return 1; }
+    if (cap < bytes) { return 1; }
+    return 0;
+}
+
+// 1 while any published slot still names frame id, 0 otherwise. The caller
+// may release the buffer only when this returns 0; slots that share one
+// decoded frame all carry that frame's id. A transient buffer that has not
+// been published yet is named by no slot, so this predicate does not protect
+// it: the caller keeps the decode target alive through reconstruction and
+// publish and must not hand it to another frame.
+fn vp9_refs_buffer_in_use(slot_map as *Vp9Refs, id as i64) as i64 {
+    if (cast(i64, slot_map) == 0 || id < 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < t.VP9_REF_FRAMES) {
+        if (slot_map.map[i].valid == 1 && slot_map.map[i].id == id) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 1 when the range at mem, cap bytes long, overlaps any published slot's
+// pixel block; 0 otherwise. Refresh flags are deliberately absent: a frame
+// may select through ref_frame_idx the same slot its refresh_frame_flags
+// later overwrites, so a refreshed slot is still live memory while the frame
+// is being reconstructed. Both ranges are non-wrapping: publish validated the
+// block it stored, and callers bound cap before calling.
+fn _overlap(slot_map as *Vp9Refs, mem as *u8, cap as i64) as i64 {
+    let is i64 as a0 = cast(i64, mem);
+    let is i64 as a1 = a0 + cap;
+    let is i64 as i with mut = 0;
+    while (i < t.VP9_REF_FRAMES) {
+        if (slot_map.map[i].valid == 1) {
+            let is i64 as s0 = cast(i64, slot_map.map[i].view.pixels);
+            let is i64 as s1 = s0 + slot_map.map[i].view.cap;
+            if (cap > 0 && a0 < s1 && s0 < a1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 1 when the range at mem, cap bytes long, is named by no published
+// reference slot, so the caller may reconstruct a frame there and publish
+// it. 0 means the range is still a live reference and decoding there would
+// change that reference's pixels; publish rejects the frame afterwards.
+// There is no refresh exception: the frame may predict from the same slot it
+// refreshes. This is the check to make before decoding, not after. A null
+// map or pointer, a negative or oversized capacity, or an address that could
+// wrap answers 0.
+fn vp9_refs_buffer_publishable(slot_map as *Vp9Refs, mem as *u8,
+                               cap as i64) as i64 {
+    if (cast(i64, slot_map) == 0 || cast(i64, mem) == 0) { return 0; }
+    if (cap < 0 || cap > fr.FRAME_MAX_BYTES) { return 0; }
+    // A user-space pointer is positive as i64; rejecting the rest keeps
+    // mem + cap from wrapping and makes the range comparison meaningful.
+    let is i64 as a0 = cast(i64, mem);
+    if (a0 <= 0 || a0 > 9223372036854775807 - cap) { return 0; }
+    if (_overlap(slot_map, mem, cap) == 1) { return 0; }
+    return 1;
+}
+
+// ── source validation ───────────────────────────────────────────────
+
+// Everything publish needs to know about a reconstructed frame, checked
+// before any slot or state field is written.
+fn _source_ok(f as *Vp9RefFrame) as i64 {
+    if (f.valid != 1) { return errno.I_BADPARAM; }
+    if (f.key_frame != 0 && f.key_frame != 1) { return errno.I_BADPARAM; }
+    if (f.refresh_flags < 0 || f.refresh_flags > 0xFF) {
+        return errno.I_BADPARAM;
+    }
+    // A key frame refreshes every slot (section 6.2). Accepting anything
+    // else would leave a slot with the previous format or size alive while
+    // the header has already moved the stream to the new one.
+    if (f.key_frame == 1 && f.refresh_flags != 0xFF) {
+        return errno.I_CORRUPT;
+    }
+    // Profile 0 is all this library decodes; a caller that got here with
+    // another format has a broken pipeline, not a stream to guess at.
+    if (f.profile != 0) { return errno.I_UNSUPPORTED; }
+    if (f.bit_depth != 8) { return errno.I_UNSUPPORTED; }
+    if (f.subsampling_x != 1 || f.subsampling_y != 1) {
+        return errno.I_UNSUPPORTED;
+    }
+    if (f.color_space < 0 || f.color_space > 6) { return errno.I_CORRUPT; }
+    if (f.color_range < 0 || f.color_range > 1) { return errno.I_CORRUPT; }
+    if (f.id < 0) { return errno.I_BADPARAM; }
+    if (f.order < 0) { return errno.I_BADPARAM; }
+    if (f.render_width < 1 || f.render_width > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    if (f.render_height < 1 || f.render_height > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+
+    if (f.view.width < 1 || f.view.width > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    if (f.view.height < 1 || f.view.height > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    if (f.view.coded_width < f.view.width
+        || f.view.coded_width > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    if (f.view.coded_height < f.view.height
+        || f.view.coded_height > VP9_REF_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    // Reconstruction writes whole blocks on the 8-sample motion-vector
+    // grid; a buffer smaller than that grid would already have been
+    // overrun, and must never become a reference.
+    let is i64 as grid_w with mut = 0;
+    let is i64 as grid_h with mut = 0;
+    let is i64 as grid = vp9_refs_coded_size(f.view.width, f.view.height,
+                                             &grid_w, &grid_h);
+    if (grid < 0) { return grid; }
+    if (f.view.coded_width < grid_w || f.view.coded_height < grid_h) {
+        return errno.I_DIMS;
+    }
+    if (cast(i64, f.view.pixels) <= 0) { return errno.I_BADPARAM; }
+    if (cast(i64, f.view.y) == 0
+        || cast(i64, f.view.u) == 0
+        || cast(i64, f.view.v) == 0) {
+        return errno.I_BADPARAM;
+    }
+    // core/frame carves the block as luma first; anything else would make
+    // the capacity arithmetic below describe a layout the decoder does not
+    // use.
+    if (cast(i64, f.view.y) != cast(i64, f.view.pixels)) {
+        return errno.I_BADPARAM;
+    }
+    if (f.view.cap < 0 || f.view.cap > fr.FRAME_MAX_BYTES) {
+        return errno.I_BADPARAM;
+    }
+    // The overlap check forms pixels + cap; keep that range representable.
+    if (cast(i64, f.view.pixels) > 9223372036854775807 - f.view.cap) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as cw = (f.view.coded_width + 1) / 2;
+    let is i64 as ch = (f.view.coded_height + 1) / 2;
+    if (f.view.stride_y < f.view.coded_width) { return errno.I_BADPARAM; }
+    if (f.view.stride_u < cw) { return errno.I_BADPARAM; }
+    if (f.view.stride_v < cw) { return errno.I_BADPARAM; }
+
+    let is i64 as need = fr.frame_size(f.view.coded_width,
+                                       f.view.coded_height);
+    if (need < 0) { return need; }
+    if (f.view.cap < need) { return errno.I_NOMEM; }
+
+    // Capacity is only sound if the planes, with the caller's strides, end
+    // inside the block. This permits aligned strides larger than the coded
+    // width but rejects overlapping or truncated layouts.
+    let is i64 as y_rows = fr.frame_mul(f.view.coded_height - 1,
+                                        f.view.stride_y);
+    if (y_rows < 0) { return y_rows; }
+    let is i64 as y_end = fr.frame_add(y_rows, f.view.coded_width);
+    if (y_end < 0) { return y_end; }
+
+    let is i64 as u_off = cast(i64, f.view.u) - cast(i64, f.view.pixels);
+    let is i64 as v_off = cast(i64, f.view.v) - cast(i64, f.view.pixels);
+    if (u_off < y_end) { return errno.I_BADPARAM; }
+
+    let is i64 as u_rows = fr.frame_mul(ch - 1, f.view.stride_u);
+    if (u_rows < 0) { return u_rows; }
+    let is i64 as u_end = fr.frame_add(fr.frame_add(u_off, u_rows), cw);
+    if (u_end < 0) { return u_end; }
+    if (v_off < u_end) { return errno.I_BADPARAM; }
+
+    let is i64 as v_rows = fr.frame_mul(ch - 1, f.view.stride_v);
+    if (v_rows < 0) { return v_rows; }
+    let is i64 as v_end = fr.frame_add(fr.frame_add(v_off, v_rows), cw);
+    if (v_end < 0) { return v_end; }
+    if (v_end > f.view.cap) { return errno.I_NOMEM; }
+    return errno.I_OK;
+}
+
+// 1 when the source buffer is named by any published slot. The caller
+// reconstructed over a live reference, whose pixels have already changed:
+// the frame must be decoded into a free/transient buffer instead, and the
+// slot it damaged (if any) cannot be recovered from this publish.
+fn _conflict(slot_map as *Vp9Refs, f as *Vp9RefFrame) as i64 {
+    return _overlap(slot_map, f.view.pixels, f.view.cap);
+}
+
+// ── reference frame update (section 8.10, step 1) ───────────────────
+
+// Publish a reconstructed frame into the slots named by refresh_flags and
+// mirror the result into Vp9State.
+//
+// The source buffer must be a free/transient range: no published slot may
+// name it, even one this frame refreshes. The rule also applies when
+// refresh_flags is 0, because decoding into a slot corrupts it whether or
+// not the result is stored. Use vp9_refs_buffer_publishable before
+// decoding.
+//
+// Returns 0; I_BADPARAM for a null argument, an unpublished/invalid source
+// frame, a bad id/order or a buffer named by a published slot;
+// I_UNSUPPORTED for a format this library does not decode; I_CORRUPT for an
+// impossible format value or a key frame that does not refresh all slots;
+// I_DIMS for an out-of-range dimension; I_NOMEM for a view too small for its
+// own coded size. Nothing is written on failure.
+//
+// refresh_flags == 0 is legal (a frame that is shown but not stored): it
+// changes no slot, and section 8.10 step 2's PrevRefFrames/PrevMvs update is
+// outside this module. A key frame must pass 0xFF.
+fn vp9_refs_publish(state as *t.Vp9State, slot_map as *Vp9Refs,
+                    frame as *Vp9RefFrame) as i64 {
+    if (cast(i64, state) == 0 || cast(i64, slot_map) == 0
+        || cast(i64, frame) == 0) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as r = _source_ok(frame);
+    if (r < 0) { return r; }
+    if (_conflict(slot_map, frame) == 1) { return errno.I_BADPARAM; }
+
+    let is i64 as i with mut = 0;
+    while (i < t.VP9_REF_FRAMES) {
+        if (((frame.refresh_flags >> i) & 1) == 1) {
+            _view_store(&slot_map.map[i], frame);
+        }
+        i = i + 1;
+    }
+
+    // The single writer of Vp9State.ref_*: same visible geometry and format
+    // the slots just recorded, for the stage 3 header's next frame.
+    t.vp9_state_publish(state, frame.refresh_flags,
+                        frame.view.width, frame.view.height,
+                        frame.profile, frame.bit_depth,
+                        frame.subsampling_x, frame.subsampling_y,
+                        frame.color_space);
+    return errno.I_OK;
+}
+
+// ── output process (section 8.9) ────────────────────────────────────
+
+// Copy the stored view of frame_to_show_map_idx. No pixels are recomputed,
+// no slot is changed and no Vp9State field is touched: a show-existing
+// frame carries refresh_frame_flags 0. The shown frame's visible size,
+// subsampling, bit depth, format and render size all come from the slot,
+// never from the show-existing header, whose geometry fields are zero.
+//
+// Returns 0, I_BADPARAM for a null argument or an index outside 0..7, or
+// I_CORRUPT when the slot has never been published.
+fn vp9_refs_show_existing(slot_map as *Vp9Refs, map_idx as i64,
+                          out as *Vp9RefView) as i64 {
+    if (cast(i64, slot_map) == 0 || cast(i64, out) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (map_idx < 0 || map_idx >= t.VP9_REF_FRAMES) {
+        return errno.I_BADPARAM;
+    }
+    if (slot_map.map[map_idx].valid == 0) { return errno.I_CORRUPT; }
+    _view_copy(out, &slot_map.map[map_idx]);
+    return errno.I_OK;
+}

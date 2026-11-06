@@ -1,0 +1,664 @@
+// =======================================================
+// caustic-av/video/vp9/adapt_bridge.cst
+// Bridge between the probability and count structures of vp9_tables.cst
+// (u8 probabilities, the layout the header and tile decoders use) and those
+// of adapt.cst (i64 probabilities and counts, the layout section 8.4 walks).
+//
+// Why a bridge exists
+// -------------------
+// adapt.cst implements sections 8.3 and 8.4 over its own Vp9Probs,
+// Vp9Counts, Vp9ProbContexts and Vp9Trees. vp9_tables.cst owns the same
+// tables in the byte layout the Boolean decoder reads and in the counter
+// layout the tile decoder increments. The two layouts store the same
+// specification arrays in a different field order, so they cannot be copied
+// as bytes; this module copies element by element, then runs exactly the
+// refresh_probs sequence of section 6.1.2 in adapt.cst and copies the result
+// back.
+//
+// What is copied and when
+// -----------------------
+// One frame context is enough: refresh_probs only loads and saves
+// ctxs.ctx[frame_context_idx]; the other three entries are never read. The
+// bridge therefore imports only that context, the working probabilities and
+// the counts, runs adapt.refresh_probs, and exports the working set plus
+// that context when refresh_frame_context is 1. Counts are per-frame and are
+// never modified by adaptation, so they are imported only.
+//
+// Every exported probability must be 1..255; a value outside that range is a
+// bug in the adaptation call and becomes I_CORRUPT rather than a truncated
+// byte.
+//
+// Nothing here allocates or keeps state between calls. The four structures
+// are caller-owned and live in Vp9Decoder so the decoder struct, not the
+// stack, carries them.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "adapt.cst" as ad;
+use "vp9_tables.cst" as t;
+
+// ── trees ───────────────────────────────────────────────────────────
+
+fn vp9_adapt_trees_init(trees as *ad.Vp9Trees) as i64 {
+    return ad.vp9_trees_init(trees);
+}
+
+// ── probabilities: t.Vp9ProbCtx -> ad.Vp9Probs ──────────────────────
+
+fn _prob_in(r as *t.Vp9ProbCtx, w as *ad.Vp9Probs) as void {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as k with mut = 0;
+
+    i = 0;
+    while (i < 16) {
+        j = 0;
+        while (j < 3) { w.partition_probs[i][j] = cast(i64, r.partition[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 9) { w.y_mode_probs[i][j] = cast(i64, r.y_mode[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 10) {
+        j = 0;
+        while (j < 9) { w.uv_mode_probs[i][j] = cast(i64, r.uv_mode[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) { w.skip_prob[i] = cast(i64, r.skip[i]); i = i + 1; }
+    i = 0;
+    while (i < 4) { w.is_inter_prob[i] = cast(i64, r.is_inter[i]); i = i + 1; }
+    i = 0;
+    while (i < 5) { w.comp_mode_prob[i] = cast(i64, r.comp_mode[i]); i = i + 1; }
+    i = 0;
+    while (i < 5) { w.comp_ref_prob[i] = cast(i64, r.comp_ref[i]); i = i + 1; }
+    i = 0;
+    while (i < 5) {
+        j = 0;
+        while (j < 2) { w.single_ref_prob[i][j] = cast(i64, r.single_ref[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 7) {
+        j = 0;
+        while (j < 3) { w.inter_mode_probs[i][j] = cast(i64, r.inter_mode[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) { w.interp_filter_probs[i][j] = cast(i64, r.interp_filter[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 3) { w.tx_probs[i][j][k] = cast(i64, r.tx[i][j][k]); k = k + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) { w.mv_joint_probs[i] = cast(i64, r.mv_joint[i]); i = i + 1; }
+    i = 0;
+    while (i < 2) { w.mv_sign_prob[i] = cast(i64, r.mv_sign[i]); i = i + 1; }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 10) { w.mv_class_probs[i][j] = cast(i64, r.mv_class[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) { w.mv_class0_bit_prob[i] = cast(i64, r.mv_class0_bit[i]); i = i + 1; }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 10) { w.mv_bits_prob[i][j] = cast(i64, r.mv_bits[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 3) {
+                w.mv_class0_fr_probs[i][j][k] = cast(i64, r.mv_class0_fr[i][j][k]);
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 3) { w.mv_fr_probs[i][j] = cast(i64, r.mv_fr[i][j]); j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) { w.mv_class0_hp_prob[i] = cast(i64, r.mv_class0_hp[i]); i = i + 1; }
+    i = 0;
+    while (i < 2) { w.mv_hp_prob[i] = cast(i64, r.mv_hp[i]); i = i + 1; }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 2) {
+                let is i64 as band with mut = 0;
+                while (band < 6) {
+                    let is i64 as ctx with mut = 0;
+                    while (ctx < 6) {
+                        let is i64 as node with mut = 0;
+                        while (node < 3) {
+                            w.coef_probs[i][j][k][band][ctx][node] =
+                                cast(i64, r.coef[i][j][k][band][ctx][node]);
+                            node = node + 1;
+                        }
+                        ctx = ctx + 1;
+                    }
+                    band = band + 1;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ── probabilities: ad.Vp9Probs -> t.Vp9ProbCtx ──────────────────────
+
+fn _prob_out(w as *ad.Vp9Probs, r as *t.Vp9ProbCtx) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as k with mut = 0;
+
+    i = 0;
+    while (i < 16) {
+        j = 0;
+        while (j < 3) {
+            if (w.partition_probs[i][j] < 1 || w.partition_probs[i][j] > 255) {
+                return errno.I_CORRUPT;
+            }
+            r.partition[i][j] = cast(u8, w.partition_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 9) {
+            if (w.y_mode_probs[i][j] < 1 || w.y_mode_probs[i][j] > 255) { return errno.I_CORRUPT; }
+            r.y_mode[i][j] = cast(u8, w.y_mode_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 10) {
+        j = 0;
+        while (j < 9) {
+            if (w.uv_mode_probs[i][j] < 1 || w.uv_mode_probs[i][j] > 255) { return errno.I_CORRUPT; }
+            r.uv_mode[i][j] = cast(u8, w.uv_mode_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        if (w.skip_prob[i] < 1 || w.skip_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.skip[i] = cast(u8, w.skip_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        if (w.is_inter_prob[i] < 1 || w.is_inter_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.is_inter[i] = cast(u8, w.is_inter_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        if (w.comp_mode_prob[i] < 1 || w.comp_mode_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.comp_mode[i] = cast(u8, w.comp_mode_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        if (w.comp_ref_prob[i] < 1 || w.comp_ref_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.comp_ref[i] = cast(u8, w.comp_ref_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        j = 0;
+        while (j < 2) {
+            if (w.single_ref_prob[i][j] < 1 || w.single_ref_prob[i][j] > 255) { return errno.I_CORRUPT; }
+            r.single_ref[i][j] = cast(u8, w.single_ref_prob[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 7) {
+        j = 0;
+        while (j < 3) {
+            if (w.inter_mode_probs[i][j] < 1 || w.inter_mode_probs[i][j] > 255) { return errno.I_CORRUPT; }
+            r.inter_mode[i][j] = cast(u8, w.inter_mode_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            if (w.interp_filter_probs[i][j] < 1 || w.interp_filter_probs[i][j] > 255) { return errno.I_CORRUPT; }
+            r.interp_filter[i][j] = cast(u8, w.interp_filter_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < i) {
+                if (w.tx_probs[i][j][k] < 1 || w.tx_probs[i][j][k] > 255) { return errno.I_CORRUPT; }
+                r.tx[i][j][k] = cast(u8, w.tx_probs[i][j][k]);
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        if (w.mv_joint_probs[i] < 1 || w.mv_joint_probs[i] > 255) { return errno.I_CORRUPT; }
+        r.mv_joint[i] = cast(u8, w.mv_joint_probs[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        if (w.mv_sign_prob[i] < 1 || w.mv_sign_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.mv_sign[i] = cast(u8, w.mv_sign_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 10) {
+            if (w.mv_class_probs[i][j] < 1 || w.mv_class_probs[i][j] > 255) { return errno.I_CORRUPT; }
+            r.mv_class[i][j] = cast(u8, w.mv_class_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        if (w.mv_class0_bit_prob[i] < 1 || w.mv_class0_bit_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.mv_class0_bit[i] = cast(u8, w.mv_class0_bit_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 10) {
+            if (w.mv_bits_prob[i][j] < 1 || w.mv_bits_prob[i][j] > 255) { return errno.I_CORRUPT; }
+            r.mv_bits[i][j] = cast(u8, w.mv_bits_prob[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 3) {
+                if (w.mv_class0_fr_probs[i][j][k] < 1 || w.mv_class0_fr_probs[i][j][k] > 255) {
+                    return errno.I_CORRUPT;
+                }
+                r.mv_class0_fr[i][j][k] = cast(u8, w.mv_class0_fr_probs[i][j][k]);
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 3) {
+            if (w.mv_fr_probs[i][j] < 1 || w.mv_fr_probs[i][j] > 255) { return errno.I_CORRUPT; }
+            r.mv_fr[i][j] = cast(u8, w.mv_fr_probs[i][j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        if (w.mv_class0_hp_prob[i] < 1 || w.mv_class0_hp_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.mv_class0_hp[i] = cast(u8, w.mv_class0_hp_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        if (w.mv_hp_prob[i] < 1 || w.mv_hp_prob[i] > 255) { return errno.I_CORRUPT; }
+        r.mv_hp[i] = cast(u8, w.mv_hp_prob[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 2) {
+                let is i64 as band with mut = 0;
+                while (band < 6) {
+                    let is i64 as ctx with mut = 0;
+                    while (ctx < 6) {
+                        let is i64 as node with mut = 0;
+                        // Band 0 has only three previous-coefficient
+                        // contexts; [0][3..5] are the specification's unused
+                        // zeros and adaptation never touches them.
+                        if (!(band == 0 && ctx >= 3)) {
+                            while (node < 3) {
+                                let is i64 as v = w.coef_probs[i][j][k][band][ctx][node];
+                                if (v < 1 || v > 255) { return errno.I_CORRUPT; }
+                                r.coef[i][j][k][band][ctx][node] = cast(u8, v);
+                                node = node + 1;
+                            }
+                        }
+                        ctx = ctx + 1;
+                    }
+                    band = band + 1;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── counts: t.Vp9Counts -> ad.Vp9Counts ─────────────────────────────
+
+fn _counts_in(r as *t.Vp9Counts, w as *ad.Vp9Counts) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as j with mut = 0;
+    let is i64 as k with mut = 0;
+    let is i64 as l with mut = 0;
+
+    i = 0;
+    while (i < 16) {
+        j = 0;
+        while (j < 4) {
+            w.counts_partition[i][j] = r.partition[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 10) {
+            w.counts_intra_mode[i][j] = r.y_mode[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 10) {
+        j = 0;
+        while (j < 10) {
+            w.counts_uv_mode[i][j] = r.uv_mode[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        j = 0;
+        while (j < 2) { w.counts_skip[i][j] = r.skip[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) { w.counts_is_inter[i][j] = r.is_inter[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        j = 0;
+        while (j < 2) { w.counts_comp_mode[i][j] = r.comp_mode[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        j = 0;
+        while (j < 2) { w.counts_comp_ref[i][j] = r.comp_ref[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 5) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 2) {
+                w.counts_single_ref[i][j][k] = r.single_ref[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 7) {
+        j = 0;
+        while (j < 4) {
+            w.counts_inter_mode[i][j] = r.inter_mode[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 3) {
+            w.counts_interp_filter[i][j] = r.interp_filter[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 4) {
+                w.counts_tx_size[i][j][k] = r.tx[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) { w.counts_mv_joint[i] = r.mv_joint[i]; i = i + 1; }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) { w.counts_mv_sign[i][j] = r.mv_sign[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 11) { w.counts_mv_class[i][j] = r.mv_class[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) { w.counts_mv_class0_bit[i][j] = r.mv_class0_bit[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 10) {
+            k = 0;
+            while (k < 2) {
+                w.counts_mv_bits[i][j][k] = r.mv_bits[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 4) {
+                w.counts_mv_class0_fr[i][j][k] = r.mv_class0_fr[i][j][k];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) { w.counts_mv_class0_hp[i][j] = r.mv_class0_hp[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 4) { w.counts_mv_fr[i][j] = r.mv_fr[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        j = 0;
+        while (j < 2) { w.counts_mv_hp[i][j] = r.mv_hp[i][j]; j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 2) {
+                let is i64 as band with mut = 0;
+                while (band < 6) {
+                    let is i64 as ctx with mut = 0;
+                    while (ctx < 6) {
+                        let is i64 as node with mut = 0;
+                        while (node < 3) {
+                            w.counts_token[i][j][k][band][ctx][node] =
+                                r.token[i][j][k][band][ctx][node];
+                            node = node + 1;
+                        }
+                        ctx = ctx + 1;
+                    }
+                    band = band + 1;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        j = 0;
+        while (j < 2) {
+            k = 0;
+            while (k < 2) {
+                let is i64 as band with mut = 0;
+                while (band < 6) {
+                    let is i64 as ctx with mut = 0;
+                    while (ctx < 6) {
+                        l = 0;
+                        while (l < 2) {
+                            w.counts_more_coefs[i][j][k][band][ctx][l] =
+                                r.more_coefs[i][j][k][band][ctx][l];
+                            l = l + 1;
+                        }
+                        ctx = ctx + 1;
+                    }
+                    band = band + 1;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── one frame's §6.1.2 refresh probs ────────────────────────────────
+
+// Import the current frame's working probabilities, the one saved context
+// refresh_probs may load, and the counts; run adapt.cst's refresh_probs;
+// export the working set and, when the frame saves its context, that
+// context. All other context slots stay untouched.
+fn vp9_adapt_frame(st as *t.Vp9State, w as *ad.Vp9Probs,
+                   cnt as *ad.Vp9Counts, ctxs as *ad.Vp9ProbContexts,
+                   trees as *ad.Vp9Trees,
+                   frame_context_idx as i64,
+                   error_resilient_mode as i64,
+                   frame_parallel_decoding_mode as i64,
+                   frame_is_intra as i64,
+                   refresh_frame_context as i64,
+                   last_frame_type as i64,
+                   interpolation_filter as i64,
+                   tx_mode as i64,
+                   allow_high_precision_mv as i64) as i64 {
+    if (cast(i64, st) == 0 || cast(i64, w) == 0 || cast(i64, cnt) == 0
+        || cast(i64, ctxs) == 0 || cast(i64, trees) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (frame_context_idx < 0 || frame_context_idx >= 4) {
+        return errno.I_BADPARAM;
+    }
+
+    _prob_in(&st.probs, w);
+    _prob_in(&st.ctxs[frame_context_idx], &ctxs.ctx[frame_context_idx]);
+    let is i64 as r with mut = _counts_in(&st.counts, cnt);
+    if (r < 0) { return r; }
+
+    r = ad.refresh_probs(w, cnt, ctxs, trees, frame_context_idx,
+                         error_resilient_mode, frame_parallel_decoding_mode,
+                         frame_is_intra, refresh_frame_context,
+                         last_frame_type, interpolation_filter, tx_mode,
+                         allow_high_precision_mv);
+    if (r < 0) { return r; }
+
+    r = _prob_out(w, &st.probs);
+    if (r < 0) { return r; }
+
+    if (refresh_frame_context == 1) {
+        r = _prob_out(&ctxs.ctx[frame_context_idx],
+                      &st.ctxs[frame_context_idx]);
+        if (r < 0) { return r; }
+        st.ctx_init[frame_context_idx] = 1;
+    }
+    return errno.I_OK;
+}
