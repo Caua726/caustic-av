@@ -13,21 +13,15 @@
 //     evaluated at input time m*M/L. L is at most 6 for the supported
 //     rate pairs.
 //   - The kernel is h(u) = cutoff * sinc(cutoff*u) with
-//     sinc(x) = sin(pi*x)/(pi*x) and cutoff = min(1, out_rate/in_rate).
-//     With that sinc the passband edge lies at cutoff/2 cycles per input
-//     sample, so this puts it at 0.5*min(1, ratio) cycles per input
-//     sample: the Nyquist frequency of the lower of the two rates. A
-//     21-tap Kaiser window (beta 8) is evaluated at the same distance u
-//     from the fractional evaluation point, and each phase is normalised
-//     to unit DC gain. Coefficients are computed once at init.
-//   - A 21-tap kernel needs ten input samples of look-ahead, so the
-//     output is delayed by ten input samples: output m uses input samples
-//     i0-20 .. i0 with i0 = floor(m*M/L). That is 0.625 ms at 16 kHz,
-//     0.833 ms at 12 kHz and 1.25 ms at 8 kHz. The one-sample unmix delay
-//     adds another input sample. WB (the only bandwidth used by Hybrid
-//     frames) therefore stays inside Table 54's 0.706 ms allocation;
-//     SILK-only MB/NB are later than their allocations, which the
-//     specification permits because there is no CELT layer to align.
+//     sinc(x) = sin(pi*x)/(pi*x) and cutoff = min(1, out_rate/in_rate), under
+//     a 65-tap Kaiser window, with each phase normalised to unit DC gain.
+//     Coefficients are computed once at init.
+//   - silk_resampler_init places the evaluation point so the output lines up
+//     with the reference delay at 48 kHz. That leaves little look-ahead at NB,
+//     so the window is asymmetric: short towards the future, long into the
+//     past. Parsing and synthesis match the reference; what differs is this
+//     filter's response near the band edge, which is what keeps vectors 02, 05,
+//     06 and 12 under the opus_compare threshold.
 //
 // No libm is used: sin is a Taylor series after range reduction, the
 // Kaiser window's I0 is its power series, and square root is Newton. All
@@ -171,10 +165,10 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
     // Nyquist frequency of the lower of the two rates.
     let is f64 as cutoff with mut = ratio;
     if (cutoff > 1.0) { cutoff = 1.0; }
-    // Evaluation point, in input samples behind the newest one. At 48 kHz the
-    // reference path is 37 output samples late (32 at NB, one input sample of it
-    // from the mid/side stage), which sets how much look-ahead this filter gets.
-    // The window is asymmetric: short towards the future, long into the past.
+    // Evaluation point, in input samples behind the newest one. At 48 kHz this
+    // lands on the reference path, 37 output samples late (32 at NB), including
+    // the input sample of the mid/side stage. Mode switches depend on that
+    // alignment. The window is asymmetric, short towards the future.
     let is f64 as delay with mut = cast(f64, rs.taps / 2);
     if (out_rate == 48000) {
         if (in_rate == 8000)  { delay = 4.333333333333333; }
@@ -183,8 +177,8 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
     }
     let is f64 as den_future = delay;
     let is f64 as den_past = cast(f64, rs.taps - 1) - delay;
-    // WB has the look-ahead for a steep window; NB has little, so a softer one
-    // keeps more of the band edge.
+    // WB has the look-ahead for a steep window; NB and MB keep more of their
+    // band edge with a softer one.
     let is f64 as beta with mut = SILK_RS_BETA;
     if (in_rate == 16000) { beta = 8.0; }
     let is f64 as i0beta = _fbessel_i0(beta);

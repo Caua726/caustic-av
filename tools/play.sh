@@ -1,8 +1,8 @@
 #!/bin/sh
 # Mini player: caustic-av decodes the video, mpv shows the frames.
 #
-#   tools/play.sh <file>        real time with audio, no seeking; needs the
-#                               decoder to keep up with the video
+#   tools/play.sh <file>        real time, video and audio from our decoder, no
+#                               seeking; needs the decoder to keep up
 #   tools/play.sh <file> live   frames shown as they are decoded, silent, for
 #                               videos the decoder cannot keep up with
 #   tools/play.sh <file> <N>    decode the first N seconds, then play them at
@@ -25,8 +25,22 @@ raw="--demuxer=rawvideo --demuxer-rawvideo-w=$w --demuxer-rawvideo-h=$h
   --title=caustic-av"
 
 if [ "$secs" = 0 ]; then
-  "$dec" --yuv --threads "$threads" "$in" 2>/dev/null | mpv $raw \
-    --audio-file="$in" ${MPV_ARGS:-} -
+  # Video and audio both come from our decoder; the audio travels by FIFO.
+  a=$(ffprobe -v error -select_streams a:0 \
+    -show_entries stream=sample_rate,channels -of csv=p=0 "$in")
+  if [ -z "$a" ]; then
+    "$dec" --yuv --threads "$threads" "$in" 2>/dev/null | mpv $raw --no-audio ${MPV_ARGS:-} -
+    exit
+  fi
+  rate=$(echo "$a" | cut -d, -f1)
+  ch=$(echo "$a" | cut -d, -f2)
+  fifo=$(mktemp -u "${TMPDIR:-.}/play.XXXXXX.pcm")
+  mkfifo "$fifo"
+  trap 'rm -f "$fifo"' EXIT INT TERM
+  "$dec" --yuv --pcm "$fifo" --threads "$threads" "$in" 2>/dev/null | mpv $raw \
+    --audio-file="$fifo" --audio-demuxer=rawaudio \
+    --demuxer-rawaudio-format=s16le --demuxer-rawaudio-rate="$rate" \
+    --demuxer-rawaudio-channels="$ch" ${MPV_ARGS:-} -
   exit
 fi
 
