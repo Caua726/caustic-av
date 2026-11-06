@@ -7,7 +7,7 @@
 #
 # The decoder is slower than real time, and a pipe cannot seek, so only the
 # second form can keep speed and audio. Build first with:
-#   caustic -O1 examples/decode.cst -o build/decode
+#   caustic -O2 examples/decode.cst -o build/decode
 set -eu
 in=$1
 secs=${2:-0}
