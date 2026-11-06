@@ -47,8 +47,12 @@ fn _norm_shift(range as i64) as i64 {
 // byte, or fail. `need` is at most seven (the largest renormalisation).
 fn _fill(b as *Vp9Bool, need as i64) as i64 {
     while (b.win_bits - 8 < need) {
-        if (b.budget < 8) { return errno.I_CORRUPT; }
-        if (b.pos >= b.len) { return errno.I_CORRUPT; }
+        // Past the end of the data the value is padded with zero bits
+        // (section 9.2.2), which is what a truncated last symbol relies on.
+        if (b.budget < 8 || b.pos >= b.len) {
+            b.win_bits = b.win_bits + 8;
+            continue;
+        }
         let is i64 as shift = 64 - b.win_bits - 8;
         if (shift < 0) { return errno.I_CORRUPT; }
         let is u64 as w with mut = cast(u64, b.win);
