@@ -107,6 +107,11 @@ For scale: a worker slot is about 56 KiB at 1080p and about 119 KiB at the
 inter scratch 20.2 KiB); 16 workers therefore need roughly 0.9-1.9 MiB,
 plus 2 MiB of stack per spawned thread created by `std/thread.cst`.
 
+The decoder modules themselves still allocate nothing; the only
+allocation on this path is inside `std/thread.cst`, which mmaps a 2 MiB
+stack per spawned worker and unmaps it in `join`. A caller that cannot
+tolerate that should keep the sequential path (no block, count 0).
+
 Threads are spawned per frame, never kept idle between frames: for a frame
 with `k` workers, workers `1..k-1` are spawned, worker 0 runs on the caller
 thread, and every started worker is joined before `tile_decode_all`

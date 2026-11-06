@@ -42,7 +42,11 @@
 //     decode target that no published slot names always exists. Every buffer
 //     is caller-owned and must stay alive while a reference slot names it;
 //     vp9_refs_buffer_in_use answers when it is safe to reuse or free one.
-// Both are the caller's to free; vp9_decoder_free only drops views.
+//     With tile threads enabled, a fourth caller block holds the per-worker
+//     contexts (vp9_decoder_bind_threads).
+// Both are the caller's to free; vp9_decoder_free only drops views. The one
+// allocation on the threaded path is inside std/thread.cst (a 2 MiB stack
+// per spawned worker, unmapped by join).
 //
 // Threads
 // -------

@@ -203,6 +203,9 @@ fn _tile_worker(arg as i64) as i64 {
 fn _tile_decode_mt(b as *blk.Vp9Blk, data as *u8, len as i64,
                    h as *hd.Vp9Header, cols as i64, rows as i64,
                    th as *threads.Vp9Threads, k as i64) as i64 {
+    // The pool clamps to its own slot count; this keeps the job array safe
+    // even if the two constants ever drift apart.
+    if (k < 2 || k > TILE_MT_MAX) { return errno.I_BADPARAM; }
     let is i64 as ti with mut = 0;
     let is i64 as count = cols * rows;
     while (ti < count) {
