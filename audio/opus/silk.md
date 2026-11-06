@@ -87,8 +87,10 @@ cap, frames_out)` decodes the SILK part of **one Opus frame**.
    - the side frame uses conditional coding except at the first interval or
      after a skipped side frame (`SILK_COND_INDEP_NOLTP`: absolute gains and
      pitch, no LTP-scaling field, no interpolation).
-   - a mid-only interval zeroes the side signal and resets the side
-     channel, so its next frame starts from a known zero LTP/LPC state.
+   - a mid-only interval zeroes this interval's side signal and resets
+     the side channel, so its next frame starts from a known zero LTP/LPC
+     state; the previous side sample is still used at the first unmix
+     sample, as 4.2.8 requires.
 8. Output: for stereo-in/stereo-out the mid/side pair is unmixed (4.2.8);
    otherwise the mid signal is delayed by one sample. Mono output of a
    stereo stream is the mid channel, matching the reference. The result is
@@ -173,19 +175,25 @@ adjustment of the filter history is needed.
 
 The resampler is deliberately non-normative (4.2.9): the decoder may choose
 any method. This one is a 21-tap polyphase Kaiser-windowed sinc, designed
-in `silk_resample.cst`, with cutoff at the lower Nyquist, per-phase DC
-normalisation, and coefficients computed once at init from a Taylor sin,
-the power series for I0 and Newton square root. It supports
+in `silk_resample.cst`: `h(u) = cutoff*sinc(cutoff*u)` with
+`sinc(x) = sin(pi*x)/(pi*x)` and `cutoff = min(1, out/in)`, which places
+the passband edge at 0.5*min(1, out/in) cycles per input sample, i.e. at
+the Nyquist frequency of the lower of the two rates. The Kaiser window
+(beta 8) is evaluated at the same distance `u` as the sinc, so the kernel
+is centred on the fractional evaluation point. Each phase is normalised to
+unit DC gain, and coefficients are computed once at init from a Taylor
+sin, the power series for I0 and Newton square root. It supports
 8/12/16 → 8/12/16/24/48 kHz; the reduced ratio has at most six phases.
 
-The 21-tap kernel needs ten future input samples, so output is delayed by
-ten input samples (0.625 ms at 16 kHz, 0.833 ms at 12 kHz, 1.25 ms at
-8 kHz), plus the one-sample unmix delay. WB, the only bandwidth Hybrid
-frames use, totals 0.6875 ms and stays inside Table 54's 0.706 ms. NB and
-MB SILK-only output is later than their Table 54 allocations; section 4.2.9
-permits this for a decoder, and there is no CELT layer to align in a
-SILK-only stream. At a format switch the resampler is cleared to silence,
-as the specification requires.
+The 21-tap kernel needs ten input samples of look-ahead, so output is
+delayed by ten input samples (0.625 ms at 16 kHz, 0.833 ms at 12 kHz,
+1.25 ms at 8 kHz), plus the one-sample unmix delay. WB, the only bandwidth
+Hybrid frames use, totals 0.6875 ms and stays inside Table 54's 0.706 ms.
+NB and MB SILK-only output is later than their Table 54 allocations;
+section 4.2.9 permits this for a decoder, and there is no CELT layer to
+align in a SILK-only stream. The passband correction above does not change
+this delay. At a format switch the resampler is cleared to silence, as the
+specification requires.
 
 Output is planar f64 in `[-1, 1]`. The Opus decoder can mix it with CELT
 and convert to its public sample format.
@@ -244,13 +252,15 @@ blobs, validating element counts and that every PDF sums to 256. It was
 **written and not run**. The committed data file was transcribed from the
 RFC text and each blob was compared value-by-value against that text in the
 writing phase (a text comparison, not execution); no value was invented.
-Running the generator and diffing it against the committed file is required
-before this provenance claim is complete.
+Running the generator and comparing the emitted blobs with the committed
+blob values (not the files, whose headers differ) is required before this
+provenance claim is complete.
 
 ## Errata and adopted interpretations
 
-All items are **UNCONFIRMED** until an external reference run confirms them.
-No test has been executed in this phase.
+All adopted interpretations are **UNCONFIRMED** until an external
+reference run confirms them; corrections that merely restate the supplied
+RFC text are marked as such. No test has been executed in this phase.
 
 ### E1. Table 17's I1 = 6 row is labelled "g" (UNCONFIRMED)
 
@@ -258,11 +268,13 @@ The row sequence is 0,1,2,3,4,5,g,7,...,31. The row is clearly the sixth
 (it has ten letter entries like every other row), so it is used as I1 = 6.
 The label is a typographic error; the table order is unambiguous.
 
-### E2. Table 24 prints the I1 = 0 row twice (UNCONFIRMED)
+### E2. Table 24 has 32 distinct rows (correction, no erratum)
 
-The WB stage-1 codebook prints the same sixteen values for I1 = 0 twice.
-The table has 32 distinct rows; the duplicate is a typographic error. One
-copy is used. The committed blob has 512 values (32 × 16).
+The supplied RFC prints Table 24's rows I1 = 0..31 exactly once, and all
+32 rows are distinct. There is no duplicated I1 = 0 row; the earlier E2
+claim was wrong. The committed blob has 512 values (32 × 16), as published.
+The generator's duplicate-row guard, written against that misreading, never
+fires and is dead code; see pending note 12.
 
 ### E3. DC response threshold: `>` or `>=` 4096 (UNCONFIRMED)
 
@@ -343,9 +355,11 @@ fn silk_decode_lost(d as *SilkDecoder) as i64   // always I_UNSUPPORTED
 
 - `channels` is the OpusHead channel count (1 or 2); `rate` is the output
   rate the Opus decoder wants (8/12/16/24/48 kHz).
-- `bandwidth` is 0 NB, 1 MB, 2 WB: the TOC configuration group
-  `config >> 2`. Hybrid configurations pass 2 (WB, the SILK layer's
-  internal rate).
+- `bandwidth` is the SILK internal bandwidth: 0 NB, 1 MB or 2 WB; any
+  other value returns `I_BADPARAM`. It is not literally the TOC
+  configuration group `config >> 2`: configurations 12-15 are Hybrid
+  (SWB/FB), whose SILK layer always runs at WB, so the Opus layer must
+  map them to 2 rather than passing 3.
 - `duration_ms` is the Opus frame duration, not the packet duration: 10,
   20, 40 or 60.
 - `coded_channels` is the TOC stereo flag plus one.
@@ -370,9 +384,10 @@ Low-severity notes; none affects valid-stream output or memory safety.
 
 1. **Generator unrun.** `tools/gen_opus_silk_tables.py` has never been
    executed. Its table extraction was written against the RFC layout and
-   may need adjustment (the Table 24 duplicate-row handling and the
-   Table 53 word-labelled rows are the most likely spots). The committed
-   data file itself is complete and was compared with the RFC text.
+   may need adjustment (the line-wrapped brace groups and the Table 53
+   word-labelled rows are the most likely spots; the Table 24 duplicate
+   guard is dead, see note 12). The committed data file itself is complete
+   and was compared with the RFC text.
 2. **Synthesis is f64, not bit-exact.** Permitted by 4.2.7.9. NLSF and LPC
    conversion, which must not drift, are fixed point.
 3. **Resampler coefficients are designed at runtime**, not committed as a
@@ -400,6 +415,54 @@ Low-severity notes; none affects valid-stream output or memory safety.
 11. **A zero-length (DTX) Opus frame must not reach `silk_decode`.** The
     range decoder accepts an empty slice, but SILK has no symbols to read;
     the Opus layer owns the DTX/silence decision before calling here.
+12. **E2 corrected; Table 24 has no duplicate.** The supplied RFC prints
+    I1 = 0..31 once each and all 32 rows are distinct, so the duplicate-row
+    erratum was false and E2 now says so. The generator's
+    `len(wb_rows) == 33` duplicate guard never fires and should be deleted
+    when the generator is next edited.
+13. **PDF-total check wording.** `silk_pdf_total`'s comment says a non-256
+    total is reported as `I_CORRUPT`, but `silk_sym` only rejects
+    `ft <= 0` and `ft > 65535`; a wrong blob/count whose values sum into
+    that range is decoded with that total. Not reachable for the committed
+    blobs. Not fixed: requiring exactly 256 would tighten a contract the
+    range-coder layer does not require.
+14. **Generator extraction is fragile (unrun).** The extractor keys on
+    caption text and the previous `Table ...:` line; captions and brace
+    groups that wrap across lines (Table 6's stage labels, Table 52's
+    `{138,` / `118}`) and word-labelled rows (Table 53) need the special
+    handling already in the script. It also writes only a two-line header,
+    not the committed file's header comment. After running it, compare the
+    emitted **blobs** against the committed blob values, not the files.
+15. **State taint after `I_CORRUPT`/`I_NOMEM`.** `silk_decode` updates
+    `d.prev_coded`, the per-channel `log_gain`/`nlsf` (through
+    `_silk_prepare`), the stereo weights and the resampler history before
+    it can fail, and it does not restore them. On any negative return the
+    caller must call `silk_decoder_reset` or discard the decoder; ignoring
+    the error and decoding the next frame would mix old and new state.
+    Valid streams are unaffected.
+16. **Wording and attribution slips.** Left as-is: "resampled per 20 ms
+    frame" (a 10 ms SILK frame is resampled per 10 ms interval too); the
+    "Three tables are not blobs by design" heading introducing more than
+    three bullets; the bullet attributing the LTP order/tap-size constants
+    to `silk.cst` (`SILK_LTP_ORDER` is in `silk_tables.cst`); the comment in
+    `silk_tables.cst` placing `silk_sym` in `silk.cst` (it is in
+    `silk_bits.cst`); the duplicated `d.bandwidth = 0 - 1` in
+    `silk_decoder_init`; and the `[-1, 1]` output range, which a
+    windowed-sinc resampler can ring slightly past.
+17. **Bandwidth-change reset of the stereo delay (choice).** On an internal
+    bandwidth change `_silk_clear_state` also zeroes `st_mid1`, `st_mid2`,
+    `st_side1` and the stereo weights. libopus's `silk_decoder_set_fs`
+    reinitialises the channel and resampler state but leaves `sStereo`
+    alone, and RFC 4.2.9 only requires discarding the resampling buffer.
+    Kept: this decoder treats a bandwidth change as a reset, and the
+    one-sample stereo history is meaningless across a rate change.
+18. **Mid-only side history: references differ.** On a mid-only interval
+    libopus keeps `sStereo.sSide[1]`, so `silk_stereo_MS_to_LR` uses the
+    previous side sample at its first output sample; FFmpeg flushes the
+    side frame before unmixing, so it uses zero there. This decoder follows
+    RFC 4.2.8 and libopus: it zeroes only the current interval's side
+    signal and keeps `st_side1` until `_silk_unmix` replaces it with
+    `side[len-1]` (zero for a mid-only interval).
 
 ## Reference implementations read
 
@@ -407,12 +470,15 @@ Only for behaviour and to settle ambiguities; no code was copied, ported or
 transcribed.
 
 - xiph/opus `main`: `silk/dec_API.c` (header bits, LBRR skip, conditional
-  coding, mono/stereo transitions), `silk/decode_frame.c`,
-  `silk/decode_indices.c`, `silk/decode_parameters.c`, `silk/decode_core.c`,
-  `silk/decode_pulses.c`, `silk/code_signs.c`, `silk/gain_quant.c`,
-  `silk/stereo_decode_pred.c`, `silk/stereo_MS_to_LR.c`,
-  `silk/NLSF_decode.c`, `silk/NLSF2A.c`, `silk/LPC_inv_pred_gain.c`,
-  `silk/tables_other.c` (mid-only iCDF and LBRR flag iCDFs).
+  coding, mono/stereo transitions), `silk/decoder_set_fs.c` (what a
+  sample-rate change resets; the stereo state is not touched),
+  `silk/decode_frame.c`, `silk/decode_indices.c`, `silk/decode_parameters.c`,
+  `silk/decode_core.c`, `silk/decode_pulses.c`, `silk/code_signs.c`,
+  `silk/gain_quant.c`, `silk/stereo_decode_pred.c`,
+  `silk/stereo_MS_to_LR.c` (two-sample side state; the prior side sample is
+  used at the first output sample), `silk/NLSF_decode.c`, `silk/NLSF2A.c`,
+  `silk/LPC_inv_pred_gain.c`, `silk/tables_other.c` (mid-only iCDF and
+  LBRR flag iCDFs).
 - FFmpeg `master`: `libavcodec/opus/silk.c` (frame driver, stereo unmix,
   LBRR handling, output delay) and `libavcodec/opus/dec.c` (how the SILK
   superframe is called and resampled).

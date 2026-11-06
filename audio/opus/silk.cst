@@ -13,8 +13,12 @@
 // correctly, but they are not synthesized: this decoder has no PLC/FEC
 // path, and silk_decode_lost() says so.
 //
-// `bandwidth` uses the SILK_BW_* numbering of silk_tables.cst, which is
-// the Opus TOC configuration group (config >> 2): 0 NB, 1 MB, 2 WB.
+// `bandwidth` is the SILK internal bandwidth, numbered as SILK_BW_* in
+// silk_tables.cst: 0 NB, 1 MB, 2 WB. Only those three values are accepted;
+// anything else returns I_BADPARAM. It is not literally the Opus TOC
+// configuration group (config >> 2): configurations 12-15 are Hybrid
+// (SWB/FB), whose SILK layer runs at WB, so the Opus layer must pass 2
+// for them rather than 3.
 // `duration_ms` is the Opus frame duration: 10, 20, 40 or 60. A 40/60 ms
 // Opus frame contains two/three 20 ms SILK frames. `coded_channels` is the
 // packet's stereo flag plus one.
@@ -763,7 +767,10 @@ fn silk_decode(d as *SilkDecoder, r as *rc.OpusRange,
                 k = k + 1;
             }
             defs.silk_chan_reset(&d.ch1);
-            d.st_side1 = 0.0;
+            // st_side1 is deliberately kept: 4.2.8 uses side[-1] at
+            // i = 0 for this interval, and only this interval's
+            // side[0..len) is zero. _silk_unmix stores side[len-1]
+            // (zero here) when it finishes.
         }
 
         // Output for this interval.

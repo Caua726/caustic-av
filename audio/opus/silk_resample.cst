@@ -12,11 +12,16 @@
 //   - L/M is the reduced output/input ratio, so output sample m is
 //     evaluated at input time m*M/L. L is at most 6 for the supported
 //     rate pairs.
-//   - The kernel has 21 taps and a Kaiser window (beta 8), with cutoff at
-//     min(input, output) Nyquist and each phase normalised to unit DC
-//     gain. Coefficients are computed once at init.
-//   - A 21-tap kernel needs ten future input samples, so the output is
-//     delayed by ten input samples: output m uses input samples
+//   - The kernel is h(u) = cutoff * sinc(cutoff*u) with
+//     sinc(x) = sin(pi*x)/(pi*x) and cutoff = min(1, out_rate/in_rate).
+//     With that sinc the passband edge lies at cutoff/2 cycles per input
+//     sample, so this puts it at 0.5*min(1, ratio) cycles per input
+//     sample: the Nyquist frequency of the lower of the two rates. A
+//     21-tap Kaiser window (beta 8) is evaluated at the same distance u
+//     from the fractional evaluation point, and each phase is normalised
+//     to unit DC gain. Coefficients are computed once at init.
+//   - A 21-tap kernel needs ten input samples of look-ahead, so the
+//     output is delayed by ten input samples: output m uses input samples
 //     i0-20 .. i0 with i0 = floor(m*M/L). That is 0.625 ms at 16 kHz,
 //     0.833 ms at 12 kHz and 1.25 ms at 8 kHz. The one-sample unmix delay
 //     adds another input sample. WB (the only bandwidth used by Hybrid
@@ -161,7 +166,11 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
     rs.taps = t.SILK_RS_TAPS;
 
     let is f64 as ratio = cast(f64, out_rate) / cast(f64, in_rate);
-    let is f64 as cutoff = 0.5 * ratio;
+    // cutoff = min(1, ratio). h(u) = cutoff*sinc(cutoff*u) has its
+    // passband edge at cutoff/2 cycles per input sample, i.e. at the
+    // Nyquist frequency of the lower of the two rates.
+    let is f64 as cutoff with mut = ratio;
+    if (cutoff > 1.0) { cutoff = 1.0; }
     let is i64 as delay = rs.taps / 2;
     let is f64 as den = cast(f64, delay);
     let is f64 as i0beta = _fbessel_i0(SILK_RS_BETA);
@@ -174,9 +183,11 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
         while (j < rs.taps) {
             // Tap j reads input sample i0 - j; the delayed evaluation
             // point is i0 + frac - delay, so its distance is
-            // frac - delay + j. The window is centred on j = delay.
+            // frac - delay + j. Both the sinc and the Kaiser window use
+            // that distance, centring the kernel on the evaluation
+            // point rather than on the integer tap position.
             let is f64 as u = frac + cast(f64, j - delay);
-            let is f64 as v = cast(f64, delay - j) / den;
+            let is f64 as v = u / den;
             let is f64 as w with mut = 1.0;
             let is f64 as arg = 1.0 - v * v;
             if (arg > 0.0) {

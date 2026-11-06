@@ -19,9 +19,11 @@
 // silk_sym() in silk.cst builds from these two.
 // =======================================================
 
-// Internal SILK sampling rates. These are bandwidth indices, and they are
-// the same numbering as the Opus TOC configuration groups (0..3 NB,
-// 4..7 MB, 8..11 WB), so the Opus decoder's helper can pass config>>2 here.
+// Internal SILK sampling rates. These are bandwidth indices 0/1/2, the
+// same class order as the Opus TOC configuration groups (0..3 NB, 4..7 MB,
+// 8..11 WB); Hybrid configurations (12..15) also use WB. The Opus decoder
+// must map SILK-only configs with config>>2 and Hybrid configs to 2;
+// raw config>>2 is 3 for Hybrid and is not a valid argument here.
 let is i64 as SILK_BW_NB with imut = 0;   //  8 kHz
 let is i64 as SILK_BW_MB with imut = 1;   // 12 kHz
 let is i64 as SILK_BW_WB with imut = 2;   // 16 kHz
