@@ -513,6 +513,9 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
             let is i64 as rr = rc.opus_range_init(&fr, fp, flen);
             if (rr < 0) { return rr; }
             let is i64 as sframes with mut = 0;
+            // Hybrid configs 12-15 are SWB/FB in the TOC, but their SILK
+            // layer is always WB: pass SILK_BW_WB (2), never config>>2
+            // (which is 3).
             let is i64 as sr = silk.silk_decode(&d.silk, &fr,
                 silk_tables.SILK_BW_WB, _opus_duration_ms(fdur),
                 p.stereo + 1, &d.silk_l[0], &d.silk_r[0], fdur, &sframes);
@@ -532,6 +535,10 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
             if (cr != fdur) { return errno.I_CORRUPT; }
 
             // SILK low band + CELT high band, aligned by output sample.
+            // SILK is delayed by the resampler's ten-input + one-unmix
+            // samples (0.6875 ms at WB, inside the 4.2.9 budget); the
+            // encoder compensates that delay on the MDCT side, so no
+            // extra CELT delay is applied here.
             let is i64 as j with mut = 0;
             while (j < fdur) {
                 d.mix[j * d.channels] = d.mix[j * d.channels] + d.silk_l[j];

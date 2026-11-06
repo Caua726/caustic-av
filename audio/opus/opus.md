@@ -48,7 +48,7 @@ opus_decode(d, pkt, len, out, cap, got)
       _opus_skip_redundancy    read the 4.5.1 header, shrink r.len
     else if mode == HYBRID:
       opus_range_init(frame)
-      silk_decode               SILK part, always WB (16 kHz) internally
+      silk_decode               SILK part, always WB=2 (never config>>2=3)
       _opus_skip_redundancy     flag + size, shrink r.len past the tail
       celt_set_frame(17, end, lm, stream_channels)
       celt_decode_with_range    continues on the same range decoder
@@ -65,7 +65,9 @@ mode-specific frame size, bandwidth, every frame length, and the output
 capacity. Those failures write nothing and leave SILK/CELT state untouched.
 A range-coder failure after decoding has begun returns the error and leaves
 `*got` untouched; `out` may contain part of the packet and the caller must
-discard it.
+discard it. The SILK slice's pending note 15 is the reason: a negative
+`silk_decode` return can leave its predictive state tainted, so the decoder
+must be reset or re-initialised before the next packet.
 
 ## Modes, frame sizes and CELT bands
 
@@ -89,7 +91,10 @@ A SILK frame is one Opus frame duration; `silk_decode` internally splits
 
 SILK runs at 8, 12 or 16 kHz (NB, MB, WB) and resamples to 48 kHz. Hybrid
 always runs SILK at WB (16 kHz) regardless of the SWB/FB label; CELT covers
-the band above 8 kHz.
+the band above 8 kHz. The Opus layer passes `silk_tables.SILK_BW_WB` (2) for
+configs 12-15 and never passes the raw `config >> 2` (which would be 3) to
+SILK; SILK-only configs use `config >> 2` (0/1/2). The fixed SILK slice
+rejects any other bandwidth with `I_BADPARAM`.
 
 The CELT end band comes from the audio bandwidth, per Table 55:
 
@@ -127,11 +132,22 @@ mono coded frame into a stereo decoder, and a stereo coded frame in a mono
 decoder is handled by each layer (SILK keeps the mid channel, CELT averages
 the two spectra, both of which are the encoder's downmix).
 
-The SILK resampler's delay and the CELT overlap-add delay are properties of
-the two synthesis paths. RFC 6716 Section 4.2.9 makes the resampler method
-non-normative and budgets the delay on the encoder side; the direct sum is
-the reference decoder's behaviour. The exact sample alignment of this
-resampler against libopus is UNCONFIRMED until the ffmpeg-difference check.
+SILK is delayed relative to CELT by the resampler: the fixed 21-tap kernel
+needs ten input samples of look-ahead plus the one-sample unmix delay. At
+WB, the only bandwidth a Hybrid frame uses, that is
+`10/16000 + 1/16000 = 0.6875 ms` (33 output samples at 48 kHz), inside
+Table 54's 0.706 ms WB allocation. RFC 6716 Section 4.2.9 makes that delay
+normative so the encoder can apply the corresponding delay to the MDCT
+layer; a conformant decoder therefore sums the two outputs sample for
+sample and does not add a CELT delay line. NB and MB SILK-only delays are
+larger than their Table 54 allocations, which 4.2.9 permits because there
+is no CELT layer to align. If the resampler's delay ever changes, the CELT
+output must be delayed by the difference (the FFmpeg decoder does that with
+its swr FIFO).
+
+The SILK filter shape is still not bit-identical to libopus, so hybrid
+sample values may differ even when the delay and the parse are correct;
+this remains UNCONFIRMED until an external hybrid comparison.
 
 ## Channel conversion and output format
 
@@ -456,13 +472,18 @@ was compiled or executed in the writing phase.
   detection and on the CELT overlap state being preserved across the mode
   switch. The construction follows the reference, but no hybrid stream has
   been decoded to confirm the output.
-- **SILK resampler delay versus CELT.** The resampler is designed from the
-  delay budget in Section 4.2.9 but is not bit-identical to the reference.
-  Hybrid and mode-switching output may be time-shifted or differ in
-  amplitude even when parsing is correct.
-- **Hybrid sum alignment.** The sum assumes SILK's resampler and CELT's
-  overlap-add produce the same 48 kHz frame interval. This is the
-  reference's model; no vector has been checked.
+- **SILK resampler delay versus CELT.** The fixed resampler delays SILK by
+  ten input samples of look-ahead plus the one-sample unmix delay:
+  0.6875 ms at WB (16 kHz), 33 output samples at 48 kHz, within Table 54's
+  0.706 ms WB allocation. NB and MB SILK-only delays are larger than their
+  allocations, which 4.2.9 permits because there is no CELT layer in a
+  SILK-only stream. The filter shape is not bit-identical to libopus, so
+  sample values may differ even though the delay is now deterministic; no
+  hybrid vector has been checked.
+- **Hybrid sum alignment.** The sum is sample for sample and relies on the
+  encoder applying the normative 4.2.9 delay to the MDCT layer; the decoder
+  does not add a CELT delay line. If the resampler delay changes, CELT must
+  be delayed by the difference. No hybrid vector has been checked.
 - **Malformed redundancy sizes.** If a redundancy header would leave the
   main frame shorter than the bits already consumed, the reference disables
   redundancy and continues with a zero-length main frame; this decoder
@@ -540,6 +561,25 @@ The seven findings from the 7d integration review and their resolution:
 - **No end-of-stream flush for the SILK resampler.** The last resampler
   delay samples are not emitted; pre-skip and end trim address the start
   and the EOS granule, not the resampler tail.
+
+### SILK slice pending items
+
+The SILK slice is adopted at `f5999a2`. Its PENDING review notes 12-18
+live in `silk.md`; these are the integration-relevant references:
+
+- 12: E2 corrected — Table 24 has no duplicate row; the generator's
+  duplicate guard is dead.
+- 13: PDF-total check wording.
+- 14: generator extraction is fragile and unrun; it still needs the
+  wrapped-brace row-label filtering and a blob-vs-blob comparison after a
+  run.
+- 15: SILK state is tainted after `I_CORRUPT`/`I_NOMEM`; the Opus layer
+  must reset or discard the decoder on a negative SILK return.
+- 16: wording/attribution slips.
+- 17: bandwidth-change stereo-delay reset choice.
+- 18: mid-only side history: libopus and RFC 4.2.8 keep the previous side
+  sample for the first unmix sample; FFmpeg flushes the side frame and
+  uses zero. This decoder follows libopus/RFC.
 
 ## Scope gaps
 
