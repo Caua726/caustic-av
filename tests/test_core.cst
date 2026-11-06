@@ -53,6 +53,16 @@ fn group_buf() as i64 {
     if (buf.buf_at(&b, 7) != 8)    { return 18; }
     if (buf.buf_at(&b, 8) >= 0)    { return 19; }
     if (buf.buf_peek(&b, 0 - 1) >= 0) { return 20; }
+
+    // A huge peek offset must not overflow into an in-range index.
+    buf.buf_init(&b, d, 8);
+    if (buf.buf_seek(&b, 5) != 0) { return 21; }
+    if (buf.buf_peek(&b, 9223372036854775807) != errno.I_EOF) { return 22; }
+    if (buf.buf_peek(&b, 2) != 8) { return 23; }              // last byte, still valid
+
+    // Null destinations are rejected for bytes, allowed for zero bytes.
+    if (buf.buf_read(&b, cast(*u8, 0), 1) != errno.I_BADPARAM) { return 24; }
+    if (buf.buf_read(&b, cast(*u8, 0), 0) != 0) { return 25; }
     return 0;
 }
 
@@ -101,6 +111,17 @@ fn group_bits() as i64 {
     if (bits.bits_msb_read_wide(&m, 64, &wide) != 0) { return 26; }
     if (wide != (0 - 1)) { return 27; }
     if (bits.bits_msb_remaining(&m) != 0) { return 28; }
+
+    // A failed ue restores the position: truncated and over-long prefixes.
+    let is *u8 as z with imut = "\x00";
+    if (bits.bits_msb_init(&m, z, 1) != 0) { return 29; }
+    if (bits.bits_msb_ue(&m) != errno.I_EOF) { return 30; }
+    if (bits.bits_msb_consumed(&m) != 0) { return 31; }
+
+    let is *u8 as z4 with imut = "\x00\x00\x00\x00";
+    if (bits.bits_msb_init(&m, z4, 4) != 0) { return 32; }
+    if (bits.bits_msb_ue(&m) != errno.I_CORRUPT) { return 33; }
+    if (bits.bits_msb_consumed(&m) != 0) { return 34; }
     return 0;
 }
 
