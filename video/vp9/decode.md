@@ -58,7 +58,8 @@ surfaces and the frame order.
   pointers to the caller's work block. The caller allocates the decoder and
   keeps it for the stream's lifetime.
 - The work block is caller-owned and must stay the same block across frames
-  because its tail is `PrevSegmentIds`. `vp9_work_size(width, height)` gives
+  because it holds both the per-frame arrays and `PrevSegmentIds`.
+  `vp9_work_size(width, height)` gives
   the bytes for a decoder that will see frames up to that visible size; it
   is a pure layout computation, no allocation. The block must be 8-byte
   aligned. The largest layout for 8192x8192 mode-info units is under 1 GiB.
