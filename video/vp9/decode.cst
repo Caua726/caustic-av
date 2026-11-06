@@ -195,6 +195,9 @@ fn _work_carve(w as *Vp9Work, base as *u8, cap as i64,
     w.nz_above_stride = nz_above;
     w.nz_left_stride = nz_left;
 
+    // Every pointer above is plain base+offset arithmetic (`_at`); none is
+    // dereferenced until the null-base, alignment and capacity checks have
+    // passed. `w.need` is the layout total queried by vp9_work_size.
     if (cast(i64, base) == 0) { return errno.I_OK; }
     if ((cast(i64, base) & 7) != 0) { return errno.I_BADPARAM; }
     if (cap < off) { return errno.I_NOMEM; }
@@ -487,8 +490,9 @@ fn _loop_filter(d as *Vp9Decoder, b as *blk.Vp9Blk, out as *frame.Frame) as i64 
 // Section 8.1 step 3: after a frame whose segmentation updates the map,
 // PrevSegmentIds follows SegmentIds. The clears that sections 7.2 and 7.2.6
 // require happen before the tiles (see _decode_slice), so a block that
-// predicts its segment id through get_segment_id (6.4.14) reads the map the
-// specification defines, not the previous frame's.
+// predicts its segment id through get_segment_id (6.4.14) reads the
+// retained previous map on a normal inter frame, or the cleared map on an
+// intra/error-resilient frame or after a size change.
 fn _update_seg_map(w as *Vp9Work, b as *blk.Vp9Blk, h as *hd.Vp9Header) as void {
     if (h.seg_enabled != 1 || h.seg_update_map != 1) { return; }
     let is i64 as n = b.mi_cols * b.mi_rows;
@@ -598,23 +602,19 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
         return st;
     }
 
-    // setup_past_independence clears PrevSegmentIds for the whole frame
-    // before any block is decoded (section 7.2); the header cannot do it
-    // because the work block is bound per frame. A resolution change also
-    // makes the old map's dimensions wrong for 6.4.14's indexing, so the
-    // current grid is cleared as well (7.2.6's map clear); the previous map
-    // is otherwise kept for temporal prediction.
-    if (h.frame_is_intra == 1 || h.error_resilient_mode == 1
-        || h.seg_map_clear == 1) {
-        _zero(w.prev_seg_ids, h.mi_cols * h.mi_rows);
-    }
-
     // Mvs and SubMvs of an intra block are never assigned (6.4.4), and
     // 6.5.10/6.5.8 read both lists of a candidate regardless of its
     // reference frames; the specification's arrays start each frame
     // cleared. PrevMvs later copies this all-zero field for intra blocks.
     _zero(cast(*u8, w.mvs), 4 * (h.mi_cols * h.mi_rows) * 4);
     _zero(cast(*u8, w.sub_mvs), 16 * (h.mi_cols * h.mi_rows) * 4);
+
+    // SubModes is written only for an intra block (6.4.4); the neighbour
+    // mode read of 9.3.2 must see DC_PRED for an inter block, as libvpx
+    // does (`vp9_above_block_mode`/`vp9_left_block_mode` return DC_PRED for
+    // an inter neighbour). MODE_DC is zero, so a per-frame clear gives an
+    // unwritten cell exactly that default.
+    _zero(w.sub_modes, 4 * (h.mi_cols * h.mi_rows));
 
     let is blk.Vp9Blk as b;
     b.h = h;
@@ -659,8 +659,9 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
     // through get_segment_id (6.4.14): setup_past_independence zeroes the
     // whole map for every intra or error-resilient frame, and
     // compute_image_size does the same when the frame size is first seen or
-    // changes. Only a successful frame then copies its SegmentIds over the
-    // map (8.1 step 3, _update_seg_map).
+    // changes. The header cannot perform the first clear because the work
+    // block is bound per frame. Only a successful frame then copies its
+    // SegmentIds over the map (8.1 step 3, _update_seg_map).
     if (h.frame_is_intra == 1 || h.error_resilient_mode == 1
         || h.seg_map_clear == 1) {
         _zero(w.prev_seg_ids, h.mi_cols * h.mi_rows);
@@ -744,6 +745,12 @@ fn vp9_decoder_decode(d as *Vp9Decoder, data as *u8, len as i64,
     if (st < 0) { return st; }
     if (sf.count < 1 || sf.count > 8) { return errno.I_CORRUPT; }
 
+    // Only the last shown slice of the packet is handed back, so one held
+    // index protects the output buffer from selection by the remaining
+    // slices. A packet with several shown-but-unpublished slices would let
+    // an earlier one be reused as a later decode target; that costs an extra
+    // pool buffer rather than corrupting the output, because only the final
+    // shown view escapes the call.
     let is i64 as held with mut = 0 - 1;
     let is i64 as i with mut = 0;
     while (i < sf.count) {

@@ -1380,6 +1380,9 @@ fn _inter_block_mode_info(b as *Vp9Blk, br as *vb.Vp9Bool,
     while (j < 2) {
         if (mi.ref_frame[j] > it.INTRA_FRAME) {
             let is mvp.MvCandList as list;
+            // mv_find_refs requires a non-null mode-context output, but the
+            // block's inter-mode context is computed once by _inter_mode_ctx
+            // below; this scratch result is intentionally not consumed.
             let is i64 as mctx with mut = 0;
             st = mvp.mv_find_refs(&mc, mi.ref_frame[j], -1, &list, &mctx);
             if (st < 0) { return st; }
