@@ -21,6 +21,12 @@
 //   (0xEC). They are ordinary elements here; `ebml_is_skippable` names them
 //   so callers can skip them without a size table.
 //
+//   A String payload ends at its first NUL octet (RFC 8794 Section 13): a
+//   writer may replace a value with a shorter one inside the same Element
+//   Data Size and pad the rest with NULs, so the bytes after the first NUL
+//   are ignored rather than being part of the value. `ebml_str` returns the
+//   prefix before that octet.
+//
 // Errors follow the library convention: 0 or a positive result is success, a
 // negative i64 is an error. A failed call leaves the out-parameter untouched
 // and never moves a caller's cursor. Sizes are validated before use, and the
@@ -366,14 +372,18 @@ fn ebml_float(e as *Ebml, el as *EbmlElement, out as *f64) as i64 {
     return errno.I_OK;
 }
 
-// Borrowed string payload with the NUL padding Matroska uses stripped.
-// Returns 0 and *out, or a negative code. An empty string is len 0.
+// Borrowed string payload, cut at the first NUL octet. RFC 8794 Section 13
+// makes a String end at the first 0x00 and requires a reader to discard
+// everything after it in the element; that is how a shorter value overwrites
+// a longer one without changing the Element Data Size. Only trailing NULs
+// would miss "webm\0junk", whose value is "webm". An empty string is len 0.
+// Returns 0 and *out, or a negative code.
 fn ebml_str(e as *Ebml, el as *EbmlElement, out as *EbmlSlice) as i64 {
     let is EbmlSlice as s;
     let is i64 as r = ebml_slice(e, el, &s);
     if (r < 0) { return r; }
-    let is i64 as n with mut = s.len;
-    while (n > 0 && s.ptr[n - 1] == 0) { n = n - 1; }
+    let is i64 as n with mut = 0;
+    while (n < s.len && s.ptr[n] != 0) { n = n + 1; }
     out.ptr = s.ptr;
     out.len = n;
     return errno.I_OK;
@@ -385,9 +395,11 @@ fn _strlen(s as *u8) as i64 {
     return n;
 }
 
-// Compare a string element against a NUL-terminated ASCII/UTF-8 string,
-// ignoring the element's trailing NUL padding. Returns 1 for equal, 0 for
-// different, or a negative code when the element cannot be read.
+// Compare a string element against a NUL-terminated ASCII/UTF-8 string.
+// The element's value ends at its first NUL (see ebml_str), so trailing
+// padding and any bytes after a terminator are not part of the comparison.
+// Returns 1 for equal, 0 for different, or a negative code when the element
+// cannot be read.
 fn ebml_str_eq(e as *Ebml, el as *EbmlElement, s as *u8) as i64 {
     let is EbmlSlice as v;
     let is i64 as r = ebml_str(e, el, &v);
