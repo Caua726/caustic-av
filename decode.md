@@ -191,7 +191,9 @@ range-checked before multiplication. For Matroska Opus, 120-sample frames at
   also publishes the same value in `Track.pre_skip`. `decode_open` re-arms it
   from the track when it is greater than zero, so both paths agree. Zero in
   the track means "keep the OpusHead value"; a caller that wants an explicit
-  zero calls `decode_set_pre_skip(dec, 0)` before the first packet.
+  zero calls `decode_set_pre_skip(dec, 0)` before the first packet. The output
+  `pts` remains the packet's container timestamp: the dropped samples are the
+  coded pre-roll, so the first returned sample belongs at that timestamp.
 - **Codec delay.** Matroska's `CodecDelay` is stored in the `Decoder` and
   reported by `decode_codec_delay`, but it is not applied a second time.
   `container/matroska.cst` reports block timestamps unshifted and explains
