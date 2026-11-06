@@ -45,11 +45,11 @@ opus_decode(d, pkt, len, out, cap, got)
       silk_decode               header bits, LBRR skip, parameters,
                                 excitation, synthesis, stereo unmix,
                                 resample to 48 kHz (planar f64)
-      opus_skip_redundancy      parse/skip the 4.5.1 tail, shrink r.len
+      _opus_skip_redundancy    read the 4.5.1 header, shrink r.len
     else if mode == HYBRID:
       opus_range_init(frame)
       silk_decode               SILK part, always WB (16 kHz) internally
-      opus_skip_redundancy      read the flag and skip the redundant frame
+      _opus_skip_redundancy     flag + size, shrink r.len past the tail
       celt_set_frame(17, end, lm, stream_channels)
       celt_decode_with_range    continues on the same range decoder
       mix                       SILK low band + CELT bands 17..end
