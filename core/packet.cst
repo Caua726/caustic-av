@@ -6,7 +6,9 @@
 // without allocation and a decoder must consume it before the source moves.
 //
 // Timestamps are in the track's own timebase, which the container reports
-// alongside the track; this struct does not convert them.
+// alongside the track; this struct does not convert them. `discard_padding`
+// is an exception: it is always nanoseconds, because Matroska's
+// DiscardPadding is defined that way and no timebase conversion applies.
 // =======================================================
 
 use "errno.cst" as errno;
@@ -19,6 +21,7 @@ struct Packet {
     dts      as i64;   // decode timestamp
     duration as i64;   // duration in timebase units, 0 when unknown
     keyframe as i64;   // 1 for a keyframe / seek point, 0 otherwise
+    discard_padding as i64;   // ns to discard at the end, 0 when unknown
 }
 
 // Empty packet on the given track, with no data and zero timestamps.
@@ -30,6 +33,7 @@ fn packet_init(p as *Packet, track as i32) as void {
     p.dts = 0;
     p.duration = 0;
     p.keyframe = 0;
+    p.discard_padding = 0;
 }
 
 // Borrow data[0..len] for the given track and timestamps. Returns 0, or
@@ -62,6 +66,15 @@ fn packet_set_data(p as *Packet, data as *u8, len as i64) as i64 {
 
 fn packet_len(p as *Packet) as i64 {
     return p.len;
+}
+
+// Nanoseconds of padding to discard at the end of this packet, as Matroska's
+// BlockGroup DiscardPadding carries. A negative value is I_BADPARAM and
+// leaves the packet untouched; the initial value is 0.
+fn packet_set_discard_padding(p as *Packet, ns as i64) as i64 {
+    if (ns < 0) { return errno.I_BADPARAM; }
+    p.discard_padding = ns;
+    return errno.I_OK;
 }
 
 fn packet_is_key(p as *Packet) as i64 {

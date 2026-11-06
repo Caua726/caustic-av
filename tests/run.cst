@@ -136,6 +136,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     // the areas are built, and keep the list explicit so a new file cannot be
     // silently skipped.
     fail = fail + cast(i64, run_case(ccp, "test_core", "tests/test_core.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_matroska", "tests/test_matroska.cst"));
 
     if (fail == 0) { io.write_str(1, "all green\n"); return 0; }
     io.write_str(1, "FAILURES: "); io.write_int(1, fail); io.write_str(1, "\n");

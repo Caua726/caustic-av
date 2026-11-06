@@ -174,6 +174,16 @@ fn group_bounds() as i64 {
     packet.packet_init(&p, 2);
     if (packet.packet_set(&p, d, 0 - 1, 5, 0, 0, 0, 1) != errno.I_BADPARAM) { return 3; }
     if (p.track != 2 || p.len != 0) { return 4; }
+
+    // DiscardPadding starts at 0, accepts a non-negative length and refuses
+    // a negative one without changing the value.
+    if (p.discard_padding != 0) { return 5; }
+    if (packet.packet_set_discard_padding(&p, 0 - 1) != errno.I_BADPARAM) { return 6; }
+    if (p.discard_padding != 0) { return 7; }
+    if (packet.packet_set_discard_padding(&p, 13500000) != 0) { return 8; }
+    if (p.discard_padding != 13500000) { return 9; }
+    if (packet.packet_set(&p, d, 1, 2, 0, 0, 0, 1) != 0) { return 10; }
+    if (p.discard_padding != 0) { return 11; }
     return 0;
 }
 

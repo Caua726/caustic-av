@@ -1,0 +1,856 @@
+// =======================================================
+// caustic-av/container/matroska.cst
+// Demuxer for Matroska and its restricted WebM profile. It reads the EBML
+// header, the Segment, Info, Tracks and the cluster stream, and hands out one
+// packet per Matroska frame. All bytes are borrowed from the caller's source;
+// the demuxer allocates nothing and opens no files.
+//
+// The layout it expects is the one the specification defines:
+//
+//   EBML header: DocType must be "webm" or "matroska", and
+//                DocTypeReadVersion must be <= 4 (the elements read here
+//                exist in that version).
+//   Segment:     may have an unknown size (the file length ends it).
+//   Info:        TimecodeScale (default 1,000,000 ns) and Duration.
+//   Tracks:      up to MK_MAX_TRACKS entries, fixed at compile time. A count
+//                past the array is corrupt, not something to allocate for.
+//   Cluster:     Timecode plus SimpleBlock and BlockGroup/Block. A cluster
+//                may have an unknown size too; then it ends at the next
+//                Cluster or at the end of the Segment.
+//
+// Timestamps: a block's raw timestamp is
+//   (cluster Timecode + block relative timestamp) * TimecodeScale
+// and every value this module reports in pts/dts/duration is in nanoseconds.
+// CodecDelay and SeekPreRoll are reported on the track in nanoseconds; the
+// demuxer does not apply them, because they belong to the decoder's pre-roll
+// handling, not to the container timeline.
+//
+// Lacing: SimpleBlock and Block may pack several frames into one payload.
+// All three modes are decoded (Xiph, fixed-size and EBML) and one packet is
+// returned per lace, in order, with the frame slice, its own pts and its
+// duration. With BlockDuration the duration is divided over the laces; the
+// last lace takes the remainder so the block's total is exact. Without it,
+// each lace takes the track's DefaultDuration (0 when the track has none).
+//
+// Packet data points into src and stays valid until the next mk_next call,
+// like every borrowed view in this library.
+// =======================================================
+
+use "ebml.cst" as ebml;
+use "../core/errno.cst" as errno;
+use "../core/packet.cst" as packet;
+
+// ── EBML header and top-level element IDs ───────────────────────────
+
+let is i64 as EBML_HEADER        with imut = 440786851;   // 0x1A45DFA3
+let is i64 as EBML_DOC_TYPE      with imut = 17026;       // 0x4282
+let is i64 as EBML_DOC_TYPE_READ with imut = 17029;       // 0x4285
+
+let is i64 as MK_SEGMENT         with imut = 408125543;   // 0x18538067
+let is i64 as MK_INFO            with imut = 357149030;   // 0x1549A966
+let is i64 as MK_TRACKS          with imut = 374648427;   // 0x1654AE6B
+
+// ── Info ────────────────────────────────────────────────────────────
+
+let is i64 as MK_TIMECODE_SCALE  with imut = 2807729;     // 0x2AD7B1
+let is i64 as MK_DURATION        with imut = 17545;       // 0x4489
+
+// ── Tracks ──────────────────────────────────────────────────────────
+
+let is i64 as MK_TRACK_ENTRY         with imut = 174;     // 0xAE
+let is i64 as MK_TRACK_NUMBER        with imut = 215;     // 0xD7
+let is i64 as MK_TRACK_TYPE          with imut = 131;     // 0x83
+let is i64 as MK_CODEC_ID            with imut = 134;     // 0x86
+let is i64 as MK_CODEC_PRIVATE       with imut = 25506;   // 0x63A2
+let is i64 as MK_DEFAULT_DURATION    with imut = 2352003; // 0x23E383
+let is i64 as MK_CODEC_DELAY         with imut = 22186;   // 0x56AA
+let is i64 as MK_SEEK_PRE_ROLL       with imut = 22203;   // 0x56BB
+let is i64 as MK_VIDEO               with imut = 224;     // 0xE0
+let is i64 as MK_PIXEL_WIDTH         with imut = 176;     // 0xB0
+let is i64 as MK_PIXEL_HEIGHT        with imut = 186;     // 0xBA
+let is i64 as MK_AUDIO               with imut = 225;     // 0xE1
+let is i64 as MK_SAMPLING_FREQUENCY  with imut = 181;     // 0xB5
+let is i64 as MK_CHANNELS            with imut = 159;     // 0x9F
+
+// ── Clusters and blocks ─────────────────────────────────────────────
+
+let is i64 as MK_CLUSTER             with imut = 524531317; // 0x1F43B675
+let is i64 as MK_TIMECODE            with imut = 231;     // 0xE7
+let is i64 as MK_SIMPLE_BLOCK        with imut = 163;     // 0xA3
+let is i64 as MK_BLOCK_GROUP         with imut = 160;     // 0xA0
+let is i64 as MK_BLOCK               with imut = 161;     // 0xA1
+let is i64 as MK_BLOCK_DURATION      with imut = 155;     // 0x9B
+let is i64 as MK_REFERENCE_BLOCK     with imut = 251;     // 0xFB
+let is i64 as MK_DISCARD_PADDING     with imut = 30114;   // 0x75A2
+
+// Track types defined by the specification (documentation for callers).
+let is i64 as MK_TRACK_VIDEO     with imut = 1;
+let is i64 as MK_TRACK_AUDIO     with imut = 2;
+let is i64 as MK_TRACK_COMPLEX   with imut = 3;
+let is i64 as MK_TRACK_LOGO      with imut = 16;
+let is i64 as MK_TRACK_SUBTITLE  with imut = 17;
+let is i64 as MK_TRACK_BUTTONS   with imut = 18;
+let is i64 as MK_TRACK_CONTROL   with imut = 32;
+
+let is i64 as MK_MAX_TRACKS with imut = 64;
+
+struct MkTrack {
+    number       as i64;    // TrackNumber, > 0
+    typ          as i64;    // MK_TRACK_*
+    codec_id     as *u8;    // borrowed ASCII, not NUL-terminated
+    codec_id_len as i64;
+    codec_priv   as *u8;    // borrowed CodecPrivate, or null with len 0
+    codec_priv_len as i64;
+    pixel_width  as i64;    // video only, 0 otherwise
+    pixel_height as i64;
+    sample_rate  as f64;    // audio only, 0.0 otherwise
+    channels     as i64;    // audio only, 0 otherwise
+    default_duration as i64;   // ns, 0 when absent
+    codec_delay  as i64;       // ns, 0 when absent
+    seek_pre_roll as i64;      // ns, 0 when absent
+}
+
+struct MkLace {
+    ptr as *u8;
+    len as i64;
+}
+
+struct Mk {
+    src as *u8;
+    len as i64;
+
+    timecode_scale  as i64;    // ns per Timecode tick
+    duration_ticks  as f64;    // raw Info Duration, in Timecode ticks
+    duration        as f64;    // ns, 0 when absent
+
+    tracks      as [64]MkTrack;
+    track_count as i64;
+
+    seg_pos as i64;            // next Segment child to inspect
+    seg_end as i64;            // end of the Segment payload
+
+    in_cluster    as i64;
+    cl_pos        as i64;      // next cluster child
+    cl_end        as i64;      // known end, or seg_end when unknown
+    cl_unknown    as i64;
+    cluster_timecode as i64;   // ticks
+
+    laces       as [256]MkLace;
+    lace_count  as i64;
+    lace_index  as i64;
+    lace_pts    as i64;        // ns of the first lace
+    lace_dur    as i64;        // ns per lace
+    lace_dur_last as i64;      // ns of the last lace (exact remainder)
+    lace_track  as i32;
+    lace_key    as i64;
+    lace_discard as i64;       // ns, from BlockGroup DiscardPadding
+}
+
+fn _track_zero(t as *MkTrack) as void {
+    t.number = 0;
+    t.typ = 0;
+    t.codec_id = cast(*u8, 0);
+    t.codec_id_len = 0;
+    t.codec_priv = cast(*u8, 0);
+    t.codec_priv_len = 0;
+    t.pixel_width = 0;
+    t.pixel_height = 0;
+    t.sample_rate = 0.0;
+    t.channels = 0;
+    t.default_duration = 0;
+    t.codec_delay = 0;
+    t.seek_pre_roll = 0;
+}
+
+// ticks * scale, refused instead of overflowing. Returns 0 or I_CORRUPT.
+fn _ns_from_ticks(ticks as i64, scale as i64, out as *i64) as i64 {
+    if (scale <= 0) { return errno.I_CORRUPT; }
+    let is i64 as limit = 4611686018427387904;   // 2^62
+    if (ticks > limit / scale || ticks < 0 - (limit / scale)) {
+        return errno.I_CORRUPT;
+    }
+    *out = ticks * scale;
+    return errno.I_OK;
+}
+
+fn _be16(src as *u8, off as i64) as i64 {
+    return (cast(i64, src[off]) << 8) | cast(i64, src[off + 1]);
+}
+
+// Track index for a Matroska TrackNumber, or -1.
+fn _track_index(m as *Mk, number as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < m.track_count) {
+        if (m.tracks[i].number == number) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ── Info ────────────────────────────────────────────────────────────
+
+fn _parse_info(m as *Mk, e as *ebml.Ebml, off as i64, size as i64) as i64 {
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + size;
+    while (pos < end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, pos, end, &el);
+        if (r < 0) { return r; }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        if (el.id == MK_TIMECODE_SCALE) {
+            let is i64 as v with mut = 0;
+            r = ebml.ebml_uint(e, &el, &v);
+            if (r < 0) { return r; }
+            if (v <= 0) { return errno.I_CORRUPT; }
+            m.timecode_scale = v;
+        } else if (el.id == MK_DURATION) {
+            let is f64 as v with mut = 0.0;
+            r = ebml.ebml_float(e, &el, &v);
+            if (r < 0) { return r; }
+            if (v < 0.0) { return errno.I_CORRUPT; }
+            m.duration_ticks = v;
+        }
+        pos = el.next;
+    }
+    return errno.I_OK;
+}
+
+// ── Tracks ──────────────────────────────────────────────────────────
+
+fn _parse_video(e as *ebml.Ebml, off as i64, size as i64,
+                t as *MkTrack) as i64 {
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + size;
+    while (pos < end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, pos, end, &el);
+        if (r < 0) { return r; }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        if (el.id == MK_PIXEL_WIDTH) {
+            r = ebml.ebml_uint(e, &el, &t.pixel_width);
+            if (r < 0) { return r; }
+        } else if (el.id == MK_PIXEL_HEIGHT) {
+            r = ebml.ebml_uint(e, &el, &t.pixel_height);
+            if (r < 0) { return r; }
+        }
+        pos = el.next;
+    }
+    return errno.I_OK;
+}
+
+fn _parse_audio(e as *ebml.Ebml, off as i64, size as i64,
+                t as *MkTrack) as i64 {
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + size;
+    while (pos < end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, pos, end, &el);
+        if (r < 0) { return r; }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        if (el.id == MK_SAMPLING_FREQUENCY) {
+            let is f64 as v with mut = 0.0;
+            r = ebml.ebml_float(e, &el, &v);
+            if (r < 0) { return r; }
+            t.sample_rate = v;
+        } else if (el.id == MK_CHANNELS) {
+            r = ebml.ebml_uint(e, &el, &t.channels);
+            if (r < 0) { return r; }
+            if (t.channels < 0) { return errno.I_CORRUPT; }
+        }
+        pos = el.next;
+    }
+    return errno.I_OK;
+}
+
+fn _parse_entry(m as *Mk, e as *ebml.Ebml, off as i64, size as i64,
+                t as *MkTrack) as i64 {
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + size;
+    while (pos < end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, pos, end, &el);
+        if (r < 0) { return r; }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        if (el.id == MK_TRACK_NUMBER) {
+            r = ebml.ebml_uint(e, &el, &t.number);
+            if (r < 0) { return r; }
+        } else if (el.id == MK_TRACK_TYPE) {
+            r = ebml.ebml_uint(e, &el, &t.typ);
+            if (r < 0) { return r; }
+        } else if (el.id == MK_CODEC_ID) {
+            let is ebml.EbmlSlice as s;
+            r = ebml.ebml_str(e, &el, &s);
+            if (r < 0) { return r; }
+            t.codec_id = s.ptr;
+            t.codec_id_len = s.len;
+        } else if (el.id == MK_CODEC_PRIVATE) {
+            let is ebml.EbmlSlice as s;
+            r = ebml.ebml_slice(e, &el, &s);
+            if (r < 0) { return r; }
+            t.codec_priv = s.ptr;
+            t.codec_priv_len = s.len;
+        } else if (el.id == MK_DEFAULT_DURATION) {
+            r = ebml.ebml_uint(e, &el, &t.default_duration);
+            if (r < 0) { return r; }
+            if (t.default_duration < 0) { return errno.I_CORRUPT; }
+        } else if (el.id == MK_CODEC_DELAY) {
+            r = ebml.ebml_uint(e, &el, &t.codec_delay);
+            if (r < 0) { return r; }
+            if (t.codec_delay < 0) { return errno.I_CORRUPT; }
+        } else if (el.id == MK_SEEK_PRE_ROLL) {
+            r = ebml.ebml_uint(e, &el, &t.seek_pre_roll);
+            if (r < 0) { return r; }
+            if (t.seek_pre_roll < 0) { return errno.I_CORRUPT; }
+        } else if (el.id == MK_VIDEO) {
+            r = _parse_video(e, el.off, el.size, t);
+            if (r < 0) { return r; }
+        } else if (el.id == MK_AUDIO) {
+            r = _parse_audio(e, el.off, el.size, t);
+            if (r < 0) { return r; }
+        }
+        pos = el.next;
+    }
+    if (t.number <= 0) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+fn _parse_tracks(m as *Mk, e as *ebml.Ebml, off as i64, size as i64) as i64 {
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + size;
+    while (pos < end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, pos, end, &el);
+        if (r < 0) { return r; }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        if (el.id == MK_TRACK_ENTRY) {
+            // Refuse before writing the entry past the fixed array.
+            if (m.track_count >= MK_MAX_TRACKS) { return errno.I_CORRUPT; }
+            _track_zero(&m.tracks[m.track_count]);
+            r = _parse_entry(m, e, el.off, el.size, &m.tracks[m.track_count]);
+            if (r < 0) { return r; }
+            m.track_count = m.track_count + 1;
+        }
+        pos = el.next;
+    }
+    return errno.I_OK;
+}
+
+// ── Open ────────────────────────────────────────────────────────────
+
+// Drop every published field so a failed or finished demuxer yields nothing.
+fn _mk_clear(m as *Mk) as void {
+    m.src = cast(*u8, 0);
+    m.len = 0;
+    m.timecode_scale = 0;
+    m.duration_ticks = 0.0;
+    m.duration = 0.0;
+    m.track_count = 0;
+    m.seg_pos = 0;
+    m.seg_end = 0;
+    m.in_cluster = 0;
+    m.cl_pos = 0;
+    m.cl_end = 0;
+    m.cl_unknown = 0;
+    m.cluster_timecode = 0;
+    m.lace_count = 0;
+    m.lace_index = 0;
+    m.lace_pts = 0;
+    m.lace_dur = 0;
+    m.lace_dur_last = 0;
+    m.lace_track = 0;
+    m.lace_key = 0;
+    m.lace_discard = 0;
+}
+
+// Parse the file at src[0..len]. Returns 0, or a negative code:
+//   I_BADMAGIC    not EBML, no Segment, or a DocType other than webm/matroska
+//   I_UNSUPPORTED DocTypeReadVersion above 4
+//   I_CORRUPT     malformed element, unknown size where the level forbids it,
+//                 no tracks, or a track count past MK_MAX_TRACKS
+//   I_EOF         a header cut short
+// On failure every field is cleared, so a later mk_next returns 0.
+fn mk_open(m as *Mk, src as *u8, len as i64) as i64 {
+    let is i64 as r = _mk_open(m, src, len);
+    if (r < 0) { _mk_clear(m); }
+    return r;
+}
+
+fn _mk_open(m as *Mk, src as *u8, len as i64) as i64 {
+    m.src = cast(*u8, 0);
+    m.len = 0;
+    m.timecode_scale = 1000000;
+    m.duration_ticks = 0.0;
+    m.duration = 0.0;
+    m.track_count = 0;
+    m.seg_pos = 0;
+    m.seg_end = 0;
+    m.in_cluster = 0;
+    m.cl_pos = 0;
+    m.cl_end = 0;
+    m.cl_unknown = 0;
+    m.cluster_timecode = 0;
+    m.lace_count = 0;
+    m.lace_index = 0;
+    m.lace_pts = 0;
+    m.lace_dur = 0;
+    m.lace_dur_last = 0;
+    m.lace_track = 0;
+    m.lace_key = 0;
+    m.lace_discard = 0;
+
+    let is ebml.Ebml as e;
+    let is i64 as r with mut = ebml.ebml_init(&e, src, len);
+    if (r < 0) { return r; }
+
+    let is ebml.EbmlElement as el;
+    r = ebml.ebml_read_element(&e, 0, len, &el);
+    if (r < 0) { return r; }
+    if (el.id != EBML_HEADER) { return errno.I_BADMAGIC; }
+    if (el.unknown != 0) { return errno.I_CORRUPT; }
+
+    // DocType: mandatory, and it names the subset this demuxer implements.
+    let is ebml.EbmlElement as dt;
+    r = ebml.ebml_find(&e, el.off, el.next, EBML_DOC_TYPE, &dt);
+    if (r < 0) { return r; }
+    if (r == 0) { return errno.I_BADMAGIC; }
+    let is i64 as webm = ebml.ebml_str_eq(&e, &dt, "webm");
+    if (webm < 0) { return webm; }
+    let is i64 as mkv = ebml.ebml_str_eq(&e, &dt, "matroska");
+    if (mkv < 0) { return mkv; }
+    if (webm == 0 && mkv == 0) { return errno.I_BADMAGIC; }
+
+    // DocTypeReadVersion is optional (default 1). This reader handles <= 4.
+    let is ebml.EbmlElement as rv;
+    r = ebml.ebml_find(&e, el.off, el.next, EBML_DOC_TYPE_READ, &rv);
+    if (r < 0) { return r; }
+    if (r == 1) {
+        let is i64 as v with mut = 0;
+        r = ebml.ebml_uint(&e, &rv, &v);
+        if (r < 0) { return r; }
+        if (v <= 0) { return errno.I_CORRUPT; }
+        if (v > 4) { return errno.I_UNSUPPORTED; }
+    }
+
+    // Segment, allowing Void/CRC padding between it and the header.
+    let is i64 as pos = el.next;
+    let is i64 as seg_found with mut = 0;
+    let is ebml.EbmlElement as seg;
+    let is i64 as scan with mut = pos;
+    while (scan < len) {
+        r = ebml.ebml_read_element(&e, scan, len, &seg);
+        if (r < 0) { return r; }
+        if (seg.id == MK_SEGMENT) { seg_found = 1; break; }
+        if (seg.unknown != 0) { return errno.I_CORRUPT; }
+        if (ebml.ebml_is_skippable(seg.id) == 0) { return errno.I_BADMAGIC; }
+        scan = seg.next;
+    }
+    if (seg_found == 0) { return errno.I_BADMAGIC; }
+
+    m.src = src;
+    m.len = len;
+    m.seg_pos = seg.off;
+    if (seg.unknown != 0) { m.seg_end = len; }
+    else { m.seg_end = seg.next; }
+
+    // Walk the Segment until the first Cluster, collecting Info and Tracks.
+    // Everything else at this level (SeekHead, Cues, Tags, Chapters, Void,
+    // CRC-32) is skipped by its validated size.
+    let is i64 as p with mut = seg.off;
+    while (p < m.seg_end) {
+        let is ebml.EbmlElement as child;
+        r = ebml.ebml_read_element(&e, p, m.seg_end, &child);
+        if (r < 0) { return r; }
+        if (child.id == MK_CLUSTER) { break; }
+        if (child.unknown != 0) { return errno.I_CORRUPT; }
+        if (child.id == MK_INFO) {
+            r = _parse_info(m, &e, child.off, child.size);
+            if (r < 0) { return r; }
+        } else if (child.id == MK_TRACKS) {
+            r = _parse_tracks(m, &e, child.off, child.size);
+            if (r < 0) { return r; }
+        }
+        p = child.next;
+    }
+    m.seg_pos = p;
+    if (m.track_count == 0) { return errno.I_CORRUPT; }
+
+    m.duration = m.duration_ticks * cast(f64, m.timecode_scale);
+    return errno.I_OK;
+}
+
+// ── Cluster walk ────────────────────────────────────────────────────
+
+// Move to the next Cluster at Segment level: 1 started, 0 end of segment, or
+// a negative code. Non-cluster children (SeekHead, Cues, ...) are skipped.
+fn _next_cluster(m as *Mk, e as *ebml.Ebml) as i64 {
+    while (m.seg_pos < m.seg_end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r = ebml.ebml_read_element(e, m.seg_pos, m.seg_end, &el);
+        if (r < 0) { return r; }
+        if (el.id == MK_CLUSTER) {
+            m.in_cluster = 1;
+            m.cl_pos = el.off;
+            m.cl_unknown = el.unknown;
+            m.cluster_timecode = 0;
+            if (el.unknown != 0) {
+                m.cl_end = m.seg_end;
+                m.seg_pos = m.seg_end;
+            } else {
+                m.cl_end = el.next;
+                m.seg_pos = el.next;
+            }
+            return 1;
+        }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        m.seg_pos = el.next;
+    }
+    return 0;
+}
+
+// Parse laces from a block payload in [pos, end). Fills m.laces and writes
+// the count through *out_count. Returns 0 or a negative code; nothing is
+// published as a packet until the whole lacing header checks out.
+fn _parse_laces(m as *Mk, pos as i64, end as i64, lacing as i64,
+                out_count as *i64) as i64 {
+    let is i64 as rem = end - pos;
+    if (rem < 0) { return errno.I_CORRUPT; }
+
+    if (lacing == 0) {
+        m.laces[0].ptr = cast(*u8, cast(i64, m.src) + pos);
+        m.laces[0].len = rem;
+        *out_count = 1;
+        return errno.I_OK;
+    }
+
+    if (pos >= end) { return errno.I_CORRUPT; }
+    let is i64 as count = cast(i64, m.src[pos]) + 1;
+    let is i64 as q with mut = pos + 1;
+
+    let is [256]i64 as sizes;
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+
+    if (lacing == 1) {
+        // Xiph: count-1 sizes; each is a run of 255 bytes plus a final byte.
+        while (i < count - 1) {
+            let is i64 as s with mut = 0;
+            while (1) {
+                if (q >= end) { return errno.I_CORRUPT; }
+                let is i64 as b = cast(i64, m.src[q]);
+                q = q + 1;
+                s = s + b;
+                if (s > end - q) { return errno.I_CORRUPT; }
+                if (b != 255) { break; }
+            }
+            sizes[i] = s;
+            sum = sum + s;
+            if (sum > end - q) { return errno.I_CORRUPT; }
+            i = i + 1;
+        }
+    } else if (lacing == 2) {
+        // Fixed: equal frames, so the remaining bytes must divide evenly.
+        let is i64 as each = (end - q) / count;
+        if (each * count != end - q) { return errno.I_CORRUPT; }
+        while (i < count) {
+            sizes[i] = each;
+            sum = sum + each;
+            i = i + 1;
+        }
+    } else {
+        // EBML: first size is unsigned; each later size is a biased signed
+        // difference from the previous one. The last is the remainder.
+        let is i64 as prev with mut = 0;
+        while (i < count - 1) {
+            let is ebml.EbmlVint as v;
+            let is i64 as r = ebml.ebml_read_vint(m.src, q, end, 0, &v);
+            if (r < 0) { return r; }
+            if (v.unknown != 0) { return errno.I_CORRUPT; }
+            q = v.next;
+            if (i == 0) {
+                prev = v.value;
+            } else {
+                let is i64 as bias = (1 << (7 * v.len - 1)) - 1;
+                prev = prev + (v.value - bias);
+                if (prev < 0) { return errno.I_CORRUPT; }
+            }
+            sizes[i] = prev;
+            sum = sum + prev;
+            if (sum > end - q) { return errno.I_CORRUPT; }
+            i = i + 1;
+        }
+    }
+
+    // The last frame is whatever is left; a negative remainder is a corrupt
+    // size table, caught before any pointer or length is published.
+    if (i < count) {
+        let is i64 as last = (end - q) - sum;
+        if (last < 0) { return errno.I_CORRUPT; }
+        sizes[count - 1] = last;
+        i = count;
+    }
+
+    let is i64 as p with mut = q;
+    i = 0;
+    while (i < count) {
+        if (sizes[i] < 0 || sizes[i] > end - p) { return errno.I_CORRUPT; }
+        m.laces[i].ptr = cast(*u8, cast(i64, m.src) + p);
+        m.laces[i].len = sizes[i];
+        p = p + sizes[i];
+        i = i + 1;
+    }
+    *out_count = count;
+    return errno.I_OK;
+}
+
+// Parse a Block/SimpleBlock payload and fill the pending lace list with its
+// timestamps. `key_in` is -1 to take the keyframe bit from the block flags
+// (SimpleBlock); 0/1 override it (BlockGroup sets it from ReferenceBlock).
+// `have_dur`/`dur_ticks` carry BlockDuration; `discard` is DiscardPadding ns.
+fn _parse_block(m as *Mk, off as i64, size as i64, key_in as i64,
+                have_dur as i64, dur_ticks as i64, discard as i64) as i64 {
+    let is i64 as end = off + size;
+    let is i64 as pos with mut = off;
+
+    let is ebml.EbmlVint as tv;
+    let is i64 as r with mut = ebml.ebml_read_vint(m.src, pos, end, 0, &tv);
+    if (r < 0) { return r; }
+    if (tv.unknown != 0) { return errno.I_CORRUPT; }
+    pos = tv.next;
+    if (end - pos < 3) { return errno.I_CORRUPT; }
+
+    // SimpleBlock flags: 0x80 keyframe, 0x70 reserved, 0x08 invisible (no
+    // effect on framing), 0x06 lacing mode, 0x01 discardable. Block inside a
+    // BlockGroup carries the same layout; its keyframe comes from
+    // ReferenceBlock instead.
+    let is i64 as rel = _be16(m.src, pos);
+    let is i64 as rel_signed with mut = rel;
+    if (rel_signed >= 32768) { rel_signed = rel_signed - 65536; }
+    let is i64 as flags = cast(i64, m.src[pos + 2]);
+    pos = pos + 3;
+
+    let is i64 as key with mut = key_in;
+    if (key_in < 0) {
+        key = 0;
+        if ((flags & 128) != 0) { key = 1; }
+    }
+    let is i64 as lacing = (flags >> 1) & 3;
+
+    let is i64 as ti = _track_index(m, tv.value);
+    if (ti < 0) { return errno.I_CORRUPT; }
+    let is *MkTrack as t = &m.tracks[ti];
+
+    let is i64 as count with mut = 0;
+    r = _parse_laces(m, pos, end, lacing, &count);
+    if (r < 0) { return r; }
+
+    let is i64 as base_ns with mut = 0;
+    r = _ns_from_ticks(m.cluster_timecode + rel_signed, m.timecode_scale,
+                       &base_ns);
+    if (r < 0) { return r; }
+
+    let is i64 as per with mut = 0;
+    let is i64 as last with mut = 0;
+    let is i64 as span with mut = 0;
+    if (have_dur != 0) {
+        let is i64 as total with mut = 0;
+        r = _ns_from_ticks(dur_ticks, m.timecode_scale, &total);
+        if (r < 0) { return r; }
+        per = total / count;
+        last = total - per * (count - 1);
+        span = total;
+    } else {
+        per = t.default_duration;
+        last = per;
+        // The last lace's pts is base + (count-1)*per. Refuse a table that
+        // would overflow that sum rather than wrapping a timestamp.
+        if (count > 1) {
+            if (per > 4611686018427387904 / (count - 1)) {
+                return errno.I_CORRUPT;
+            }
+            span = per * (count - 1);
+        }
+    }
+    if (base_ns > 0 && span > 4611686018427387904 - base_ns) {
+        return errno.I_CORRUPT;
+    }
+
+    m.lace_count = count;
+    m.lace_index = 0;
+    m.lace_pts = base_ns;
+    m.lace_dur = per;
+    m.lace_dur_last = last;
+    m.lace_track = cast(i32, ti);
+    m.lace_key = key;
+    m.lace_discard = discard;
+    return errno.I_OK;
+}
+
+// Parse a BlockGroup: Block plus the metadata that overrides it. A block with
+// no ReferenceBlock is a keyframe. Returns 0 or a negative code.
+fn _parse_block_group(m as *Mk, e as *ebml.Ebml, off as i64,
+                      size as i64) as i64 {
+    let is i64 as pos with mut = off;
+    let is i64 as end = off + size;
+    let is i64 as block_off with mut = 0;
+    let is i64 as block_size with mut = 0;
+    let is i64 as have_block with mut = 0;
+    let is i64 as key with mut = 1;
+    let is i64 as dur with mut = 0;
+    let is i64 as have_dur with mut = 0;
+    let is i64 as discard with mut = 0;
+
+    while (pos < end) {
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, pos, end, &el);
+        if (r < 0) { return r; }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+        if (el.id == MK_BLOCK) {
+            block_off = el.off;
+            block_size = el.size;
+            have_block = 1;
+        } else if (el.id == MK_REFERENCE_BLOCK) {
+            key = 0;
+        } else if (el.id == MK_BLOCK_DURATION) {
+            r = ebml.ebml_uint(e, &el, &dur);
+            if (r < 0) { return r; }
+            if (dur < 0) { return errno.I_CORRUPT; }
+            have_dur = 1;
+        } else if (el.id == MK_DISCARD_PADDING) {
+            r = ebml.ebml_int(e, &el, &discard);
+            if (r < 0) { return r; }
+            if (discard < 0) { return errno.I_CORRUPT; }
+        }
+        pos = el.next;
+    }
+
+    if (have_block == 0) { return errno.I_CORRUPT; }
+    return _parse_block(m, block_off, block_size, key, have_dur, dur, discard);
+}
+
+// One step inside the current cluster. Returns 1 when laces are ready to be
+// handed out, 0 when the element was skipped or the cluster ended, or a
+// negative code.
+fn _cluster_step(m as *Mk, e as *ebml.Ebml) as i64 {
+    while (m.cl_pos < m.cl_end) {
+        let is i64 as start = m.cl_pos;
+        let is ebml.EbmlElement as el;
+        let is i64 as r with mut = ebml.ebml_read_element(e, start, m.cl_end, &el);
+        if (r < 0) { return r; }
+
+        if (el.id == MK_CLUSTER) {
+            // Only an unknown-size cluster can be ended by a sibling, whose
+            // header we just read. Rewind so Segment level reads it again.
+            if (m.cl_unknown == 0) { return errno.I_CORRUPT; }
+            m.seg_pos = start;
+            m.in_cluster = 0;
+            return 0;
+        }
+        if (el.unknown != 0) { return errno.I_CORRUPT; }
+
+        if (el.id == MK_TIMECODE) {
+            r = ebml.ebml_uint(e, &el, &m.cluster_timecode);
+            if (r < 0) { return r; }
+            if (m.cluster_timecode < 0) { return errno.I_CORRUPT; }
+            if (m.cluster_timecode > 4611686018427387904) {
+                return errno.I_CORRUPT;
+            }
+            m.cl_pos = el.next;
+            continue;
+        }
+        if (el.id == MK_SIMPLE_BLOCK) {
+            r = _parse_block(m, el.off, el.size, 0 - 1, 0, 0, 0);
+            if (r < 0) { return r; }
+            m.cl_pos = el.next;
+            return 1;
+        }
+        if (el.id == MK_BLOCK_GROUP) {
+            r = _parse_block_group(m, e, el.off, el.size);
+            if (r < 0) { return r; }
+            m.cl_pos = el.next;
+            return 1;
+        }
+        m.cl_pos = el.next;
+    }
+
+    m.in_cluster = 0;
+    if (m.cl_unknown == 0) { m.seg_pos = m.cl_end; }
+    return 0;
+}
+
+// ── Public iteration ────────────────────────────────────────────────
+
+// Next packet: 1 with *pkt filled, 0 at a clean end of stream, or a negative
+// code on malformed input. Track is the 0-based index into the exposed track
+// list; pts/dts/duration are nanoseconds.
+fn mk_next(m as *Mk, pkt as *packet.Packet) as i64 {
+    while (1) {
+        if (m.lace_index < m.lace_count) {
+            let is i64 as i = m.lace_index;
+            let is i64 as dur with mut = m.lace_dur;
+            if (i == m.lace_count - 1) { dur = m.lace_dur_last; }
+            let is i64 as pts = m.lace_pts + i * m.lace_dur;
+            let is i64 as r with mut = packet.packet_set(pkt, m.laces[i].ptr,
+                                                m.laces[i].len, m.lace_track,
+                                                pts, pts, dur, m.lace_key);
+            if (r < 0) { return r; }
+            r = packet.packet_set_discard_padding(pkt, m.lace_discard);
+            if (r < 0) { return r; }
+            m.lace_index = m.lace_index + 1;
+            return 1;
+        }
+
+        if (m.in_cluster != 0) {
+            let is ebml.Ebml as e;
+            e.src = m.src;
+            e.len = m.len;
+            let is i64 as r = _cluster_step(m, &e);
+            if (r < 0) { return r; }
+            continue;
+        }
+
+        let is ebml.Ebml as e2;
+        e2.src = m.src;
+        e2.len = m.len;
+        let is i64 as s = _next_cluster(m, &e2);
+        if (s < 0) { return s; }
+        if (s == 0) { return 0; }
+    }
+    return 0;
+}
+
+fn mk_track_count(m as *Mk) as i64 {
+    return m.track_count;
+}
+
+// Track by 0-based index, or a null pointer when the index is out of range.
+fn mk_track(m as *Mk, i as i64) as *MkTrack {
+    if (i < 0 || i >= m.track_count) { return cast(*MkTrack, 0); }
+    return &m.tracks[i];
+}
+
+fn mk_timecode_scale(m as *Mk) as i64 {
+    return m.timecode_scale;
+}
+
+// Segment duration in nanoseconds, 0.0 when Info did not carry one.
+fn mk_duration(m as *Mk) as f64 {
+    return m.duration;
+}
+
+fn _strlen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Compare a track's CodecID against a NUL-terminated string. 1 equal, 0 not.
+fn mk_track_codec_eq(t as *MkTrack, s as *u8) as i64 {
+    let is i64 as n = _strlen(s);
+    if (n != t.codec_id_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (t.codec_id[i] != s[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}

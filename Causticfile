@@ -44,5 +44,6 @@ script "test-opt" {
 script "clean" {
     "rm -rf build .caustic"
     "rm -f tests/test_core tests/test_core.exe"
+    "rm -f tests/test_matroska tests/test_matroska.exe"
     "echo 'clean: build artifacts, cache and test binaries removed'"
 }

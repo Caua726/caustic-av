@@ -1,0 +1,403 @@
+// =======================================================
+// caustic-av/container/ebml.cst
+// A streaming reader for EBML (RFC 8794), the framing layer under Matroska
+// and WebM. It parses element headers and primitive values out of a
+// caller-owned byte range. Nothing here allocates, and nothing trusts a size
+// in the file: a declared payload is checked against its parent's end and the
+// source length before any offset is published, so a hostile header cannot
+// move a caller past its buffer.
+//
+// Framing:
+//   An element is an ID vint followed by a size vint followed by `size`
+//   payload bytes. A vint's first byte has a marker bit: 1xxxxxxx is one
+//   byte, 01xxxxxx is two, ... 00000001 is eight. The marker and the zero
+//   prefix are not part of the value. IDs keep their marker (Matroska writes
+//   them that way, e.g. 0x1A45DFA3), so an ID's value is returned raw; a
+//   size comes back with the marker removed. An all-ones size value is the
+//   "unknown size" sentinel and is reported through `unknown` rather than as
+//   a usable length.
+//
+//   Two elements are pure padding/skip material: CRC-32 (0xBF) and Void
+//   (0xEC). They are ordinary elements here; `ebml_is_skippable` names them
+//   so callers can skip them without a size table.
+//
+// Errors follow the library convention: 0 or a positive result is success, a
+// negative i64 is an error. A failed call leaves the out-parameter untouched
+// and never moves a caller's cursor. Sizes are validated before use, and the
+// value readers reject a payload wider than the primitive they read instead
+// of truncating it.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+
+// 2^60 - 1 bytes keeps every offset and offset+size inside a positive i64.
+let is i64 as EBML_MAX_BYTES with imut = 1152921504606846975;
+
+// CRC-32 element: its payload is a CRC over the parent; a reader that does
+// not verify it skips it like any element.
+let is i64 as EBML_ID_CRC32 with imut = 191;    // 0xBF
+// Void: payload is filler.
+let is i64 as EBML_ID_VOID  with imut = 236;    // 0xEC
+
+struct Ebml {
+    src as *u8;   // caller-owned bytes
+    len as i64;   // bytes available from src, 0 <= len <= EBML_MAX_BYTES
+}
+
+// One vint read, before it is interpreted as an ID or a size.
+struct EbmlVint {
+    value   as i64;   // data bits, marker and zero prefix removed
+    raw     as i64;   // all bits of the vint, marker included (IDs)
+    len     as i64;   // bytes consumed, 1..8
+    next    as i64;   // absolute source offset after the vint
+    unknown as i64;   // 1 when this is a size whose data bits are all ones
+}
+
+// A parsed element header. `off` is the absolute source offset of the
+// payload; `next` is the offset just past it. For an unknown-size element
+// `size` is 0 and `next` equals `off`, because the end is not knowable from
+// the header: the caller finds it by scanning for the next sibling.
+struct EbmlElement {
+    id      as i64;
+    size    as i64;
+    off     as i64;
+    next    as i64;
+    unknown as i64;
+}
+
+// Borrowed view of an element payload or string.
+struct EbmlSlice {
+    ptr as *u8;
+    len as i64;
+}
+
+// Iteration over the children of one parent range.
+struct EbmlIter {
+    e   as *Ebml;
+    pos as i64;
+    end as i64;
+}
+
+// Bind the reader to src[0..len]. Returns 0, I_BADPARAM for a negative length
+// or a null pointer with bytes, or I_DIMS if len is beyond EBML_MAX_BYTES.
+// On failure the reader is left empty.
+fn ebml_init(e as *Ebml, src as *u8, len as i64) as i64 {
+    e.src = cast(*u8, 0);
+    e.len = 0;
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > EBML_MAX_BYTES) { return errno.I_DIMS; }
+    if (len > 0 && cast(i64, src) == 0) { return errno.I_BADPARAM; }
+    e.src = src;
+    e.len = len;
+    return errno.I_OK;
+}
+
+// Length in bytes of the vint whose first byte is `first`, or 0 when the
+// first byte cannot start one (0x00 asks for more than eight bytes).
+fn ebml_vint_len(first as i64) as i64 {
+    if (first <= 0 || first > 255) { return 0; }
+    let is i64 as len with mut = 1;
+    let is i64 as mask with mut = 128;
+    while ((first & mask) == 0) {
+        len = len + 1;
+        mask = mask >> 1;
+        if (len > 8) { return 0; }
+    }
+    return len;
+}
+
+// Read one vint at src[pos] with the read confined to [pos, end).
+//
+// `is_id` selects the interpretation: an ID keeps its marker bits, may be at
+// most four bytes (the EBML maximum ID length), and never carries the
+// unknown-size sentinel; a size loses the marker and reports the sentinel
+// through *out.unknown. Returns 0 or a negative code:
+//   I_BADPARAM  pos/end outside the source or end before pos
+//   I_EOF       no byte at pos, or fewer than the prefix promises
+//   I_CORRUPT   0x00 prefix (would need more than eight bytes), or a
+//               five-byte-or-longer ID
+// *out is untouched on failure.
+fn ebml_read_vint(src as *u8, pos as i64, end as i64, is_id as i64,
+                  out as *EbmlVint) as i64 {
+    if (pos < 0 || end < pos) { return errno.I_BADPARAM; }
+    if (pos >= end) { return errno.I_EOF; }
+    let is i64 as first = cast(i64, src[pos]);
+    let is i64 as len = ebml_vint_len(first);
+    if (len == 0) { return errno.I_CORRUPT; }
+    if (is_id != 0 && len > 4) { return errno.I_CORRUPT; }
+    if (end - pos < len) { return errno.I_EOF; }
+
+    // Value bits with the marker and its zero prefix removed.
+    let is i64 as value with mut = first & ((1 << (8 - len)) - 1);
+    if (len == 8) { value = 0; }   // the whole first byte was the marker
+    let is i64 as raw with mut = first;
+    let is i64 as i with mut = 1;
+    while (i < len) {
+        let is i64 as b = cast(i64, src[pos + i]);
+        value = (value << 8) | b;
+        raw = (raw << 8) | b;
+        i = i + 1;
+    }
+
+    let is i64 as unknown with mut = 0;
+    if (is_id == 0) {
+        // All data bits set, for the element's own length. For len 8 that is
+        // 56 data bits, still positive in an i64.
+        let is i64 as all_ones = (1 << (7 * len)) - 1;
+        if (value == all_ones) { unknown = 1; }
+    }
+
+    out.value = value;
+    out.raw = raw;
+    out.len = len;
+    out.next = pos + len;
+    out.unknown = unknown;
+    return errno.I_OK;
+}
+
+// Read the element header at pos, with pos..parent_end as the enclosing
+// range. Returns 0 or a negative code; *el is untouched on failure.
+//
+// The declared payload is rejected with I_CORRUPT when it would run past the
+// parent, so `off + size` always stays inside the range the caller named. An
+// unknown size is legal here (it is the caller's job to decide whether its
+// level permits one); `next` then equals `off`.
+fn ebml_read_element(e as *Ebml, pos as i64, parent_end as i64,
+                     el as *EbmlElement) as i64 {
+    if (pos < 0 || parent_end < pos) { return errno.I_BADPARAM; }
+    if (parent_end > e.len) { return errno.I_BADPARAM; }
+
+    let is EbmlVint as id;
+    let is i64 as r with mut = ebml_read_vint(e.src, pos, parent_end, 1, &id);
+    if (r < 0) { return r; }
+    let is EbmlVint as sz;
+    r = ebml_read_vint(e.src, id.next, parent_end, 0, &sz);
+    if (r < 0) { return r; }
+
+    let is i64 as data = sz.next;
+    if (data > parent_end) { return errno.I_EOF; }
+
+    let is i64 as size with mut = 0;
+    let is i64 as next with mut = data;
+    let is i64 as unknown with mut = 0;
+    if (sz.unknown != 0) {
+        unknown = 1;
+    } else {
+        size = sz.value;
+        if (size > parent_end - data) { return errno.I_CORRUPT; }
+        next = data + size;
+    }
+
+    el.id = id.raw;
+    el.size = size;
+    el.off = data;
+    el.next = next;
+    el.unknown = unknown;
+    return errno.I_OK;
+}
+
+// Advance `cursor` past an element whose header was read successfully. An
+// unknown-size element has no known end, so this is I_UNSUPPORTED: the
+// caller must scan for a sibling instead of stepping over it.
+fn ebml_element_skip(el as *EbmlElement, cursor as *i64) as i64 {
+    if (el.unknown != 0) { return errno.I_UNSUPPORTED; }
+    *cursor = el.next;
+    return errno.I_OK;
+}
+
+fn ebml_is_skippable(id as i64) as i64 {
+    if (id == EBML_ID_CRC32 || id == EBML_ID_VOID) { return 1; }
+    return 0;
+}
+
+// Start iterating the children in [start, end). Returns 0, or I_BADPARAM on
+// a range outside the source or one that runs backwards.
+fn ebml_iter_init(it as *EbmlIter, e as *Ebml, start as i64, end as i64) as i64 {
+    if (start < 0 || end < start) { return errno.I_BADPARAM; }
+    if (end > e.len) { return errno.I_BADPARAM; }
+    it.e = e;
+    it.pos = start;
+    it.end = end;
+    return errno.I_OK;
+}
+
+// Next child: 1 and *el filled, 0 at the end of the range, or a negative
+// code. An unknown-size child is I_UNSUPPORTED: iteration cannot know where
+// it ends, so a level that allows unknown sizes must walk it itself.
+fn ebml_iter_next(it as *EbmlIter, el as *EbmlElement) as i64 {
+    if (it.pos >= it.end) { return 0; }
+    let is i64 as r = ebml_read_element(it.e, it.pos, it.end, el);
+    if (r < 0) { return r; }
+    if (el.unknown != 0) { return errno.I_UNSUPPORTED; }
+    it.pos = el.next;
+    return 1;
+}
+
+// Look for the first child with `id` in [start, end). Returns 1 when found,
+// 0 when the range ends without it, or a negative code on malformed input.
+fn ebml_find(e as *Ebml, start as i64, end as i64, id as i64,
+             el as *EbmlElement) as i64 {
+    let is EbmlIter as it;
+    let is i64 as r with mut = ebml_iter_init(&it, e, start, end);
+    if (r < 0) { return r; }
+    while (1) {
+        r = ebml_iter_next(&it, el);
+        if (r <= 0) { return r; }
+        if (el.id == id) { return 1; }
+    }
+    return 0;
+}
+
+// Same as ebml_find, over the payload of a known-size parent element.
+fn ebml_find_child(e as *Ebml, parent as *EbmlElement, id as i64,
+                   el as *EbmlElement) as i64 {
+    if (parent.unknown != 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as end = parent.off + parent.size;
+    if (end < parent.off || end > e.len) { return errno.I_CORRUPT; }
+    return ebml_find(e, parent.off, end, id, el);
+}
+
+// Borrow the element payload. Returns 0 and *out, or I_UNSUPPORTED when the
+// size is unknown. The slice points into the source and is valid as long as
+// the source is.
+fn ebml_slice(e as *Ebml, el as *EbmlElement, out as *EbmlSlice) as i64 {
+    if (el.unknown != 0) { return errno.I_UNSUPPORTED; }
+    if (el.off < 0 || el.size < 0) { return errno.I_CORRUPT; }
+    if (el.off > e.len || el.size > e.len - el.off) { return errno.I_CORRUPT; }
+    out.ptr = cast(*u8, cast(i64, e.src) + el.off);
+    out.len = el.size;
+    return errno.I_OK;
+}
+
+// Unsigned integer payload, 0..8 bytes big-endian. Zero bytes is 0. A full
+// eight-byte value with bit 63 set comes back negative: as with buf_u64be,
+// that is the raw 64 bits and casting to u64 recovers the value.
+fn ebml_uint(e as *Ebml, el as *EbmlElement, out as *i64) as i64 {
+    let is EbmlSlice as s;
+    let is i64 as r = ebml_slice(e, el, &s);
+    if (r < 0) { return r; }
+    if (s.len > 8) { return errno.I_CORRUPT; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.len) {
+        v = (v << 8) | cast(i64, s.ptr[i]);
+        i = i + 1;
+    }
+    *out = v;
+    return errno.I_OK;
+}
+
+// Signed integer payload, 0..8 bytes, two's complement big-endian. Zero
+// bytes is 0. *out is untouched on failure.
+fn ebml_int(e as *Ebml, el as *EbmlElement, out as *i64) as i64 {
+    let is EbmlSlice as s;
+    let is i64 as r = ebml_slice(e, el, &s);
+    if (r < 0) { return r; }
+    if (s.len > 8) { return errno.I_CORRUPT; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.len) {
+        v = (v << 8) | cast(i64, s.ptr[i]);
+        i = i + 1;
+    }
+    if (s.len > 0 && s.len < 8) {
+        let is i64 as sign = 1 << (s.len * 8 - 1);
+        if ((v & sign) != 0) { v = v - (sign << 1); }
+    }
+    *out = v;
+    return errno.I_OK;
+}
+
+// Reinterpret the 32 bits of an IEEE 754 single as a double. Every f32 value
+// (including subnormals, infinity and NaN) is exactly representable as f64,
+// so this is a bit-field widening rather than arithmetic. `bits` is the raw
+// 32 bits in a non-negative i64.
+fn _f32_bits_to_f64(bits as i64) as f64 {
+    let is i64 as sign = (bits >> 31) & 1;
+    let is i64 as exp = (bits >> 23) & 255;
+    let is i64 as frac = bits & 8388607;             // 2^23 - 1
+    let is i64 as fb with mut = 0;
+    if (exp == 255) {
+        // Infinity or NaN: keep the payload in the wider mantissa.
+        fb = (sign << 63) | (2047 << 52) | (frac << 29);
+        return *cast(*f64, &fb);
+    }
+    if (exp == 0 && frac == 0) {
+        fb = sign << 63;                             // signed zero
+        return *cast(*f64, &fb);
+    }
+    if (exp == 0) {
+        // f32 subnormal: value = frac * 2^-149. Normalise so the leading one
+        // becomes the f64 implicit bit, then the exponent follows from the
+        // bit position.
+        let is i64 as h with mut = 0;
+        let is i64 as t with mut = frac;
+        while (t > 1) { t = t >> 1; h = h + 1; }
+        let is i64 as mant = (frac - (1 << h)) << (52 - h);
+        fb = (sign << 63) | ((h + 874) << 52) | mant;
+        return *cast(*f64, &fb);
+    }
+    fb = (sign << 63) | ((exp + 896) << 52) | (frac << 29);
+    return *cast(*f64, &fb);
+}
+
+// Float payload: 0 bytes is 0.0, 4 bytes is a big-endian f32, 8 bytes is a
+// big-endian f64. Any other width is I_CORRUPT.
+fn ebml_float(e as *Ebml, el as *EbmlElement, out as *f64) as i64 {
+    let is EbmlSlice as s;
+    let is i64 as r = ebml_slice(e, el, &s);
+    if (r < 0) { return r; }
+    if (s.len == 0) {
+        *out = 0.0;
+        return errno.I_OK;
+    }
+    if (s.len != 4 && s.len != 8) { return errno.I_CORRUPT; }
+    let is i64 as bits with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < s.len) {
+        bits = (bits << 8) | cast(i64, s.ptr[i]);
+        i = i + 1;
+    }
+    if (s.len == 4) {
+        *out = _f32_bits_to_f64(bits);
+    } else {
+        *out = *cast(*f64, &bits);
+    }
+    return errno.I_OK;
+}
+
+// Borrowed string payload with the NUL padding Matroska uses stripped.
+// Returns 0 and *out, or a negative code. An empty string is len 0.
+fn ebml_str(e as *Ebml, el as *EbmlElement, out as *EbmlSlice) as i64 {
+    let is EbmlSlice as s;
+    let is i64 as r = ebml_slice(e, el, &s);
+    if (r < 0) { return r; }
+    let is i64 as n with mut = s.len;
+    while (n > 0 && s.ptr[n - 1] == 0) { n = n - 1; }
+    out.ptr = s.ptr;
+    out.len = n;
+    return errno.I_OK;
+}
+
+fn _strlen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Compare a string element against a NUL-terminated ASCII/UTF-8 string,
+// ignoring the element's trailing NUL padding. Returns 1 for equal, 0 for
+// different, or a negative code when the element cannot be read.
+fn ebml_str_eq(e as *Ebml, el as *EbmlElement, s as *u8) as i64 {
+    let is EbmlSlice as v;
+    let is i64 as r = ebml_str(e, el, &v);
+    if (r < 0) { return r; }
+    let is i64 as n = _strlen(s);
+    if (n != v.len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (v.ptr[i] != s[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
