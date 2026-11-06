@@ -1,0 +1,764 @@
+// =======================================================
+// caustic-av/decode.cst
+// Codec-id dispatch: one decoder object, opened for one track, fed one packet
+// at a time, handing out 0..N decoded frames.
+//
+//   decode_open(dec, track)                    open for a codec.Track
+//   decode_open_codec(dec, codec, priv, len)   open without a track
+//   decode_send(dec, pkt)                      0 = accepted, negative = error
+//   decode_receive(dec, out)                   1 = output, 0 = drained
+//
+// The dispatch table is small on purpose: the library has VP9 video, Opus
+// audio and MP3 audio, and nothing else. A codec this library knows by name
+// but does not decode (VP8, AV1, H.264, H.265, AAC, Vorbis, FLAC, Theora, PCM)
+// and a codec it does not know at all both return I_UNSUPPORTED from
+// decode_open; the track itself still lists, so a caller can report "this file
+// holds H.264" without pretending to play it.
+//
+// Ownership and memory
+// --------------------
+// The Decoder is caller-owned and large: it embeds the VP9 decoder (roughly
+// 250 KiB of probability contexts, counts and working sets), the Opus decoder
+// (SILK and CELT state), the MP3 decoder (parser plus synthesis history) and a
+// 11520-value i16 PCM scratch block (120 ms of stereo at 48 kHz, the longest
+// Opus packet). It belongs in caller storage, not on a small stack. Nothing
+// here allocates; the library opens no file and copies no packet.
+//
+// VP9 additionally needs caller memory that this module cannot invent:
+//
+//   decode_vp9_work_size(w, h)        bytes for the persistent work block
+//   decode_vp9_bind(dec, mem, cap)    attach it (8-byte aligned)
+//   decode_vp9_frame_size(w, h)       bytes for one I420 pool buffer
+//   decode_vp9_add_buffer(dec, ...)   register up to nine of them
+//   decode_vp9_replace_buffer(...)    grow a free buffer after I_NOMEM
+//   decode_vp9_free_buffer(dec)       index that no reference slot names
+//   decode_vp9_frame_need(dec)        frame_need after I_NOMEM
+//   decode_vp9_work_need(dec)         work_need after I_NOMEM
+//
+// Opus and MP3 need no extra block: their state is inside the Decoder. The
+// optional stage-9 tile threads add a third block, which the wrappers at the
+// bottom expose (decode_vp9_bind_threads and friends); they are written
+// against the stage 9 API and that branch is not merged yet.
+//
+// Packet handoff
+// --------------
+// send arms one packet; receive consumes it. A packet is either one VP9
+// superframe (up to eight coded frames), one Opus packet, or one MP3 frame.
+// VP9 yields 0..8 displayed frames in bitstream order; Opus and MP3 yield one
+// block or, when pre-skip/trim consumes the whole packet, none. send refuses a
+// second packet while the previous one is undrained (VP9 enforces it itself;
+// the audio paths use the pending flag), so no packet is skipped or handed out
+// twice. Receive returning 0 means the armed packet has no further output; for
+// audio, whose single output also finishes the packet, the next send is
+// allowed as soon as receive returns 1.
+//
+// The packet bytes stay the caller's. For VP9 they must remain valid and
+// unchanged until receive returns 0; for Opus and MP3 until receive returns.
+// Nothing is copied except the decoded PCM, which lands in the Decoder's own
+// scratch block.
+//
+// Output
+// ------
+// One Output record describes either a video view or an audio block.
+//
+//   Video: kind = OUTPUT_VIDEO, `video` is an I420 view (visible width/height,
+//          coded strides), valid until the next receive or send; the render
+//          hint, profile, bit depth, subsampling, colour space/range and the
+//          rising `order` hint come from vp9.Vp9Output. `pts_valid` is 1 only
+//          for the first output of a packet, because the container timestamp
+//          describes the packet, not each frame of a superframe; `order`
+//          gives the presentation sequence.
+//   Audio: kind = OUTPUT_AUDIO, `audio` is interleaved signed 16-bit PCM in
+//          the Decoder's scratch block (valid until the next receive), `pts`
+//          is the packet's timestamp in the track timebase, `pts_valid` is 1,
+//          and `duration` is the returned frame count converted to that same
+//          timebase.
+//
+// Pre-skip, codec delay and discard padding
+// -----------------------------------------
+//   pre-skip:      OpusHead's pre-skip is applied by opus_decoder_init, which
+//                  drops that many decoded 48 kHz samples from the start. A
+//                  Track.pre_skip greater than zero overrides the header value
+//                  (decode_set_pre_skip does the same for a caller with no
+//                  track); zero means "keep what the header said".
+//   codec delay:   the container's CodecDelay is recorded in the Decoder and
+//                  reported by decode_codec_delay. It is NOT applied a second
+//                  time here: the Opus pre-skip already covers the coded
+//                  delay, and the demuxer deliberately reports container
+//                  timestamps unshifted (container/matroska.cst explains that
+//                  choice). A caller that wants FFmpeg-style negative packet
+//                  pts subtracts the delay once, outside this module.
+//   discard pad:   Packet.discard_padding is nanoseconds at the end of the
+//                  block. For Opus it is converted to 48 kHz output samples
+//                  and added to the decoder's pending end trim, so a trim that
+//                  spans a packet boundary keeps working. For MP3 it is
+//                  converted at the frame's sample rate and subtracted from
+//                  the decoded block; a value that covers the whole block
+//                  yields no output (the excess is not carried, because a
+//                  valid block padding never exceeds the block).
+//
+// Errors
+// ------
+// Every entry point returns 0, a positive item count, or a negative
+// core/errno code; the codec modules' codes are passed through unchanged:
+// I_BADPARAM for a null/unopened/wrong-media object or a packet already
+// pending, I_NOMEM when a caller block is too small (the *_need getters say
+// how much), I_UNSUPPORTED for a profile or feature this library does not
+// implement, and the codec's I_EOF/I_CORRUPT for malformed input. An Opus or
+// MP3 decode error abandons the pending packet; the caller may re-open or call
+// the codec module's reset. VP9 errors taint the reference state until the
+// next key/intra-only frame, as video/vp9/vp9.md records.
+// =======================================================
+
+use "core/errno.cst" as errno;
+use "core/codec.cst" as codec;
+use "core/frame.cst" as frame;
+use "core/samples.cst" as samples;
+use "core/packet.cst" as packet;
+use "video/vp9/decode.cst" as vp9;
+use "audio/opus/opus.cst" as opus;
+use "audio/mp3/mp3.cst" as mp3;
+use "audio/mp3/mp3_decode.cst" as mp3dec;
+
+// ── Output kinds ────────────────────────────────────────────────────
+
+let is i64 as OUTPUT_NONE  with imut = 0;
+let is i64 as OUTPUT_VIDEO with imut = 1;
+let is i64 as OUTPUT_AUDIO with imut = 2;
+
+// 48 kHz * 0.120 s * 2 channels: the longest Opus packet and the widest
+// output this module produces. A fixed field of the caller-owned Decoder, so
+// a packet length never drives an allocation.
+let is i64 as DECODE_PCM_VALUES with imut = 11520;
+
+// 2^62, the positive ceiling used by core/frame and core/samples.
+let is i64 as DECODE_LIMIT with imut = 4611686018427387904;
+
+// ── Output record ───────────────────────────────────────────────────
+
+struct Output {
+    kind as i64;               // OUTPUT_NONE, OUTPUT_VIDEO, OUTPUT_AUDIO
+
+    video as frame.Frame;      // I420 view when kind is OUTPUT_VIDEO
+    audio as samples.Samples;  // interleaved S16 block when kind is OUTPUT_AUDIO
+
+    // Video fields, copied from vp9.Vp9Output.
+    render_width  as i64;
+    render_height as i64;
+    profile       as i64;
+    bit_depth     as i64;
+    subsampling_x as i64;
+    subsampling_y as i64;
+    color_space   as i64;
+    color_range   as i64;
+    order         as i64;
+
+    // Audio and common timing fields. pts is in (timebase_num/timebase_den)
+    // seconds; duration is in the same unit. pts_valid is 0 when the
+    // container gave one timestamp for a packet that produced several frames.
+    pts            as i64;
+    pts_valid      as i64;
+    duration       as i64;
+    timebase_num   as i64;
+    timebase_den   as i64;
+}
+
+// ── Decoder object ──────────────────────────────────────────────────
+
+struct Decoder {
+    codec  as i64;    // CODEC_*
+    kind   as i64;    // TRACK_VIDEO or TRACK_AUDIO for the opened codec
+    opened as i64;    // 1 after a successful decode_open
+
+    rate     as i64;  // Opus: 48000; MP3: the track's first-frame rate
+    channels as i64;  // 0 when a codec-only open could not know yet
+    pre_skip as i64;  // effective Opus pre-skip, in 48 kHz samples
+    codec_delay as i64;   // container CodecDelay in ns, informational
+    timebase_num as i64;
+    timebase_den as i64;
+
+    vp9_dec  as vp9.Vp9Decoder;
+    opus_dec as opus.OpusDecoder;
+    mp3_dec  as mp3dec.Mp3Decode;
+
+    // The audio packet armed by decode_send and consumed by a later
+    // decode_receive. VP9 keeps its own armed superframe; these fields carry
+    // the container metadata for both.
+    pending        as i64;
+    pending_data   as *u8;
+    pending_len    as i64;
+    pending_pts    as i64;
+    pending_padding as i64;
+    video_shown    as i64;   // one video output already used the packet pts
+
+    mp3_frame as mp3.Mp3Frame;  // parsed at send, decoded at receive
+
+    pcm as [11520]i16;          // decoded audio, valid until the next receive
+}
+
+// ── Small helpers ───────────────────────────────────────────────────
+
+fn _decoder_clear(d as *Decoder) as void {
+    d.codec = codec.CODEC_UNKNOWN;
+    d.kind = codec.TRACK_UNKNOWN;
+    d.opened = 0;
+    d.rate = 0;
+    d.channels = 0;
+    d.pre_skip = 0;
+    d.codec_delay = 0;
+    d.timebase_num = 0;
+    d.timebase_den = 0;
+    d.pending = 0;
+    d.pending_data = cast(*u8, 0);
+    d.pending_len = 0;
+    d.pending_pts = 0;
+    d.pending_padding = 0;
+    d.video_shown = 0;
+}
+
+fn _output_clear(out as *Output) as void {
+    out.kind = OUTPUT_NONE;
+    frame.frame_free(&out.video);
+    samples.samples_free(&out.audio);
+    out.render_width = 0;
+    out.render_height = 0;
+    out.profile = 0;
+    out.bit_depth = 0;
+    out.subsampling_x = 0;
+    out.subsampling_y = 0;
+    out.color_space = 0;
+    out.color_range = 0;
+    out.order = 0;
+    out.pts = 0;
+    out.pts_valid = 0;
+    out.duration = 0;
+    out.timebase_num = 0;
+    out.timebase_den = 0;
+}
+
+fn _set_pending(d as *Decoder, pkt as *packet.Packet) as void {
+    d.pending_data = pkt.data;
+    d.pending_len = pkt.len;
+    d.pending_pts = pkt.pts;
+    d.pending_padding = pkt.discard_padding;
+    d.pending = 1;
+}
+
+// Nanoseconds to output samples at rate Hz, rounded to nearest. Split into
+// whole seconds and a remainder so ns * rate never overflows; the remainder
+// product is at most 1e9 * 768000, well inside i64.
+fn _ns_to_samples(ns as i64, rate as i64) as i64 {
+    if (ns < 0) { return errno.I_BADPARAM; }
+    if (rate <= 0) { return errno.I_BADPARAM; }
+    let is i64 as whole = ns / 1000000000;
+    let is i64 as rem = ns % 1000000000;
+    if (whole > DECODE_LIMIT / rate) { return errno.I_DIMS; }
+    let is i64 as base = whole * rate;
+    if (rem > (DECODE_LIMIT - 500000000) / rate) { return errno.I_DIMS; }
+    let is i64 as frac = (rem * rate + 500000000) / 1000000000;
+    if (frac > DECODE_LIMIT - base) { return errno.I_DIMS; }
+    return base + frac;
+}
+
+// A sample count at rate Hz in the track timebase, rounded to nearest. A
+// track whose container did not state a usable timebase (denominator 0)
+// reports 0, because there is no unit to convert into.
+fn _samples_to_ticks(d as *Decoder, count as i64, rate as i64) as i64 {
+    if (count < 0) { return errno.I_BADPARAM; }
+    if (rate <= 0) { return errno.I_DIMS; }
+    if (count == 0) { return 0; }
+    if (d.timebase_num <= 0 || d.timebase_den <= 0) { return 0; }
+
+    // ticks = count * den / (rate * num), with both products bounded.
+    if (d.timebase_den > DECODE_LIMIT / count) { return errno.I_DIMS; }
+    let is i64 as a = count * d.timebase_den;
+    if (d.timebase_num > DECODE_LIMIT / rate) { return errno.I_DIMS; }
+    let is i64 as b = rate * d.timebase_num;
+    if (b <= 0) { return errno.I_DIMS; }
+    if (a > DECODE_LIMIT - b / 2) { return errno.I_DIMS; }
+    return (a + b / 2) / b;
+}
+
+// Parse one MP3 packet into d.mp3_frame. The packet is a complete frame, as
+// demux_next hands it out; offsets stay relative to the packet and are made
+// absolute against m.stream.src at receive time. Returns 0 or the parser's
+// error, or I_UNSUPPORTED when the frame's rate/channels disagree with the
+// track the decoder was opened for.
+fn _mp3_prepare(d as *Decoder, pkt as *packet.Packet) as i64 {
+    let is mp3.Mp3Header as h;
+    let is i64 as r with mut = mp3.mp3_header_parse(pkt.data, pkt.len, &h);
+    if (r < 0) { return r; }
+    if (h.frame_len > pkt.len) { return errno.I_EOF; }
+    if (h.side_info_offset < 0 || h.side_info_len < 0) {
+        return errno.I_CORRUPT;
+    }
+    if (h.side_info_end > pkt.len) { return errno.I_CORRUPT; }
+
+    let is mp3.Mp3SideInfo as side;
+    r = mp3.mp3_side_info_parse(pkt.data + h.side_info_offset,
+                                h.side_info_len, h.version, h.channels, &side);
+    if (r < 0) { return r; }
+
+    if (d.rate > 0 && h.sample_rate != d.rate) { return errno.I_UNSUPPORTED; }
+    if (d.channels > 0 && h.channels != d.channels) {
+        return errno.I_UNSUPPORTED;
+    }
+
+    d.mp3_frame.header = h;
+    d.mp3_frame.side = side;
+    d.mp3_frame.offset = 0;
+    d.mp3_frame.length = h.frame_len;
+    d.mp3_frame.index = 0;
+    d.mp3_frame.side_info_offset = h.side_info_offset;
+    d.mp3_frame.side_info_len = h.side_info_len;
+    d.mp3_frame.main_data_offset = h.side_info_end;
+    d.mp3_frame.main_data_len = h.frame_len - h.side_info_end;
+    d.mp3_frame.reservoir_back = side.main_data_begin;
+    d.mp3_frame.reservoir_len = side.main_data_begin
+        + d.mp3_frame.main_data_len;
+    return errno.I_OK;
+}
+
+// ── Open ────────────────────────────────────────────────────────────
+
+// Open a decoder for one track. The track supplies the codec id, the codec
+// private bytes, the effective pre-skip, the container CodecDelay and the
+// timebase. Returns 0, or:
+//   I_BADPARAM     null decoder/track, a negative private length, or a null
+//                  private pointer with bytes
+//   I_UNSUPPORTED  a codec this library does not decode (VP8, AV1, H.264,
+//                  H.265, AAC, Vorbis, FLAC, Theora, PCM, unknown)
+//   the Opus parser's error for a malformed OpusHead
+//   the codec initialiser's error
+// On failure the Decoder is cleared and opened stays 0.
+fn decode_open(d as *Decoder, t as *codec.Track) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, t) == 0) { return errno.I_BADPARAM; }
+    _decoder_clear(d);
+    if (t.priv_len < 0) { return errno.I_BADPARAM; }
+    if (t.priv_len > 0 && cast(i64, t.priv) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as r with mut = errno.I_OK;
+
+    if (t.codec == codec.CODEC_VP9) {
+        r = vp9.vp9_decoder_init(&d.vp9_dec);
+        if (r < 0) { _decoder_clear(d); return r; }
+        d.codec = codec.CODEC_VP9;
+        d.kind = codec.TRACK_VIDEO;
+        d.rate = 0;
+        d.channels = 0;
+        d.pre_skip = 0;
+    } else if (t.codec == codec.CODEC_OPUS) {
+        r = opus.opus_decoder_init(&d.opus_dec, t.priv, t.priv_len);
+        if (r < 0) { _decoder_clear(d); return r; }
+        if (t.pre_skip > 0) {
+            // OpusHead's field is 16 bits; a larger track value is not a
+            // legal pre-skip and is refused rather than skipping a stream.
+            if (t.pre_skip > 65535) { _decoder_clear(d); return errno.I_BADPARAM; }
+            r = opus.opus_decoder_set_pre_skip(&d.opus_dec, t.pre_skip);
+            if (r < 0) { _decoder_clear(d); return r; }
+        }
+        d.codec = codec.CODEC_OPUS;
+        d.kind = codec.TRACK_AUDIO;
+        d.rate = opus.opus_decoder_rate(&d.opus_dec);
+        d.channels = opus.opus_decoder_channels(&d.opus_dec);
+        d.pre_skip = opus.opus_decoder_pre_skip(&d.opus_dec);
+    } else if (t.codec == codec.CODEC_MP3) {
+        r = mp3dec.mp3_decode_init(&d.mp3_dec);
+        if (r < 0) { _decoder_clear(d); return r; }
+        d.codec = codec.CODEC_MP3;
+        d.kind = codec.TRACK_AUDIO;
+        d.rate = t.rate;
+        d.channels = t.channels;
+        d.pre_skip = 0;
+    } else {
+        _decoder_clear(d);
+        return errno.I_UNSUPPORTED;
+    }
+
+    d.codec_delay = t.codec_delay;
+    d.timebase_num = t.timebase_num;
+    d.timebase_den = t.timebase_den;
+    // A caller with no container timebase still gets a useful unit for Opus:
+    // its output is always counted at 48 kHz (RFC 7845 Section 4).
+    if (d.codec == codec.CODEC_OPUS
+        && (d.timebase_num <= 0 || d.timebase_den <= 0)) {
+        d.timebase_num = 1;
+        d.timebase_den = 48000;
+    }
+    d.opened = 1;
+    return errno.I_OK;
+}
+
+// Open by codec id for a caller that has no codec.Track. Codec private is
+// still required for Opus; Opus reports rate and channels at open and gets a
+// default 1/48000 timebase, while MP3 stays unknown until its first packet.
+fn decode_open_codec(d as *Decoder, codec_id as i64, priv as *u8,
+                     priv_len as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (priv_len < 0) { return errno.I_BADPARAM; }
+    if (priv_len > 0 && cast(i64, priv) == 0) { return errno.I_BADPARAM; }
+    let is codec.Track as t;
+    codec.track_clear(&t);
+    t.codec = codec_id;
+    t.kind = codec.codec_kind(codec_id);
+    t.priv = priv;
+    t.priv_len = priv_len;
+    return decode_open(d, &t);
+}
+
+// ── Send ────────────────────────────────────────────────────────────
+
+// Arm one packet. VP9 validates and stores the Annex B split; Opus stores the
+// packet for receive; MP3 parses the header and side information now, so a
+// malformed frame fails here. A second packet while one is pending is
+// I_BADPARAM. Returns 0 or a negative code.
+fn decode_send(d as *Decoder, pkt as *packet.Packet) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
+    if (d.opened == 0) { return errno.I_BADPARAM; }
+    if (pkt.len < 0) { return errno.I_BADPARAM; }
+    if (pkt.len > 0 && cast(i64, pkt.data) == 0) { return errno.I_BADPARAM; }
+    if (pkt.discard_padding < 0) { return errno.I_BADPARAM; }
+
+    if (d.codec == codec.CODEC_VP9) {
+        let is i64 as r = vp9.vp9_decoder_send(&d.vp9_dec, pkt.data, pkt.len);
+        if (r < 0) { return r; }
+        _set_pending(d, pkt);
+        d.video_shown = 0;
+        return errno.I_OK;
+    }
+
+    if (d.codec == codec.CODEC_OPUS || d.codec == codec.CODEC_MP3) {
+        if (d.pending != 0) { return errno.I_BADPARAM; }
+        if (d.codec == codec.CODEC_MP3) {
+            let is i64 as r = _mp3_prepare(d, pkt);
+            if (r < 0) { return r; }
+        }
+        _set_pending(d, pkt);
+        return errno.I_OK;
+    }
+
+    return errno.I_UNSUPPORTED;
+}
+
+// ── Receive ─────────────────────────────────────────────────────────
+
+fn _receive_vp9(d as *Decoder, out as *Output) as i64 {
+    let is vp9.Vp9Output as vo;
+    let is i64 as r = vp9.vp9_decoder_receive(&d.vp9_dec, &vo);
+    if (r < 0) {
+        d.pending = 0;
+        return r;
+    }
+    if (r == 0) {
+        d.pending = 0;
+        return 0;
+    }
+
+    out.kind = OUTPUT_VIDEO;
+    out.video = vo.frame;
+    out.render_width = vo.render_width;
+    out.render_height = vo.render_height;
+    out.profile = vo.profile;
+    out.bit_depth = vo.bit_depth;
+    out.subsampling_x = vo.subsampling_x;
+    out.subsampling_y = vo.subsampling_y;
+    out.color_space = vo.color_space;
+    out.color_range = vo.color_range;
+    out.order = vo.order;
+    out.timebase_num = d.timebase_num;
+    out.timebase_den = d.timebase_den;
+    out.duration = 0;
+    if (d.video_shown == 0) {
+        out.pts = d.pending_pts;
+        out.pts_valid = 1;
+        d.video_shown = 1;
+    }
+    return 1;
+}
+
+fn _receive_opus(d as *Decoder, out as *Output) as i64 {
+    if (d.pending == 0) { return 0; }
+
+    let is i64 as pts = d.pending_pts;
+    let is i64 as pad = d.pending_padding;
+
+    if (pad > 0) {
+        let is i64 as pad_samples = _ns_to_samples(pad, 48000);
+        if (pad_samples < 0) {
+            d.pending = 0;
+            return pad_samples;
+        }
+        let is i64 as carry = opus.opus_decoder_end_trim(&d.opus_dec);
+        if (pad_samples > DECODE_LIMIT - carry) {
+            d.pending = 0;
+            return errno.I_DIMS;
+        }
+        let is i64 as tr = opus.opus_decoder_set_end_trim(
+            &d.opus_dec, carry + pad_samples);
+        if (tr < 0) {
+            d.pending = 0;
+            return tr;
+        }
+    }
+
+    let is i64 as got with mut = 0;
+    let is i64 as r = opus.opus_decode(&d.opus_dec, d.pending_data,
+                                       d.pending_len, &d.pcm[0],
+                                       DECODE_PCM_VALUES, &got);
+    d.pending = 0;
+    if (r < 0) { return r; }
+    if (got == 0) { return 0; }
+
+    let is i64 as rate = opus.opus_decoder_rate(&d.opus_dec);
+    let is i64 as ch = opus.opus_decoder_channels(&d.opus_dec);
+    let is i64 as dur = _samples_to_ticks(d, got, rate);
+    if (dur < 0) { return dur; }
+
+    let is i64 as sr = samples.samples_init(&out.audio,
+        samples.SAMPLE_FMT_S16, rate, ch, got,
+        cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
+    if (sr < 0) { return sr; }
+
+    out.kind = OUTPUT_AUDIO;
+    out.pts = pts;
+    out.pts_valid = 1;
+    out.duration = dur;
+    out.timebase_num = d.timebase_num;
+    out.timebase_den = d.timebase_den;
+    return 1;
+}
+
+fn _receive_mp3(d as *Decoder, out as *Output) as i64 {
+    if (d.pending == 0) { return 0; }
+
+    let is i64 as pts = d.pending_pts;
+    let is i64 as pad = d.pending_padding;
+
+    // mp3_decode_frame reads main data through m.stream.src, so the packet
+    // that was parsed at send is bound again here. Its offsets are relative
+    // to this packet.
+    d.mp3_dec.stream.src = d.pending_data;
+    d.mp3_dec.stream.len = d.pending_len;
+
+    let is i64 as got = mp3dec.mp3_decode_frame(&d.mp3_dec, &d.mp3_frame,
+        cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
+    d.pending = 0;
+    if (got < 0) { return got; }
+
+    let is i64 as rate = d.mp3_frame.header.sample_rate;
+    let is i64 as ch = d.mp3_frame.header.channels;
+    let is i64 as count with mut = got;
+
+    // A codec-only open has no track fields; the first frame supplies them.
+    if (d.rate <= 0) { d.rate = rate; }
+    if (d.channels <= 0) { d.channels = ch; }
+    if (d.timebase_num <= 0 || d.timebase_den <= 0) {
+        d.timebase_num = 1;
+        d.timebase_den = rate;
+    }
+
+    if (pad > 0) {
+        let is i64 as cut = _ns_to_samples(pad, rate);
+        if (cut < 0) { return cut; }
+        // A DiscardPadding that covers the whole block leaves no output. A
+        // valid block padding does not exceed the block; the excess is not
+        // carried into the next packet.
+        if (cut >= count) { count = 0; } else { count = count - cut; }
+    }
+    if (count == 0) { return 0; }
+
+    let is i64 as dur = _samples_to_ticks(d, count, rate);
+    if (dur < 0) { return dur; }
+
+    let is i64 as sr = samples.samples_init(&out.audio,
+        samples.SAMPLE_FMT_S16, rate, ch, count,
+        cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
+    if (sr < 0) { return sr; }
+
+    out.kind = OUTPUT_AUDIO;
+    out.pts = pts;
+    out.pts_valid = 1;
+    out.duration = dur;
+    out.timebase_num = d.timebase_num;
+    out.timebase_den = d.timebase_den;
+    return 1;
+}
+
+// Hand out the next decoded item: 1 with *out filled, 0 when the armed packet
+// has no further output, or a negative code. out is cleared first. For VP9 the
+// view points into the caller's pixel pool and lives until the next receive or
+// send; for audio it points into the Decoder's PCM scratch and lives until the
+// next receive.
+fn decode_receive(d as *Decoder, out as *Output) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (d.opened == 0) { return errno.I_BADPARAM; }
+    _output_clear(out);
+
+    if (d.codec == codec.CODEC_VP9)  { return _receive_vp9(d, out); }
+    if (d.codec == codec.CODEC_OPUS) { return _receive_opus(d, out); }
+    if (d.codec == codec.CODEC_MP3)  { return _receive_mp3(d, out); }
+    return errno.I_UNSUPPORTED;
+}
+
+// ── Accessors and codec controls ────────────────────────────────────
+
+fn decode_opened(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.opened;
+}
+
+fn decode_codec(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return codec.CODEC_UNKNOWN; }
+    return d.codec;
+}
+
+fn decode_kind(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return codec.TRACK_UNKNOWN; }
+    return d.kind;
+}
+
+fn decode_rate(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.rate;
+}
+
+fn decode_channels(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.channels;
+}
+
+// Effective Opus pre-skip in 48 kHz samples; 0 for every other codec.
+fn decode_pre_skip(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.pre_skip;
+}
+
+// Container CodecDelay in nanoseconds, as decode_open received it. It is
+// reported, not applied: see the policy at the top of this file.
+fn decode_codec_delay(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.codec_delay;
+}
+
+// Override the effective Opus pre-skip and re-arm it. Set it before the first
+// packet; calling it later starts a new skip at the current output position.
+// Only Opus has a pre-skip; every other codec returns I_UNSUPPORTED.
+fn decode_set_pre_skip(d as *Decoder, samples_count as i64) as i64 {
+    if (cast(i64, d) == 0 || d.opened == 0) { return errno.I_BADPARAM; }
+    if (d.codec != codec.CODEC_OPUS) { return errno.I_UNSUPPORTED; }
+    let is i64 as r = opus.opus_decoder_set_pre_skip(&d.opus_dec,
+                                                     samples_count);
+    if (r < 0) { return r; }
+    d.pre_skip = opus.opus_decoder_pre_skip(&d.opus_dec);
+    return errno.I_OK;
+}
+
+// Samples to drop from the end of the next Opus output, in 48 kHz samples.
+// A DiscardPadding on the next packet is added to this value. The intended
+// use is the EOS granule trim of an Ogg Opus stream, which the container does
+// not carry as a packet field. Other codecs return I_UNSUPPORTED.
+fn decode_set_end_trim(d as *Decoder, samples_count as i64) as i64 {
+    if (cast(i64, d) == 0 || d.opened == 0) { return errno.I_BADPARAM; }
+    if (d.codec != codec.CODEC_OPUS) { return errno.I_UNSUPPORTED; }
+    return opus.opus_decoder_set_end_trim(&d.opus_dec, samples_count);
+}
+
+// Drop the views and mark the decoder closed. The caller keeps ownership of
+// the work block and pixel buffers; a VP9 decoder's reference slots are
+// invalidated, as vp9_decoder_free documents.
+fn decode_close(d as *Decoder) as void {
+    if (cast(i64, d) == 0) { return; }
+    if (d.opened != 0 && d.codec == codec.CODEC_VP9) {
+        vp9.vp9_decoder_free(&d.vp9_dec);
+    }
+    _decoder_clear(d);
+}
+
+// ── VP9 caller memory ───────────────────────────────────────────────
+
+fn decode_vp9_work_size(width as i64, height as i64) as i64 {
+    return vp9.vp9_work_size(width, height);
+}
+
+fn decode_vp9_frame_size(width as i64, height as i64) as i64 {
+    return vp9.vp9_frame_size(width, height);
+}
+
+fn decode_vp9_threads_work_size(width as i64, height as i64,
+                                workers as i64) as i64 {
+    return vp9.vp9_threads_work_size(width, height, workers);
+}
+
+fn _vp9_check(d as *Decoder) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (d.opened == 0 || d.codec != codec.CODEC_VP9) {
+        return errno.I_BADPARAM;
+    }
+    return errno.I_OK;
+}
+
+fn decode_vp9_bind(d as *Decoder, work as *u8, cap as i64) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return vp9.vp9_decoder_bind(&d.vp9_dec, work, cap);
+}
+
+fn decode_vp9_add_buffer(d as *Decoder, mem as *u8, cap as i64) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return vp9.vp9_decoder_add_buffer(&d.vp9_dec, mem, cap);
+}
+
+fn decode_vp9_free_buffer(d as *Decoder) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return vp9.vp9_decoder_free_buffer(&d.vp9_dec);
+}
+
+fn decode_vp9_replace_buffer(d as *Decoder, idx as i64, mem as *u8,
+                             cap as i64) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return vp9.vp9_decoder_replace_buffer(&d.vp9_dec, idx, mem, cap);
+}
+
+// Required work-block size after receive returned I_NOMEM for the work block;
+// 0 when the last frame did not report a shortfall.
+fn decode_vp9_work_need(d as *Decoder) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return d.vp9_dec.work_need;
+}
+
+// Required pixel-buffer size after receive returned I_NOMEM for the pool; 0
+// when the last frame did not report a shortfall.
+fn decode_vp9_frame_need(d as *Decoder) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return d.vp9_dec.frame_need;
+}
+
+// Required worker-block size after receive returned I_NOMEM for the thread
+// block; 0 when tile threads are off or the last frame did not report one.
+// PENDING: this reads the stage 9 Vp9Threads.need field.
+fn decode_vp9_threads_need(d as *Decoder) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return d.vp9_dec.thr.need;
+}
+
+// Attach a worker block and enable tile threads; `workers` includes the
+// calling thread, so 2 means one spawned worker. PENDING: stage 9 API.
+fn decode_vp9_bind_threads(d as *Decoder, mem as *u8, cap as i64,
+                           workers as i64) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return vp9.vp9_decoder_bind_threads(&d.vp9_dec, mem, cap, workers);
+}
+
+// Change the worker count after decode_vp9_bind_threads. PENDING: stage 9 API.
+fn decode_vp9_set_threads(d as *Decoder, workers as i64) as i64 {
+    let is i64 as r = _vp9_check(d);
+    if (r < 0) { return r; }
+    return vp9.vp9_decoder_set_threads(&d.vp9_dec, workers);
+}
