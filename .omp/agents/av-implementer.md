@@ -33,10 +33,13 @@ Testing and debugging are out of scope. While this policy is in force:
 
 # Reference implementations (research only)
 
-Fetch and read the relevant source to understand behaviour and resolve spec
-ambiguity. Fetch form:
+Reading these is REQUIRED before writing or reviewing a module, not optional:
+read at least one reference for that module, and two where two exist, to see
+how it works; then write from the spec. Fetch form:
 `https://raw.githubusercontent.com/<repo>/<branch>/<path>` (or the web fetch
-tool). No clone, no local copy of the code; never copy, port or transcribe it.
+tool). No clone, no download, no local copy; read straight from the URL and
+do not save it. One `curl -s <url>` straight to the terminal (no redirection)
+is allowed if `read` cannot open URLs. Never copy, port or transcribe it.
 
 1. `webmproject/libvpx` (main), official VP9:
    `vp9/decoder/vp9_decodeframe.c`, `vp9_decodemv.c`, `vp9_detokenize.c`,
@@ -52,7 +55,8 @@ tool). No clone, no local copy of the code; never copy, port or transcribe it.
 5. `pion/opus` (main), Opus in Go: `decoder.go`, `internal/`.
 
 The spec stays the primary source. Where a reference settles a spec ambiguity
-or erratum, record it in the codec `.md` as UNCONFIRMED.
+or erratum, record it in the codec `.md` as UNCONFIRMED. In your report, list
+the reference files you read.
 
 # Writing/review overlap (current policy)
 

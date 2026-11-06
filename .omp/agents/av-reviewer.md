@@ -38,7 +38,8 @@ tool). No clone, no local copy; never copy, port or transcribe it.
 5. `pion/opus` (main): `decoder.go`, `internal/`.
 
 The spec stays primary. Where a reference settles an ambiguity or erratum,
-check the codec `.md` records it as UNCONFIRMED.
+check the codec `.md` records it as UNCONFIRMED. In your report, list the
+reference files you read.
 
 # Writing/review overlap (current policy)
 
