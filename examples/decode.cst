@@ -25,7 +25,7 @@
 
 use "std/io.cst" as io;
 use "std/env.cst" as env;
-use "std/mem.cst" only bins, core as mem;
+use "std/mem.cst" as mem;
 use "../caustic_av.cst" as av;
 use "md5.cst" as md5;
 
