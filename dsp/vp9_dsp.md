@@ -84,11 +84,15 @@ its own bit. AVX and AVX2 are reported from CPUID alone: the XCR0 test
 implemented, because no kernel here uses one.
 
 Targets: the x86_64 module is imported only under
-`__target_is_x86_64 - __target_is_windows == 1`, and every file in
-`dsp/x86_64/` aborts compilation if reached on another target. The kernels
-read the System V argument registers (rdi, rsi, rdx, rcx, r8, r9) and use only
-caller-saved registers, so a Windows x86_64 build keeps the scalar path.
-AArch64 installs nothing (there is no NEON kernel) and is documented below.
+`__target_is_x86_64 - __target_is_windows == 1`. Each statement that names it
+is guarded by `abi.VP9_X86_SYSV`, an `imut` global that folds to 1 exactly on
+x86_64 System V, so on every other target the branch is dead and the name of
+the module that was not loaded is never resolved. The install pass itself
+aborts the build with `__compile_error` if it is reached with
+`VP9_X86_SYSV == 0`, which catches a direct import of `dsp/x86_64/`. The
+kernels read the System V argument registers (rdi, rsi, rdx, rcx, r8, r9) and
+use only caller-saved registers, so a Windows x86_64 build keeps the scalar
+path. AArch64 installs nothing (there is no NEON kernel).
 
 ## Kernels
 
@@ -297,3 +301,11 @@ byte comparison for every mode and size (a temporary harness that calls both
 and compares, which does not exist), the VP9 conformance vectors through
 `trace_headers`/MD5, and an fps measurement against the scalar build. None of
 these was executed in this phase.
+
+One gap worth stating plainly: no target in `Causticfile` imports the video
+tree at all (`tests/run.cst` compiles the core and Matroska cases only), so
+neither these kernels nor the stage 3-6 decoder are compiled by
+`caustic-mk run test`. Compiling them at all requires a driver that imports
+`video/vp9/decode.cst`, which does not exist yet (stage 10). Every construct
+used here was checked by reading against the existing users in this repository
+and in `std/`; none has been through the compiler in this phase.
