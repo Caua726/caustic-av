@@ -60,12 +60,13 @@ fn buf_skip(b as *Buf, n as i64) as i64 {
 }
 
 // Byte at off bytes ahead of the cursor, without consuming. Negative offsets
-// are rejected rather than reading before the start.
+// and offsets at or past the end are rejected. The range check is done
+// against remaining bytes before the addition so a huge off cannot overflow
+// pos + off and slip past the bound.
 fn buf_peek(b as *Buf, off as i64) as i64 {
     if (off < 0) { return errno.I_EOF; }
-    let is i64 as i = b.pos + off;
-    if (i >= b.len) { return errno.I_EOF; }
-    return cast(i64, b.ptr[i]);
+    if (off >= b.len - b.pos) { return errno.I_EOF; }
+    return cast(i64, b.ptr[b.pos + off]);
 }
 
 // Byte at absolute offset off, without consuming. The offset is from the
@@ -169,10 +170,12 @@ fn buf_u64be(b as *Buf) as i64 {
     return (hi << 32) | lo;
 }
 
-// Copy n bytes to dst. A negative count is I_BADPARAM; too few bytes is
-// I_EOF. Neither moves the cursor and neither writes to dst.
+// Copy n bytes to dst. A negative count or a null destination with bytes is
+// I_BADPARAM; too few source bytes is I_EOF. Neither moves the cursor and
+// neither writes to dst.
 fn buf_read(b as *Buf, dst as *u8, n as i64) as i64 {
     if (n < 0) { return errno.I_BADPARAM; }
+    if (n > 0 && cast(i64, dst) == 0) { return errno.I_BADPARAM; }
     if (buf_remaining(b) < n) { return errno.I_EOF; }
     let is i64 as i with mut = 0;
     while (i < n) {
