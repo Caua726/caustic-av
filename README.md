@@ -2,17 +2,13 @@
 
 **Audio and video containers and codecs for [Caustic](https://github.com/Caua726/Caustic), written from the specifications: the job FFmpeg and GStreamer do for C, with neither of them inside.**
 
-![status](https://img.shields.io/badge/status-written%2C%20not%20verified-lightgrey)
+![status](https://img.shields.io/badge/status-VP9%20and%20MP3%20working%2C%20Opus%20broken-yellow)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Writing phase: WRITTEN, NOT VERIFIED.** The modules described below are
-> written, but nothing in this repository has been compiled, built or run.
-> There are no results: no MD5, `ffprobe`, `trace_headers`, `opus_compare`,
-> FFmpeg-difference or fps check has been executed. Codec notes mark every
-> unresolved reading as UNCONFIRMED. The VP9 probability and residual table
-> blobs and the MP3 analytic window/DCT blobs are still pending. The hub and
-> the decode example are written, reviewed and merged; nothing has been
-> compiled or run.
+> **Decoders only, no encoders.** VP9 Profile 0 matches the official libvpx
+> vectors and MP3 matches FFmpeg in a short comparison. **Opus compiles and runs
+> but its output is wrong**: it does not match FFmpeg in any mode. See
+> [Status](#status).
 
 ## What it is
 
@@ -69,8 +65,8 @@ headers and MP4/WAV demuxing are not written.
 
 | Codec | Decode | Encode | State and written limits |
 |---|---|---|---|
-| Opus | yes | no | written (decode): Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
-| MP3 | yes | no | written (decode): Layer III only (MPEG-1, MPEG-2 and MPEG-2.5); CBR and VBR; ID3v2.2/2.3/2.4 and ID3v1 skipping; Xing/Info and VBRI metadata; sync scan; free format refused |
+| Opus | broken | no | output wrong (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
+| MP3 | yes | no | matches FFmpeg in a short comparison. Layer III only (MPEG-1, MPEG-2 and MPEG-2.5); CBR and VBR; ID3v2.2/2.3/2.4 and ID3v1 skipping; Xing/Info and VBRI metadata; sync scan; free format refused |
 | PCM | no | no | planned |
 | FLAC | no | no | planned |
 | Vorbis | no | no | planned |
@@ -95,7 +91,7 @@ I, Layer II and free-format bitrates are `I_UNSUPPORTED`.
 
 | Codec | Decode | Encode | State and written limits |
 |---|---|---|---|
-| VP9 | yes | no | written (decode): Profile 0, 8-bit 4:2:0 (I420) |
+| VP9 | yes | no | matches the official vectors. Profile 0, 8-bit 4:2:0 (I420) |
 | VP8 | no | no | planned |
 | AV1 | no | no | planned |
 
@@ -118,8 +114,9 @@ Profiles 1-3 (4:2:2/4:4:4, 10/12-bit), CS_RGB and the VP9 encoder are not
 written.
 
 The optional SIMD kernels (`dsp/`) and VP9 tile threading
-(`video/vp9/threads.cst`) are written and merged; both are opt-in, default to
-the scalar/sequential path, and have no measured fps figure.
+(`video/vp9/threads.cst`) are merged; both are opt-in and default to the scalar/sequential path. The
+SIMD kernels cover residual add, compound average and part of intra
+prediction, not subpel filtering or the loop filter.
 
 ### Generated tables
 
@@ -129,8 +126,8 @@ generator sources that produce them.
 
 | Generator | Output | State |
 |---|---|---|
-| `tools/gen_vp9_tables.py` | `video/vp9/vp9_tables_data.cst`: `inv_map`, keyframe probabilities, default probabilities | **pending** (`VP9_TABLES_GENERATED = 0`; the blobs are empty) |
-| `tools/gen_vp9_residual_tables.py` | `video/vp9/residual_tables_data.cst`: scans, coefficient bands, token tree, energy classes, extra bits, category probabilities, pareto, quantizers, mode-to-transform | **pending** (`VP9_RESIDUAL_TABLES_GENERATED = 0`) |
+| `tools/gen_vp9_tables.py` | `video/vp9/vp9_tables_data.cst`: `inv_map`, keyframe probabilities, default probabilities | committed; generated and checked by the vector results |
+| `tools/gen_vp9_residual_tables.py` | `video/vp9/residual_tables_data.cst`: scans, coefficient bands, token tree, energy classes, extra bits, category probabilities, pareto, quantizers, mode-to-transform | committed; generated and checked by the vector results |
 | `tools/gen_opus_silk_tables.py` | `audio/opus/silk_tables_data.cst`: SILK PDFs and tables | committed; generator not run in this phase; no blob pending |
 | `tools/gen_opus_celt_tables.py` | `audio/opus/celt_tables_data.cst`: `e_means`, `e_prob_model`, `caps` | committed; generator not run in this phase; its `--check-only` byte comparison has not run |
 | `tools/gen_mp3_tables.py` | `audio/mp3/mp3_tables_data.cst`: bitrate/sample-rate/sfb/pretab/alias/synthesis-window/Huffman/scalefactor tables | committed; generator not run in this phase; analytic window/DCT blobs still pending |
@@ -282,8 +279,13 @@ input is audio-only. `--threads` is the optional VP9 tile-worker count, 1..16
 with the calling thread included; the default is the sequential path.
 `examples/md5.cst` implements RFC 1321 for the frame hashes. The example has no
 track selection, no seeking and no image output, and it does not trim MP3
-LAME/VBRI gapless delay or padding. It is written, reviewed and merged;
-nothing has been compiled or run.
+LAME/VBRI gapless delay or padding.
+
+`--yuv` writes displayed frames as raw I420 on stdout instead of their MD5.
+`tools/play.sh` pipes that to `mpv`: in real time with the file's own audio,
+`live` (silent, as fast as frames arrive), or `<N>` to pre-decode N seconds and
+then play with audio and seeking. The audio it plays comes from `mpv`, not from
+this library.
 
 ## Dependencies
 
@@ -319,7 +321,7 @@ The decode path was written in this order; stages 8 and 9 are merged into
 7. **Hub and example** — `core/codec.cst`, `demux.cst`, `decode.cst` and
    `caustic_av.cst` for sniffing, track publication, decoder dispatch and the
    output record; `examples/decode.cst` and `examples/md5.cst` with the
-   `caustic-mk build decode` target. Written, reviewed and merged.
+   `caustic-mk build decode` target.
 
 Future work, deliberately separate from the written decode path:
 
@@ -330,35 +332,42 @@ Future work, deliberately separate from the written decode path:
 - **Conversion:** YUV/RGB, scaling and sample-format paths (no `convert/`
   tree is written).
 - **Speed:** the SIMD table is installed only on x86_64 System V; AArch64 has
-  no NEON kernels, and no fps number exists.
+  no NEON kernels. Subpel filtering and the loop filter have no SIMD and the
+  loop filter runs on one thread.
 
-## Status and unverified checks
+## Status
 
-This is a writing-phase library. **WRITTEN, NOT VERIFIED**: nothing has been
-compiled or run, so no statement here is a test result. The hub
-(`caustic_av.cst`, `demux.cst`, `decode.cst`, `core/codec.cst`), the decode
-example (`examples/decode.cst`, `examples/md5.cst`) and the
-`caustic-mk build decode` target are written, reviewed and merged.
+Results below use `caustic -O2 examples/decode.cst -o build/decode`.
 
-- No decoded frame has been compared with libvpx's MD5 or with a
-  `trace_headers` dump; no container has been checked with `ffprobe`.
-- No Opus output has been compared with `opus_compare`; the RFC 6716 vectors
-  have not been run.
-- No MP3 PCM has been compared with FFmpeg's, and no maximum-difference
-  tolerance exists yet.
-- No fps or throughput figure has been measured, with or without SIMD or
-  threads.
-- The errata and reference-derived choices in the codec notes are
-  **UNCONFIRMED** until those external comparisons run.
-- The test runner has targets only for the core and Matroska cases and does not
-  import the codec trees. `caustic-mk build decode` compiles the example
-  through the hub, but that target has not been run either.
+| Part | Result | Checked against |
+|---|---|---|
+| VP9 Profile 0 | **works**: all 331 vectors with an official `.md5` pass frame by frame with 1 thread; 265 of them re-run with 4 threads also pass | libvpx `.md5` files |
+| VP9 on real video | first minute of a 720p video, 1800/1800 frames | FFmpeg `framemd5` |
+| MP3 | **works**: maximum sample difference of 1 on MPEG-1 stereo and mono, MPEG-2 and MPEG-2.5 | FFmpeg PCM, short generated files |
+| Opus | **broken**: SILK, CELT and hybrid all decode without error but the audio is wrong (SNR below 0 dB) | FFmpeg PCM, short generated files |
+| Matroska/WebM | exercised by every VP9 vector | same vectors |
 
-Known unsupported paths, in addition to the pending VP9 and MP3 analytic blobs:
+Speed on that 720p video (low bitrate): 72 fps with 1 thread, 87 fps with 4, on a
+machine where FFmpeg's VP9 decoder reaches about 1600 and 3200 fps. Busier video
+will be slower.
 
-- **VP9:** Profiles 1-3, 10/12-bit, 4:2:2/4:4:4 and CS_RGB; encoding. The hub
-  returns `I_UNSUPPORTED` for every VP9 frame until the probability and
-  residual blobs are generated.
+Not checked yet:
+
+- The RFC 6716 vectors through `opus_compare`; pointless until Opus is fixed.
+- MP3 beyond the four short files above: real music, free-running VBR, ID3 and
+  sync recovery. The MP3 output keeps the encoder delay, so it is compared
+  after alignment.
+- SIMD kernels against the scalar ones, and the threaded path on the rest of the
+  vectors.
+- The complete `bbb`, `sintel` and `tos` movie files; only `bbb_1280x720` was
+  compared, up to frame 14975 of 17895.
+- Errata marked UNCONFIRMED in the codec notes have not been reviewed one by one.
+- The test runner only has the core and Matroska cases, with no codec suite. The
+  VP9 and audio comparisons above were run by hand.
+
+Known unsupported paths:
+
+- **VP9:** Profiles 1-3, 10/12-bit, 4:2:2/4:4:4 and CS_RGB; encoding.
 - **Opus:** mapping families 1 and 255, more than two channels, PLC, FEC,
   DTX, LBRR synthesis, redundant CELT frame synthesis, soft clipping and
   anything other than signed 16-bit output. Output gain is stored and can be
@@ -381,31 +390,22 @@ Known unsupported paths, in addition to the pending VP9 and MP3 analytic blobs:
 
 ## Testing
 
-`caustic-mk run test`, `caustic-mk run test-opt` and `caustic-mk build decode`
-exist in `Causticfile`, but none has been run in this phase and nothing below
-is a passing result.
+```sh
+caustic-mk run test        # core and Matroska cases, a few seconds
+caustic-mk run test-opt    # the same through the optimizing backend
+caustic -O2 examples/decode.cst -o build/decode
+./build/decode --md5 file.webm
+```
 
-The checks the original briefs call for, all **NOT RUN**:
+Compare one VP9 vector with its official hashes:
 
-- Build and run the example: `caustic-mk build decode` and
-  `./build/decode <file>` on the committed WebM and Ogg vectors in
-  `tests/vectors/small/`. No MP3 vector is committed; an MP3 file must be
-  generated with FFmpeg and libmp3lame for that check.
-- VP9: decoded-frame MD5 against the libvpx `vp90-2-*` vectors,
-  `trace_headers` field comparison and `ffprobe` metadata.
-- Opus: `opus_compare` against the RFC 6716 vectors, including Hybrid
-  output.
-- MP3: maximum absolute PCM difference against FFmpeg on aligned frames.
-- Containers: `ffprobe` track and timestamp comparison of the stored track
-  list, including the raw-MP3 path.
-- Example: per-frame MD5 versus libvpx `.md5` files and FFmpeg `framemd5`,
-  PCM bytes versus `ffmpeg -f s16le`, and the example's stderr track list
-  versus `ffprobe -show_streams`.
-- SIMD and threads: scalar-versus-kernel byte comparison, threaded-versus-
-  sequential output comparison (including `--threads 2/4`), and an fps
-  measurement.
-- Generators: running each `tools/` generator and comparing the committed
-  blobs byte for byte.
+```sh
+awk '{print $1}' vp90-2-03-deltaq.webm.md5 > ref.txt
+./build/decode --md5 vp90-2-03-deltaq.webm 2>/dev/null | diff - ref.txt
+```
+
+The vectors live in the gitignored `tests/vectors/`. They come from
+<https://storage.googleapis.com/downloads.webmproject.org/test_data/libvpx/>.
 
 ## Patents
 
