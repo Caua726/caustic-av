@@ -519,10 +519,6 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
             if (xr < 0) { return xr; }
 
             if (d.red_on != 0 && d.red_c2s != 0) {
-                if (d.prev_mode == opus_packet.OPUS_MODE_SILK) {
-                    let is i64 as cz = celt.celt_reset(&d.celt);
-                    if (cz < 0) { return cz; }
-                }
                 let is i64 as rd = _opus_decode_redundant(d,
                     _opus_celt_end(p.bandwidth), p.stereo + 1, &red[0]);
                 if (rd < 0) { return rd; }
@@ -616,6 +612,10 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
             let is *f64 as win = &d.celt.tab.window[0];
             let is i64 as cc = d.channels;
             if (d.red_c2s != 0) {
+                // After a SILK frame with no trailing redundancy CELT is stale,
+                // so the redundant audio is decoded but not used.
+                if (d.prev_mode != opus_packet.OPUS_MODE_SILK
+                    || d.prev_redundancy != 0) {
                 let is i64 as t with mut = 0;
                 while (t < 120 * cc) {
                     d.mix[t] = red[t];
@@ -631,6 +631,7 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
                         c0 = c0 + 1;
                     }
                     t2 = t2 + 1;
+                }
                 }
             } else {
                 let is i64 as cz = celt.celt_reset(&d.celt);
