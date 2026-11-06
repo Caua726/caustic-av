@@ -334,6 +334,31 @@ as `video/vp9/vp9.md` records.
   `demux.cst` fills. This avoids a dependency on the demuxer object while
   still delivering codec private, pre-skip, codec delay and timebase.
 
+## Inherited pending table blobs
+
+The hub owns no tables. It inherits the generator state of the modules it
+calls, and a decoder that is not ready must say so rather than produce
+plausible output:
+
+- **VP9:** `video/vp9/vp9_tables_data.cst` and
+  `video/vp9/residual_tables_data.cst` are written by
+  `tools/gen_vp9_tables.py` and `tools/gen_vp9_residual_tables.py`.
+  `vp9_decoder_receive` checks `vp9_tables_ready()` and
+  `vp9_residual_tables_ready()` and returns `I_UNSUPPORTED` while either blob
+  is pending, so the hub returns `I_UNSUPPORTED` for every frame until the
+  generators have been run and their output committed.
+- **MP3:** stage 8a's note records the IMDCT window blobs
+  (`MP3_WINDOW_LONG/START/STOP/SHORT`) and the Table 3-B.3 synthesis window as
+  pending, with `mp3_window_tables_ready()` at 0. Stage 8b's note says it
+  builds analytic windows and reads only Table 3-B.3 through
+  `mp3_synth_window`; if that blob is still a zero fill, synthesis is silent
+  rather than an error. The hub does not add a guard of its own; the stage 8
+  merge must settle which side provides the windows.
+- **Opus:** `celt_tables_data.cst` and `silk_tables_data.cst` are committed;
+  their own notes are the authority for whether any generated blob remains.
+
+None of these generators was run in this phase.
+
 ## References read
 
 Read only to understand behaviour; no code was copied, ported or transcribed:
