@@ -219,9 +219,9 @@ fn _ogg_kind(c as i64) as i64 {
 
 // ── Track list construction ─────────────────────────────────────────
 
-// Fill one codec.Track from a Matroska TrackEntry. Returns 0, or I_DIMS when
-// an audio rate cannot be represented. codec_id and priv stay borrowed from
-// the source and are never freed here.
+// Fill one codec.Track from a Matroska TrackEntry. Returns 0, or I_DIMS /
+// I_CORRUPT when an audio rate cannot be represented. codec_id and priv stay
+// borrowed from the source and are never freed here.
 fn _fill_mk_track(dt as *codec.Track, t as *matroska.MkTrack) as i64 {
     codec.track_clear(dt);
     dt.number = t.number;
