@@ -6,8 +6,9 @@
 // plain asm functions whose addresses mean nothing until they are published
 // in the table, and they assume the System V argument registers. It is
 // imported only under `__target_is_x86_64 - __target_is_windows == 1`
-// (see dsp/vp9_dsp.cst), and the guard below stops a build that reached it
-// any other way.
+// (see dsp/vp9_dsp.cst), and the guard below stops a call that reached it
+// any other way. A bare import of the directory never runs the body, so the
+// guard can only report a call.
 //
 // Installation rule: a kernel is published only when the CPU bit its
 // instruction set needs is present. Every kernel in this directory is SSE2,
@@ -27,8 +28,9 @@ use "vp9_idct.cst" as idct;
 use "vp9_interp.cst" as interp;
 
 fn vp9_dsp_init_x86_64(t as *abi.Vp9Dsp) as void {
-    // Dead on every other target, which is what keeps a direct import of this
-    // directory from producing SysV asm for a machine that calls differently.
+    // Fires on every other target when the function is called there, which is
+    // what keeps a cross-target call from producing SysV asm for a machine
+    // that calls differently.
     if (abi.VP9_X86_SYSV == 0) {
         __compile_error("dsp/x86_64 is x86_64 System V only");
     }

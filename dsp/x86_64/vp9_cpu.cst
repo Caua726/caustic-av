@@ -29,8 +29,8 @@
 // x86_64 System V only. A top-level `if (...) { ... }` is not part of the
 // grammar (a top-level `if` must wrap a `use`), so the target check lives in
 // `vp9_dsp_init_x86_64` in vp9_dsp_x86.cst, which is the only caller of this
-// probe: importing this file directly on another target is a programming
-// error the installer reports.
+// probe: a call reached on another target is a programming error the
+// installer reports. Importing this file alone does not run anything.
 
 // rbx is callee-saved and CPUID writes ebx, so it is pushed for the call.
 // No other register CPUID touches (eax, ecx, edx) is callee-saved.
