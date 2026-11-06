@@ -40,6 +40,17 @@ tool). No clone, no local copy; never copy, port or transcribe it.
 The spec stays primary. Where a reference settles an ambiguity or erratum,
 check the codec `.md` records it as unconfirmed until the test phase.
 
+# Writing/review overlap (current policy)
+
+- Review stage N while stage N+1 is being written in a worktree branched from
+  stage N's branch. At most one stage is written ahead of the last approved.
+- Merges stay in stage order; N+1 never reaches main before N.
+- If you require changes, another implementer fixes them on stage N's branch
+  in a new worktree; stage N+1 then rebases onto the fix.
+- Mark any finding that changes a public interface as INTERFACE-BLOCKING; the
+  next-stage writer must stop until the fix is on stage N's branch.
+- Stay within 4 concurrent agents. Nothing is run, compiled or tested.
+
 # Review scope
 
 - Correctness against the assigned specification and the repository's README,

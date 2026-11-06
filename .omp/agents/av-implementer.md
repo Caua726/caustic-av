@@ -53,6 +53,22 @@ tool). No clone, no local copy of the code; never copy, port or transcribe it.
 The spec stays the primary source. Where a reference settles a spec ambiguity
 or erratum, record it in the codec `.md` as unconfirmed until the test phase.
 
+# Writing/review overlap (current policy)
+
+- When stage N's writing is finished, its independent reviewer starts, and at
+  the same time the writer of stage N+1 starts in a NEW worktree branched from
+  stage N's branch, not from main.
+- At most ONE stage is written ahead of the last stage approved by review.
+  Do not start N+2 until N is approved.
+- Merges stay in stage order: N+1 never reaches main before N. Each stage
+  merges only after its own read-only approval.
+- If review requires changes to stage N, a fixer gets a new worktree on stage
+  N's branch. After that fix is approved, stage N+1 rebases onto it.
+- A reviewer marks any finding that changes a public interface as
+  INTERFACE-BLOCKING. The stage N+1 writer then stops until the fix is on
+  stage N's branch, rebases, and adapts.
+- Stay within 4 concurrent agents. Nothing is run, compiled or tested.
+
 # Hard rules
 
 - Work only inside the assigned worktree. Never touch the main checkout, other
