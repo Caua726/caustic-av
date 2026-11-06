@@ -351,10 +351,12 @@ terminator the encoder reserves.
 The page format is RFC 3533 Section 6; all multi-byte integers are little
 endian. A page is 27 header bytes plus N segment-table bytes plus the sum of
 the lacing values, at most 65307 bytes. `ogg_page_parse` validates the
-capture pattern, minimum size, version, reserved header-type bits, segment
-table, body and CRC before publishing any field. The CRC is the
-non-reflected 0x04C11DB7 polynomial with initial value 0 and no final
-inversion, computed bit by bit over the page with the checksum bytes zero.
+capture pattern, the 27-byte minimum, the segment table and body against the
+source end, and then the CRC; only after that does it check version 0 and
+the reserved header-type bits, and only then does it publish any field. The
+CRC is the non-reflected 0x04C11DB7 polynomial with initial value 0 and no
+final inversion, computed bit by bit over the page with the checksum bytes
+zero.
 
 Packet reassembly follows RFC 3533 Section 5: 255 continues, 0..254 ends.
 A packet that spans pages is remembered as up to 32 `(offset, length)`
@@ -401,7 +403,7 @@ Everything in the decoder is caller-owned and fixed-size:
 All items below are unconfirmed until an external comparison runs; nothing
 was compiled or executed in the writing phase.
 
-- **BOS header completes on its BOS page.** Read from RFC 3533 Section 5
+- **BOS header completes on its BOS page.** Read from RFC 3533 Section 4
   ("bos pages ... containing one initial header packet per page"). A
   different reading would allow a continued first header packet.
 - **Version 0 accepted for OpusHead.** RFC 7845 Section 5.1 says version
@@ -446,6 +448,11 @@ was compiled or executed in the writing phase.
 
 Low-severity notes; none affects valid-stream memory safety.
 
+- **The second Opus header is consumed without a magic check.** `ogg.cst`
+  advances past the OpusTags packet and does not verify its `OpusTags`
+  magic; a malformed comment packet is accepted by the demuxer.
+  `opus_head.cst` provides `opus_tags_parse` for a caller that wants to
+  validate or read it.
 - **`OpusDecoder` is large.** Two embedded codec states plus the scratch
   arrays dominate it; callers must own it (or place it in static storage).
   A future interface could take caller-provided sub-buffers.
