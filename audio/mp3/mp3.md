@@ -152,7 +152,9 @@ a frame may not exceed `reservoir_len * 8`.
 The caller owns the reservoir bytes and its history buffer. Stage 8b
 copies or indexes `reservoir_back` bytes from that history plus the current
 frame's `main_data_offset/main_data_len`; the parser does not allocate a
-reservoir.
+reservoir. The history must hold at least 511 bytes (255 for MPEG-2/2.5),
+the largest value the backpointer field can carry and the bound the
+7680-bit buffer permits.
 
 ## ID3
 
@@ -176,9 +178,10 @@ trim audio.
 * Xing/Info is read at the first frame's `side_info_end`, i.e. after the
   header, the optional CRC and the side information. The four-byte tag is
   `"Xing"` (VBR) or `"Info"` (nominally CBR). The 32-bit flags select, in
-  order, frames (4 bytes), bytes (4), TOC (100) and quality (4). The TOC is
-  copied to `Mp3.toc`; `frame_count`, `vbr_bytes`, `xing_quality` and
-  `toc_present` expose it. `is_vbr` is 1 for `"Xing"` and 0 for `"Info"`.
+  order, frames (4 bytes), bytes (4), TOC (100) and quality (4). The raw
+  flag word is `xing_flags`; the TOC is copied to `Mp3.toc`;
+  `frame_count`, `vbr_bytes`, `xing_quality` and `toc_present` expose the
+  rest. `is_vbr` is 1 for `"Xing"` and 0 for `"Info"`.
 * A LAME extension is recognised when the nine-byte encoder string starts
   with `"LAME"`, `"Lavf"` or `"Lavc"`. The 24-bit delay/padding word is at
   offset 21 in that extension: delay = `v >> 12`, padding = `v & 0xFFF`.

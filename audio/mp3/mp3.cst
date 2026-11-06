@@ -133,6 +133,7 @@ struct Mp3 {
     is_vbr        as i64;   // 1 for Xing or VBRI, 0 for Info or absent
     has_xing      as i64;
     has_vbri      as i64;
+    xing_flags    as i64;   // raw Xing/Info flag word
     vbr_bytes     as i64;
     frame_count   as i64;   // 0 when the tag did not carry it
     xing_quality  as i64;
@@ -257,6 +258,7 @@ fn _mp3_clear(m as *Mp3) as void {
     m.is_vbr = 0;
     m.has_xing = 0;
     m.has_vbri = 0;
+    m.xing_flags = 0;
     m.vbr_bytes = 0;
     m.frame_count = 0;
     m.xing_quality = 0;
@@ -576,6 +578,7 @@ fn _mp3_parse_xing(m as *Mp3, src as *u8, off as i64, end as i64) as i64 {
     m.has_xing = 1;
     m.is_vbr = xing;
     let is i64 as flags = _mp3_u32be(src, off + 4);
+    m.xing_flags = flags;
     let is i64 as p with mut = off + 8;
 
     if ((flags & 1) != 0) {
