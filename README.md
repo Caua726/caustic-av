@@ -5,9 +5,9 @@
 ![status](https://img.shields.io/badge/status-VP9%2C%20MP3%20and%20Opus%20decoding-green)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Decoders only, no encoders.** VP9 Profile 0 matches the official libvpx
-> vectors. MP3 and Opus match the reference closely in short comparisons, but
-> have not been through their full conformance checks. See [Status](#status).
+> **Decoders only, no encoders.** VP9 Profile 0 passes the official libvpx
+> vectors. Opus passes 8 of the 12 RFC 6716 vectors and MP3 matches FFmpeg on
+> real audio. See [Status](#status).
 
 ## What it is
 
@@ -64,8 +64,8 @@ headers and MP4/WAV demuxing are not written.
 
 | Codec | Decode | Encode | State and written limits |
 |---|---|---|---|
-| Opus | yes | no | CELT matches libopus; SILK and hybrid are close (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
-| MP3 | yes | no | matches FFmpeg in a short comparison. Layer III only (MPEG-1, MPEG-2 and MPEG-2.5); CBR and VBR; ID3v2.2/2.3/2.4 and ID3v1 skipping; Xing/Info and VBRI metadata; sync scan; free format refused |
+| Opus | yes | no | 8 of 12 RFC 6716 vectors pass (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
+| MP3 | yes | no | matches FFmpeg on real audio. Layer III only (MPEG-1, MPEG-2 and MPEG-2.5); CBR and VBR; ID3v2.2/2.3/2.4 and ID3v1 skipping; Xing/Info and VBRI metadata; sync scan; free format refused |
 | PCM | no | no | planned |
 | FLAC | no | no | planned |
 | Vorbis | no | no | planned |
@@ -281,10 +281,10 @@ track selection, no seeking and no image output, and it does not trim MP3
 LAME/VBRI gapless delay or padding.
 
 `--yuv` writes displayed frames as raw I420 on stdout instead of their MD5.
-`tools/play.sh` pipes that to `mpv`: in real time with the file's own audio,
+`tools/play.sh` pipes that to `mpv`: in real time,
 `live` (silent, as fast as frames arrive), or `<N>` to pre-decode N seconds and
-then play with audio and seeking. The audio it plays comes from `mpv`, not from
-this library.
+then play with seeking. By default both video and audio come from this library;
+`<N>` still takes its audio from `mpv`.
 
 ## Dependencies
 
@@ -342,10 +342,9 @@ Results below use `caustic -O2 examples/decode.cst -o build/decode`.
 |---|---|---|
 | VP9 Profile 0 | **works**: all 331 vectors with an official `.md5` pass frame by frame with 1 thread; 265 of them re-run with 4 threads also pass | libvpx `.md5` files |
 | VP9 on real video | first minute of a 720p video, 1800/1800 frames | FFmpeg `framemd5` |
-| MP3 | **works**: maximum sample difference of 1 on MPEG-1 stereo and mono, MPEG-2 and MPEG-2.5 | FFmpeg PCM, short generated files |
-| Opus CELT | **works**: maximum sample difference of 1 | libopus through FFmpeg, short generated file |
-| Opus on real audio | 8 s from a real WebM track: same sample count, no offset, 49 dB SNR, not bit-exact | libopus through FFmpeg |
-| Opus SILK, hybrid | parsing and synthesis correct; differs from libopus at high frequencies because the resampler is our own (RFC 6716 section 4.2.9 leaves it free): 30-50 dB, lower near the band edge | libopus through FFmpeg, short generated files |
+| MP3 | **works**: maximum sample difference of 1 on real audio across MPEG-1, 2 and 2.5, mono and stereo, CBR, VBR, joint and plain stereo, and ID3 tags. Leading junk is skipped; after damaged bytes it resynchronises and the tail matches the clean decode | FFmpeg PCM |
+| Opus RFC 6716 vectors | **8 of 12 pass**: 01 (99.8%), 03 (47.3%), 04 (69.1%), 07 (99.6%), 08 (94.8%), 09 (87.9%), 10 (87.7%), 11 (99.7%). Fail: 02 (error 0.464517), 05 (error 0.379529), 06 (error 0.433659), 12 (error 0.916999) (threshold about 0.28) | `opus_compare` |
+| Opus on real audio | 8 s from a real WebM track: maximum sample difference of 1, 101 dB, same length, no offset | libopus through FFmpeg |
 | Matroska/WebM | exercised by every VP9 vector | same vectors |
 
 Speed on that 720p video (low bitrate): 72 fps with 1 thread, 87 fps with 4, on a
@@ -354,12 +353,14 @@ will be slower.
 
 Not checked yet:
 
-- The RFC 6716 vectors through `opus_compare`.
-- SILK at NB and MB is 0.5 to 0.7 ms later than libopus, which the RFC allows
-  for SILK-only frames.
-- MP3 beyond the four short files above: real music, free-running VBR, ID3 and
-  sync recovery. The MP3 output keeps the encoder delay, so it is compared
-  after alignment.
+- Why vectors 02, 05, 06, 12 miss the threshold. CELT is near bit-exact, and the SILK and
+  hybrid vectors reach 30-44 dB once low-passed below the band edge, so parsing
+  and synthesis look right. The remaining error sits near the band edge, where
+  our own resampler differs (RFC 6716 section 4.2.9 leaves it free), and in
+  isolated peaks at bandwidth and stereo switches. Not proven to be only that.
+- Packet loss: PLC and FEC are not written, so the PCM transition a lost-frame
+  decode would produce between modes without redundancy is also missing.
+- MP3 beyond 8 s of one track, and the MPEG reference conformance streams.
 - SIMD kernels against the scalar ones, and the threaded path on the rest of the
   vectors.
 - The complete `bbb`, `sintel` and `tos` movie files; only `bbb_1280x720` was
@@ -372,7 +373,7 @@ Known unsupported paths:
 
 - **VP9:** Profiles 1-3, 10/12-bit, 4:2:2/4:4:4 and CS_RGB; encoding.
 - **Opus:** mapping families 1 and 255, more than two channels, PLC, FEC,
-  DTX, LBRR synthesis, redundant CELT frame synthesis, soft clipping and
+  DTX, LBRR synthesis, soft clipping and
   anything other than signed 16-bit output. Output gain is stored and can be
   enabled at codec level, but the hub neither exposes nor applies it.
 - **MP3:** Layer I, Layer II, free-format bitrate, CRC verification, error
