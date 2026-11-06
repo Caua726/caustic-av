@@ -38,8 +38,8 @@
 //             the track's private data, and timestamps are nanoseconds
 //             (timebase 1/1e9). An A_OPUS CodecPrivate is parsed for its
 //             channel count and pre-skip; the output rate is 48000 Hz, the
-//             rate RFC 7845 fixes for Opus output, whatever SamplingFrequency
-//             the container stores.
+//             fixed Opus rate, whatever SamplingFrequency the container
+//             stores.
 //   Ogg:      one track per logical stream serial. The BOS packet is the
 //             track's private data. Opus is the only mapping whose granule
 //             unit this stage interprets (48 kHz samples, RFC 7845 Section 4),
@@ -55,8 +55,10 @@
 // -------
 // Each packet is one complete Layer III frame: the 4-byte header, optional
 // CRC, side information and main data, exactly the bytes mp3_next validated.
-// The decoder reparses the header from the packet and keeps the bit
-// reservoir, which Matroska and Ogg carry inside the packet only for Opus.
+// The decoder reparses the header from the packet and keeps the bit reservoir
+// across frames. A Matroska A_MPEG/L3 block may hold more than one frame; the
+// demuxer publishes such a block as one packet and decode.cst consumes every
+// frame in it.
 // keyframe is 1 only when the frame's main_data_begin is 0, i.e. when the
 // frame's main data is self-contained; a frame that reaches into the reservoir
 // of earlier frames reports 0. A frame whose sample rate or channel count
