@@ -1,0 +1,436 @@
+// =======================================================
+// caustic-av/video/vp9/decode.cst
+// Keyframe driver for the VP9 decoder: one coded frame slice in, one
+// reconstructed 8-bit I420 surface out. It validates the parsed header,
+// binds the caller's work and frame memory, decodes the tiles through
+// block.cst/tile.cst, runs the loop filter of section 8.8, and performs the
+// post-frame bookkeeping of sections 8.1, 8.9 and 8.10.
+//
+// Memory
+// ------
+// Nothing here allocates. The caller supplies:
+//   * a persistent work block (vp9_decoder_bind). Its size for a maximum
+//     visible width/height is vp9_work_size(width, height); it must stay the
+//     same block for the decoder's lifetime because it also holds the
+//     PrevSegmentIds map between frames.
+//   * one output surface per decode call (mem, cap). It must hold
+//     frame.frame_size(coded_width, coded_height) bytes for the coded size
+//     the decoder reports in d.frame_need when the buffer is too small.
+// Both blocks are the caller's to free; vp9_decoder_free only drops views.
+//
+// Padded surfaces
+// ---------------
+// The coded size is rounded up to 64 and one extra 64-sample band is added
+// on the right and bottom. Section 6.4.21 predicts transform blocks whose
+// top-left is inside MiCols*8 but whose body may overhang by up to 31
+// samples, and 8.5.1 writes the whole block; the fixed pred_intra expects
+// that padding. The visible rectangle is (0,0)-(h.width,h.height); the
+// surface is zeroed so any padding a filter touches has a defined value.
+//
+// What is decoded
+// ---------------
+// Key frames and intra-only frames. An inter frame, a show_existing_frame,
+// or a stream with the probability/coefficient table blobs still pending
+// returns I_UNSUPPORTED before any tile is decoded. Stage 5 adds inter
+// frames and probability adaptation; stage 6 adds stored reference frames
+// and display order. Reference slots are published as metadata by
+// vp9_state_publish, but their pixels are not retained here.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "../../core/frame.cst" as frame;
+use "vp9_tables.cst" as t;
+use "header.cst" as hd;
+use "residual.cst" as res;
+use "residual_tables.cst" as res_tbl;
+use "block.cst" as blk;
+use "tile.cst" as tile;
+use "loopfilter.cst" as lf;
+
+// The mode-info grid ceiling: 65536 pixels per side / 8.
+let is i64 as VP9_MAX_MI with imut = 8192;
+
+// ── caller-owned work block ─────────────────────────────────────────
+
+// The per-frame arrays of block.cst and residual.cst, carved out of one
+// caller-owned byte block. `need` is the total the layout requires; the
+// pointers are valid only when the block was carved with a non-null base.
+struct Vp9Work {
+    need as i64;
+
+    mi_cols as i64;
+    mi_rows as i64;
+    acols as i64;              // MiCols rounded up to 8 (partition ctx)
+    arows as i64;
+    nz_above_stride as i64;
+    nz_left_stride as i64;
+
+    mi_sizes as *u8;
+    tx_sizes as *u8;
+    skips as *u8;
+    segment_ids as *u8;
+    ref_frames as *u8;
+    y_modes as *u8;
+    sub_modes as *u8;
+    prev_seg_ids as *u8;
+
+    above_part as *u8;
+    left_part as *u8;
+    above_segpred as *u8;
+    left_segpred as *u8;
+    above_nz as *u8;
+    left_nz as *u8;
+
+    coef as *i64;
+    cc as res.Vp9CoefCtx;
+}
+
+fn _zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+// Round a non-negative offset up to 8 bytes.
+fn _align8(off as i64) as i64 {
+    return (off + 7) & (0 - 8);
+}
+
+// Pointer at `off` bytes into the caller's base block. A null base yields a
+// null/absolute pointer, which is never dereferenced (only the layout path
+// of vp9_work_size carves with a null base).
+fn _at(base as *u8, off as i64) as *u8 {
+    return cast(*u8, cast(i64, base) + off);
+}
+
+// Lay out (and, when base is non-null, bind) the work arrays for a frame of
+// mi_cols x mi_rows mode-info units. Returns 0 on success; I_NOMEM with
+// w.need set when the caller's block is too small; I_DIMS/I_BADPARAM for
+// impossible dimensions or a misaligned base. Dimensions are capped at
+// VP9_MAX_MI before any size is computed, so every sum below fits easily in
+// an i64 (the largest layout is under 1 GiB).
+fn _work_carve(w as *Vp9Work, base as *u8, cap as i64,
+               mi_cols as i64, mi_rows as i64,
+               ss_x as i64, ss_y as i64) as i64 {
+    if (cast(i64, w) == 0) { return errno.I_BADPARAM; }
+    if (mi_cols <= 0 || mi_rows <= 0) { return errno.I_BADPARAM; }
+    if (mi_cols > VP9_MAX_MI || mi_rows > VP9_MAX_MI) { return errno.I_DIMS; }
+
+    let is i64 as mi_count = mi_cols * mi_rows;
+    let is i64 as sb64_cols = (mi_cols + 7) >> 3;
+    let is i64 as sb64_rows = (mi_rows + 7) >> 3;
+    let is i64 as acols = sb64_cols << 3;
+    let is i64 as arows = sb64_rows << 3;
+    if (acols < mi_cols || arows < mi_rows) { return errno.I_DIMS; }
+    let is i64 as nz_above = 2 * acols + 16;
+    let is i64 as nz_left = 2 * arows + 16;
+
+    let is i64 as off with mut = 0;
+
+    w.mi_sizes = _at(base, off); off = off + mi_count;
+    w.tx_sizes = _at(base, off); off = off + mi_count;
+    w.skips = _at(base, off); off = off + mi_count;
+    w.segment_ids = _at(base, off); off = off + mi_count;
+    w.ref_frames = _at(base, off); off = off + mi_count;
+    w.y_modes = _at(base, off); off = off + mi_count;
+    w.sub_modes = _at(base, off); off = off + 4 * mi_count;
+    w.prev_seg_ids = _at(base, off); off = off + mi_count;
+    w.above_part = _at(base, off); off = off + acols;
+    w.left_part = _at(base, off); off = off + arows;
+    w.above_segpred = _at(base, off); off = off + acols;
+    w.left_segpred = _at(base, off); off = off + arows;
+    w.above_nz = _at(base, off); off = off + 3 * nz_above;
+    w.left_nz = _at(base, off); off = off + 3 * nz_left;
+    off = _align8(off);
+    w.coef = cast(*i64, _at(base, off));
+    off = off + 1024 * 8;
+
+    w.need = off;
+    w.mi_cols = mi_cols;
+    w.mi_rows = mi_rows;
+    w.acols = acols;
+    w.arows = arows;
+    w.nz_above_stride = nz_above;
+    w.nz_left_stride = nz_left;
+
+    if (cast(i64, base) == 0) { return errno.I_OK; }
+    if ((cast(i64, base) & 7) != 0) { return errno.I_BADPARAM; }
+    if (cap < off) { return errno.I_NOMEM; }
+
+    let is i64 as st = res.vp9_coef_ctx_init(&w.cc, w.above_nz, nz_above,
+                                             w.left_nz, nz_left,
+                                             mi_cols, mi_rows, ss_x, ss_y);
+    if (st < 0) { return st; }
+    return errno.I_OK;
+}
+
+// Bytes vp9_decoder_bind needs for a decoder that will see frames up to
+// width x height. Returns a positive byte count, or I_DIMS for an impossible
+// size. This is the visible size: the coded padding is not part of the work
+// block.
+fn vp9_work_size(width as i64, height as i64) as i64 {
+    if (width <= 0 || height <= 0) { return errno.I_DIMS; }
+    if (width > frame.FRAME_MAX_DIM || height > frame.FRAME_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    let is i64 as mi_cols = (width + 7) >> 3;
+    let is i64 as mi_rows = (height + 7) >> 3;
+    let is Vp9Work as w;
+    let is i64 as st = _work_carve(&w, cast(*u8, 0), 0, mi_cols, mi_rows, 1, 1);
+    if (st < 0) { return st; }
+    return w.need;
+}
+
+// ── decoder object ──────────────────────────────────────────────────
+
+struct Vp9Decoder {
+    state as t.Vp9State;
+    hdr as hd.Vp9Header;
+    work as *u8;
+    work_cap as i64;
+    work_need as i64;      // set when a decode finds the work too small
+    frame_need as i64;     // set when a decode finds the surface too small
+}
+
+// Zero the decoder and initialise the persistent state. No frame context is
+// valid yet; a key or intra-only frame installs one (section 7.2).
+fn vp9_decoder_init(d as *Vp9Decoder) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    _zero(cast(*u8, d), sizeof(Vp9Decoder));
+    t.vp9_state_init(&d.state);
+    return errno.I_OK;
+}
+
+// Attach the caller's persistent work block. `cap` is its size in bytes; the
+// exact requirement is checked per frame against vp9_work_size. The block
+// must stay alive and 8-byte aligned for the decoder's lifetime.
+fn vp9_decoder_bind(d as *Vp9Decoder, work as *u8, cap as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, work) == 0) { return errno.I_BADPARAM; }
+    if (cap <= 0) { return errno.I_BADPARAM; }
+    d.work = work;
+    d.work_cap = cap;
+    d.work_need = 0;
+    return errno.I_OK;
+}
+
+// Drop the views; the caller keeps ownership of both blocks.
+fn vp9_decoder_free(d as *Vp9Decoder) as void {
+    if (cast(i64, d) == 0) { return; }
+    d.work = cast(*u8, 0);
+    d.work_cap = 0;
+    d.work_need = 0;
+    d.frame_need = 0;
+}
+
+// ── frame-level loop filter ─────────────────────────────────────────
+
+fn _loop_filter(d as *Vp9Decoder, b as *blk.Vp9Blk, out as *frame.Frame) as i64 {
+    let is *hd.Vp9Header as h = b.h;
+    if (h.lf_level == 0) { return errno.I_OK; }
+
+    let is [8]u8 as alt_active;
+    let is [8]i64 as alt_data;
+    let is i64 as s with mut = 0;
+    while (s < 8) {
+        alt_active[s] = cast(u8, h.seg_feature_enabled[s][t.VP9_SEG_LVL_ALT_L]);
+        alt_data[s] = h.seg_feature_data[s][t.VP9_SEG_LVL_ALT_L];
+        s = s + 1;
+    }
+
+    let is lf.LfParams as lp;
+    lp.mi_cols = b.mi_cols;
+    lp.mi_rows = b.mi_rows;
+    lp.sub_x = b.sub_x;
+    lp.sub_y = b.sub_y;
+    lp.level = h.lf_level;
+    lp.sharpness = h.lf_sharpness;
+    lp.delta_enabled = h.lf_delta_enabled;
+    lp.seg_enabled = h.seg_enabled;
+    lp.seg_abs_or_delta = h.seg_abs_or_delta;
+    lp.ref_deltas = &h.lf_ref_delta[0];
+    lp.mode_deltas = &h.lf_mode_delta[0];
+    lp.seg_alt_l_active = &alt_active[0];
+    lp.seg_alt_l_data = &alt_data[0];
+
+    let is lf.LfFrame as lfr;
+    let is i64 as st = lf.lf_frame_init(&lfr, &lp);
+    if (st < 0) { return st; }
+
+    let is lf.LfBlockInfo as lbi;
+    lbi.mi_sizes = b.mi_sizes;
+    lbi.tx_sizes = b.tx_sizes;
+    lbi.skips = b.skips;
+    lbi.segment_ids = b.segment_ids;
+    lbi.ref_frames = b.ref_frames;
+    lbi.y_modes = b.y_modes;
+
+    return lf.lf_filter_frame(&lfr, &lbi, out.y, out.u, out.v,
+                              out.stride_y, out.stride_u, out.stride_v);
+}
+
+// ── post-frame bookkeeping ──────────────────────────────────────────
+
+// Section 8.1 step 3: PrevSegmentIds follows SegmentIds after a frame that
+// updates the map. A resolution change drops the old map.
+fn _update_seg_map(w as *Vp9Work, b as *blk.Vp9Blk, h as *hd.Vp9Header) as void {
+    let is i64 as n = b.mi_cols * b.mi_rows;
+    if (h.seg_enabled == 1 && h.seg_update_map == 1) {
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            w.prev_seg_ids[i] = b.segment_ids[i];
+            i = i + 1;
+        }
+    } else if (h.seg_map_clear == 1) {
+        _zero(w.prev_seg_ids, n);
+    }
+}
+
+// ── one coded frame slice ───────────────────────────────────────────
+
+fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
+                 mem as *u8, cap as i64, out as *frame.Frame) as i64 {
+    let is i64 as st with mut = hd.vp9_header_parse(&d.state, &d.hdr, data, len);
+    if (st < 0) { return st; }
+    let is *hd.Vp9Header as h = &d.hdr;
+
+    // Stage 6 owns showing an already decoded slot.
+    if (h.show_existing_frame == 1) { return errno.I_UNSUPPORTED; }
+    // Stage 5 owns inter frames.
+    if (h.frame_is_intra != 1) { return errno.I_UNSUPPORTED; }
+    // The probability blobs and the coefficient tables must exist before any
+    // tile is decoded; both modules report their generated state.
+    if (h.probs_pending == 1 || t.vp9_tables_ready() == 0) {
+        return errno.I_UNSUPPORTED;
+    }
+    if (res_tbl.vp9_residual_tables_ready() == 0) {
+        return errno.I_UNSUPPORTED;
+    }
+    // Profile 0 is fixed to 8-bit 4:2:0 by header.cst; restate the surface
+    // requirement before touching memory.
+    if (h.bit_depth != 8 || h.subsampling_x != 1 || h.subsampling_y != 1) {
+        return errno.I_UNSUPPORTED;
+    }
+    if (h.has_compressed_header != 1) { return errno.I_CORRUPT; }
+    if (h.mi_cols <= 0 || h.mi_rows <= 0) { return errno.I_CORRUPT; }
+    if (h.mi_cols > VP9_MAX_MI || h.mi_rows > VP9_MAX_MI) {
+        return errno.I_DIMS;
+    }
+
+    // Coded surface: MiCols*8 x MiRows*8 rounded to 64, plus one 64-sample
+    // band for the overhanging transform blocks of 6.4.21/8.5.1.
+    let is i64 as maxx = h.mi_cols * 8;
+    let is i64 as maxy = h.mi_rows * 8;
+    let is i64 as coded_w = (((maxx + 63) >> 6) << 6) + 64;
+    let is i64 as coded_h = (((maxy + 63) >> 6) << 6) + 64;
+    if (coded_w > frame.FRAME_MAX_DIM || coded_h > frame.FRAME_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    let is i64 as fsz = frame.frame_size(coded_w, coded_h);
+    if (fsz < 0) { return fsz; }
+    if (cap < fsz) { d.frame_need = fsz; return errno.I_NOMEM; }
+    if (cast(i64, mem) == 0) { return errno.I_BADPARAM; }
+    st = frame.frame_alloc_coded(out, h.width, h.height, coded_w, coded_h,
+                                 mem, cap);
+    if (st < 0) { return st; }
+    // Padding samples are not reconstructed by every block; zeroing the
+    // coded surface makes whatever the loop filter touches deterministic.
+    _zero(mem, fsz);
+
+    let is Vp9Work as w;
+    st = _work_carve(&w, d.work, d.work_cap, h.mi_cols, h.mi_rows,
+                     h.subsampling_x, h.subsampling_y);
+    if (st < 0) {
+        if (st == errno.I_NOMEM) { d.work_need = w.need; }
+        frame.frame_free(out);
+        return st;
+    }
+    let is blk.Vp9Blk as b;
+    _zero(cast(*u8, &b), sizeof(blk.Vp9Blk));
+    b.h = h;
+    b.st = &d.state;
+    b.fr = out;
+    b.mi_cols = h.mi_cols;
+    b.mi_rows = h.mi_rows;
+    b.mi_col_start = 0;
+    b.acols = w.acols;
+    b.arows = w.arows;
+    b.sub_x = h.subsampling_x;
+    b.sub_y = h.subsampling_y;
+    b.lossless = h.lossless;
+    b.mi_sizes = w.mi_sizes;
+    b.tx_sizes = w.tx_sizes;
+    b.skips = w.skips;
+    b.segment_ids = w.segment_ids;
+    b.ref_frames = w.ref_frames;
+    b.y_modes = w.y_modes;
+    b.sub_modes = w.sub_modes;
+    b.above_part = w.above_part;
+    b.left_part = w.left_part;
+    b.above_segpred = w.above_segpred;
+    b.left_segpred = w.left_segpred;
+    b.above_nz = w.above_nz;
+    b.left_nz = w.left_nz;
+    b.nz_above_stride = w.nz_above_stride;
+    b.nz_left_stride = w.nz_left_stride;
+    b.cc = &w.cc;
+    b.coef = w.coef;
+
+    st = tile.tile_decode_all(&b, data, len);
+    if (st < 0) { frame.frame_free(out); return st; }
+    st = _loop_filter(d, &b, out);
+    if (st < 0) { frame.frame_free(out); return st; }
+
+    _update_seg_map(&w, &b, h);
+    t.vp9_state_publish(&d.state, h.refresh_frame_flags,
+                        h.width, h.height, h.profile, h.bit_depth,
+                        h.subsampling_x, h.subsampling_y, h.color_space);
+    if (h.refresh_frame_context == 1) {
+        st = t.vp9_state_save_probs(&d.state, h.frame_context_idx);
+        if (st < 0) { frame.frame_free(out); return st; }
+    }
+
+    if (h.show_frame == 0) { frame.frame_free(out); }
+    return errno.I_OK;
+}
+
+// ── public entry point ──────────────────────────────────────────────
+
+// Decode one packet. A packet may be an Annex B superframe; its slices are
+// decoded in order. The output surface holds the last displayed slice
+// (`show_frame == 1`); a packet made only of hidden frames returns I_OK with
+// a cleared frame view, which the caller can recognise by out->width == 0
+// (stage 6 owns display order and stored reference frames).
+//
+// Errors: I_BADPARAM for null pointers or an unbound decoder, I_NOMEM when
+// cap is too small (d.frame_need) or the bound work block is too small
+// (d.work_need), I_UNSUPPORTED for inter/show-existing/pending tables, and
+// the header/tile modules' negative codes otherwise. A rejected frame leaves
+// the persistent state tainted until the next key or intra-only frame, as
+// recorded in vp9.md.
+fn vp9_decoder_decode(d as *Vp9Decoder, data as *u8, len as i64,
+                      mem as *u8, cap as i64,
+                      out as *frame.Frame) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, d.work) == 0) { return errno.I_BADPARAM; }
+    frame.frame_free(out);
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len == 0) { return errno.I_EOF; }
+    if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
+    if (cap < 0) { return errno.I_BADPARAM; }
+
+    let is hd.Vp9Superframe as sf;
+    let is i64 as st with mut = hd.vp9_superframe_split(data, len, &sf);
+    if (st < 0) { return st; }
+    if (sf.count < 1 || sf.count > 8) { return errno.I_CORRUPT; }
+
+    let is i64 as i with mut = 0;
+    while (i < sf.count) {
+        st = _decode_slice(d, sf.ptr[i], sf.len[i], mem, cap, out);
+        if (st < 0) {
+            frame.frame_free(out);
+            return st;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}

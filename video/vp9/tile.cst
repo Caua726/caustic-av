@@ -1,0 +1,130 @@
+// =======================================================
+// caustic-av/video/vp9/tile.cst
+// Tile layout and tile decoding for VP9, section 6.4.1-6.4.2.
+//
+// The uncompressed and compressed headers (stage 3) leave h.tiles as one
+// byte range per tile, indexed row-major in decode_tiles order. This module
+// walks those ranges in the same order, gives each tile its own Boolean
+// decoder over exactly its slice, and drives the partition tree of
+// block.cst for the tile's superblock rectangle.
+//
+// Context lifetime follows sections 7.4.1 and 7.4.2:
+//   * the above contexts (partition, nonzero, segment prediction) are
+//     cleared once before the first tile and persist across tiles, because
+//     a tile row may use the row above it;
+//   * the left contexts are cleared at the start of every 8x8 mode-info row
+//     inside a tile, so information from a different tile cannot leak in
+//     from the left.
+//
+// Every tile is independent in the bitstream; an error in one aborts the
+// frame with its negative status rather than resynchronising, since the
+// frame cannot be reconstructed once a tile is lost.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "bool.cst" as vb;
+use "header.cst" as hd;
+use "recon_tables.cst" as rt;
+use "block.cst" as blk;
+
+// get_tile_offset (section 6.4.1): the first mode-info row/column of a tile.
+// `mis` is MiRows or MiCols, `tile_sz_log2` the tile-column/row log2.
+fn tile_offset(tile_num as i64, mis as i64, tile_sz_log2 as i64) as i64 {
+    if (tile_num < 0) { return errno.I_BADPARAM; }
+    if (mis < 0) { return errno.I_BADPARAM; }
+    if (tile_sz_log2 < 0 || tile_sz_log2 > 6) { return errno.I_BADPARAM; }
+    let is i64 as sbs = (mis + 7) >> 3;
+    let is i64 as off = ((tile_num * sbs) >> tile_sz_log2) << 3;
+    if (off > mis) { return mis; }
+    return off;
+}
+
+// decode_tile (section 6.4.2): superblocks in raster order, left contexts
+// reset once per 8x8 row.
+fn _decode_tile(b as *blk.Vp9Blk, br as *vb.Vp9Bool,
+                mi_row_start as i64, mi_row_end as i64,
+                mi_col_start as i64, mi_col_end as i64) as i64 {
+    let is i64 as r with mut = mi_row_start;
+    while (r < mi_row_end) {
+        blk.blk_clear_left(b);
+        let is i64 as c with mut = mi_col_start;
+        while (c < mi_col_end) {
+            let is i64 as st = blk.blk_decode_partition(b, br, r, c,
+                                                        rt.BLOCK_64X64);
+            if (st < 0) { return st; }
+            c = c + 8;
+        }
+        r = r + 8;
+    }
+    return errno.I_OK;
+}
+
+// Bounds from the specification (section 6.2.14): tile_cols_log2 <= 6 and
+// tile_rows_log2 <= 2.
+fn t_max_cols_log2() as i64 { return 6; }
+fn t_max_rows_log2() as i64 { return 2; }
+
+// decode_tiles (section 6.4): validate every tile range against the frame
+// slice, then decode each tile in header order. `len` is the whole coded
+// frame slice; h.tiles.off/len are offsets into it.
+fn tile_decode_all(b as *blk.Vp9Blk, data as *u8, len as i64) as i64 {
+    if (cast(i64, b) == 0 || cast(i64, b.h) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
+    if (len < 0) { return errno.I_BADPARAM; }
+
+    let is *hd.Vp9Header as h = b.h;
+    if (h.tile_cols_log2 < 0 || h.tile_cols_log2 > t_max_cols_log2()) {
+        return errno.I_CORRUPT;
+    }
+    if (h.tile_rows_log2 < 0 || h.tile_rows_log2 > t_max_rows_log2()) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as cols = 1 << h.tile_cols_log2;
+    let is i64 as rows = 1 << h.tile_rows_log2;
+    let is i64 as count = cols * rows;
+    if (count < 1 || count > 256) { return errno.I_CORRUPT; }
+    if (h.tiles.count != count) { return errno.I_CORRUPT; }
+    if (h.mi_cols <= 0 || h.mi_rows <= 0) { return errno.I_CORRUPT; }
+
+    // Section 7.4.1: the above contexts are cleared once, before any tile.
+    blk.blk_clear_above(b);
+
+    let is i64 as ti with mut = 0;
+    let is i64 as tile_row with mut = 0;
+    while (tile_row < rows) {
+        let is i64 as row_start = tile_offset(tile_row, h.mi_rows,
+                                              h.tile_rows_log2);
+        let is i64 as row_end = tile_offset(tile_row + 1, h.mi_rows,
+                                            h.tile_rows_log2);
+        if (row_start < 0 || row_end < 0) { return errno.I_CORRUPT; }
+        let is i64 as tile_col with mut = 0;
+        while (tile_col < cols) {
+            let is i64 as col_start = tile_offset(tile_col, h.mi_cols,
+                                                  h.tile_cols_log2);
+            let is i64 as col_end = tile_offset(tile_col + 1, h.mi_cols,
+                                                h.tile_cols_log2);
+            if (col_start < 0 || col_end < 0) { return errno.I_CORRUPT; }
+
+            let is i64 as off = h.tiles.off[ti];
+            let is i64 as tlen = h.tiles.len[ti];
+            if (off < 0 || tlen < 1) { return errno.I_CORRUPT; }
+            if (off > len) { return errno.I_CORRUPT; }
+            if (tlen > len - off) { return errno.I_CORRUPT; }
+
+            b.mi_col_start = col_start;
+            let is vb.Vp9Bool as br;
+            let is i64 as st with mut = vb.vp9_bool_init(&br,
+                cast(*u8, cast(i64, data) + off), tlen);
+            if (st < 0) { return st; }
+            st = _decode_tile(b, &br, row_start, row_end, col_start, col_end);
+            if (st < 0) { return st; }
+            st = vb.vp9_bool_exit(&br);
+            if (st < 0) { return st; }
+
+            ti = ti + 1;
+            tile_col = tile_col + 1;
+        }
+        tile_row = tile_row + 1;
+    }
+    return errno.I_OK;
+}
