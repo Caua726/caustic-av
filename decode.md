@@ -2,7 +2,7 @@
 
 Stage 10. `decode.cst` maps a `core/codec.Track` to the VP9, Opus or MP3
 decoder already in the tree, arms one packet, and hands out 0..N video frames
-or one audio block. It owns no file, no allocation and no output surface it did
+or audio blocks. It owns no file, no allocation and no output surface it did
 not receive from the caller.
 
 Status: **WRITTEN, NOT VERIFIED.** Nothing here has been compiled or run. The
