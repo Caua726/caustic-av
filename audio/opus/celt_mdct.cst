@@ -1,0 +1,285 @@
+// =======================================================
+// caustic-av/audio/opus/celt_mdct.cst
+// Inverse MDCT, overlap-add, comb post-filter and de-emphasis for the CELT
+// layer, RFC 6716 sections 4.3.7 and 4.3.7.1-4.3.7.2.
+//
+// Transform model
+//   The RFC defines an inverse MDCT that takes N frequency samples and
+//   produces 2*N time samples with a factor 1/2. The window is the
+//   low-overlap window derived from the 240-sample Vorbis window:
+//
+//     w(t) = W(t)             for t < 120          (rising edge)
+//     w(t) = 1                for 120 <= t < N
+//     w(t) = W(119 - (t-N))   for N <= t < N+120   (falling edge)
+//     w(t) = 0                beyond N+120
+//
+//   with W(n) = sin(pi/2 * sin(pi/2*(n+1/2)/120)^2). That window is power
+//   complementary with a hop of N: the rising edge of one frame pairs with
+//   the falling edge of the previous one over 120 samples, and the flat
+//   middle is used by exactly one frame. The frame therefore produces N new
+//   samples and a 120-sample tail that the next frame's overlap-add consumes.
+//   For N = 120 the tapers meet and the window is the full 240-sample basic
+//   window.
+//
+//   The direct cosine sum is evaluated through the DCT-IV kernel
+//   u(m) = sum_k X[k] cos(pi/N (m+1/2)(k+1/2)), using the symmetry
+//   u(2N-1-m) = -u(m) to avoid computing the second half. This is O(N^2/2)
+//   per block: correct and easy to audit, but not the fastest possible
+//   inverse MDCT. celt.md records the fast-transform work as deferred.
+//
+//   The overlap-add tail and the post-filter history live in the decoder
+//   state, so no allocation happens here.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/math.cst" as fm;
+use "celt_state.cst" as st;
+
+let is f64 as CELT_PI with imut = 3.141592653589793;
+let is i64 as CELT_COMB_MINPERIOD with imut = 15;
+let is f64 as CELT_DEEMPH with imut = 0.8500061035;
+
+// One inverse MDCT block. `x` holds the coefficients with element stride
+// `stride` (short blocks are interleaved in the frame spectrum), `n` is the
+// number of coefficients, `out` receives n samples and `ola` points at the
+// 120-sample tail from the previous block. `w` is the 120-sample taper.
+fn celt_imdct_block(x as *f64, stride as i64, n as i64, out as *f64,
+                    ola as *f64, w as *f64) as i64 {
+    if (n <= 0 || n > 960 || (n & 1) != 0) { return errno.I_BADPARAM; }
+    let is i64 as half = n >> 1;
+    let is i64 as ov with mut = 120;
+    if (ov > n) { ov = n; }
+    let is i64 as m_lo with mut = half - ov;
+    if (m_lo < 0) { m_lo = 0; }
+    let is [960]f64 as ubuf;
+    let is i64 as ulen = n - m_lo;
+    let is i64 as i with mut = 0;
+    while (i < ulen) {
+        ubuf[i] = 0.0;
+        i = i + 1;
+    }
+
+    // DCT-IV row for m in [m_lo, n). Each coefficient advances a rotation,
+    // so only one sine and one cosine are evaluated per k.
+    let is f64 as pin = CELT_PI / cast(f64, n);
+    let is i64 as k with mut = 0;
+    while (k < n) {
+        let is f64 as xk = x[k * stride];
+        if (xk != 0.0) {
+            let is f64 as kf = cast(f64, k) + 0.5;
+            let is f64 as ang = pin * (cast(f64, m_lo) + 0.5) * kf;
+            let is f64 as step = pin * kf;
+            let is f64 as c with mut = fm.cos(ang);
+            let is f64 as s with mut = fm.sin(ang);
+            let is f64 as cd = fm.cos(step);
+            let is f64 as sd = fm.sin(step);
+            let is i64 as j with mut = 0;
+            while (j < ulen) {
+                ubuf[j] = ubuf[j] + xk * c;
+                let is f64 as nx = c * cd - s * sd;
+                let is f64 as ny = s * cd + c * sd;
+                c = nx;
+                s = ny;
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+
+    // Output samples [0, n): windowed first 120 (mixed with the tail), flat
+    // after that. The MDCT scale of RFC 4.3.7 is 1/2.
+    let is i64 as t with mut = 0;
+    while (t < n) {
+        let is i64 as mm = _celt_imdct_map(t + half, n);
+        let is i64 as idx with mut = 0;
+        let is i64 as sg with mut = 1;
+        if (mm < 0) { idx = 0 - mm - 1; sg = -1; } else { idx = mm; }
+        if (idx < m_lo || idx >= n) { return errno.I_CORRUPT; }
+        let is f64 as v = 0.5 * cast(f64, sg) * ubuf[idx - m_lo];
+        if (t < ov) {
+            out[t] = w[t] * v + ola[t];
+        } else {
+            out[t] = v;
+        }
+        t = t + 1;
+    }
+
+    // Tail for the next block: the windowed falling edge.
+    t = 0;
+    while (t < ov) {
+        let is i64 as mm = _celt_imdct_map(n + t + half, n);
+        let is i64 as idx with mut = 0;
+        let is i64 as sg with mut = 1;
+        if (mm < 0) { idx = 0 - mm - 1; sg = -1; } else { idx = mm; }
+        if (idx < m_lo || idx >= n) { return errno.I_CORRUPT; }
+        let is f64 as v = 0.5 * cast(f64, sg) * ubuf[idx - m_lo];
+        ola[t] = w[ov - 1 - t] * v;
+        t = t + 1;
+    }
+    return errno.I_OK;
+}
+
+// Map an extended MDCT-DCT-IV index into [0, n) and encode the sign as
+// -(idx+1). The cosine kernel satisfies u(-1-m) = u(m) and
+// u(2n+m) = -u(m), and u(2n-1-m) = -u(m); together those fold every index
+// the window can ask for back into the computed row.
+fn _celt_imdct_map(m as i64, n as i64) as i64 {
+    let is i64 as mm with mut = m;
+    let is i64 as sg with mut = 1;
+    let is i64 as two = 2 * n;
+    while (mm >= two) {
+        mm = mm - two;
+        sg = 0 - sg;
+    }
+    while (mm < 0) { mm = 0 - 1 - mm; }
+    if (mm >= n) {
+        mm = two - 1 - mm;
+        sg = 0 - sg;
+    }
+    if (sg < 0) { return 0 - mm - 1; }
+    return mm;
+}
+
+// Taps of the comb post-filter, RFC 4.3.7.1.
+fn celt_comb_tap(tapset as i64, which as i64) as f64 {
+    if (tapset == 0) {
+        if (which == 0) { return 0.3066406250; }
+        if (which == 1) { return 0.2170410156; }
+        return 0.1296386719;
+    }
+    if (tapset == 1) {
+        if (which == 0) { return 0.4638671875; }
+        if (which == 1) { return 0.2680664062; }
+        return 0.0;
+    }
+    if (tapset == 2) {
+        if (which == 0) { return 0.7998046875; }
+        if (which == 1) { return 0.1000976562; }
+        return 0.0;
+    }
+    if (which == 0) { return 0.3066406250; }
+    if (which == 1) { return 0.2170410156; }
+    return 0.1296386719;
+}
+
+// y[i] = x[i] + g0 * comb(x, T0, tapset0) cross-fading to
+//               g1 * comb(x, T1, tapset1) over `overlap` samples, using the
+// squared MDCT window as the fade (RFC 4.3.7.1).
+// The filter is applied in place; x[-T ...] must be valid past samples.
+fn celt_comb_filter(x as *f64, t0_in as i64, g0 as f64, tap0 as i64,
+                    t1_in as i64, g1 as f64, tap1 as i64, n as i64,
+                    w as *f64, overlap_in as i64) as void {
+    let is i64 as t0 with mut = t0_in;
+    let is i64 as t1 with mut = t1_in;
+    if (t0 < CELT_COMB_MINPERIOD) { t0 = CELT_COMB_MINPERIOD; }
+    if (t1 < CELT_COMB_MINPERIOD) { t1 = CELT_COMB_MINPERIOD; }
+    let is i64 as overlap with mut = overlap_in;
+    if (g0 == g1 && t0 == t1 && tap0 == tap1) { overlap = 0; }
+    let is f64 as g00 = g0 * celt_comb_tap(tap0, 0);
+    let is f64 as g01 = g0 * celt_comb_tap(tap0, 1);
+    let is f64 as g02 = g0 * celt_comb_tap(tap0, 2);
+    let is f64 as g10 = g1 * celt_comb_tap(tap1, 0);
+    let is f64 as g11 = g1 * celt_comb_tap(tap1, 1);
+    let is f64 as g12 = g1 * celt_comb_tap(tap1, 2);
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is f64 as oldv = g00 * x[i - t0]
+            + g01 * (x[i - t0 + 1] + x[i - t0 - 1])
+            + g02 * (x[i - t0 + 2] + x[i - t0 - 2]);
+        let is f64 as newv = g10 * x[i - t1]
+            + g11 * (x[i - t1 + 1] + x[i - t1 - 1])
+            + g12 * (x[i - t1 + 2] + x[i - t1 - 2]);
+        if (i < overlap) {
+            let is f64 as f = w[i] * w[i];
+            x[i] = x[i] + (1.0 - f) * oldv + f * newv;
+        } else {
+            x[i] = x[i] + newv;
+        }
+        i = i + 1;
+    }
+}
+
+// Apply this frame's post-filter to one channel, in place, in its history
+// buffer. Every output channel reads the same transition: the state left by
+// the previous frame (pf_period/pf_gain/pf_tapset) and the parameters decoded
+// in this one. Nothing that carries across frames changes here, apart from
+// the reference's minimum-period clamp, which is idempotent.
+fn celt_postfilter_apply(d as *st.CeltDec, c as i64, n as i64, lm as i64,
+                         new_period as i64, new_gain as f64,
+                         new_tap as i64) as i64 {
+    let is *f64 as hist = &d.pf_hist[c * 2048];
+    let is *f64 as base = celt_tbl_offset(hist, 1024);
+    let is *f64 as w = &d.tab.window[0];
+    if (d.pf_period < CELT_COMB_MINPERIOD) { d.pf_period = CELT_COMB_MINPERIOD; }
+    if (d.pf_period_old < CELT_COMB_MINPERIOD) { d.pf_period_old = CELT_COMB_MINPERIOD; }
+    if (lm == 0) {
+        // 2.5 ms: one segment; the parameters decoded in this frame take
+        // effect from the next frame (the reference's one-frame delay).
+        celt_comb_filter(base, d.pf_period_old, d.pf_gain_old, d.pf_tapset_old,
+                         d.pf_period, d.pf_gain, d.pf_tapset, 120, w, 120);
+    } else {
+        // The first 120 samples are the previous frame's overlap; fade the
+        // filter from the one before it to the previous frame's parameters.
+        celt_comb_filter(base, d.pf_period_old, d.pf_gain_old, d.pf_tapset_old,
+                         d.pf_period, d.pf_gain, d.pf_tapset, 120, w, 120);
+        // The rest fades from the previous frame's filter to this frame's.
+        celt_comb_filter(celt_tbl_offset(base, 120),
+                         d.pf_period, d.pf_gain, d.pf_tapset,
+                         new_period, new_gain, new_tap, n - 120, w, 120);
+    }
+    return errno.I_OK;
+}
+
+// Advance the post-filter state by exactly one frame, after every output
+// channel has been filtered (RFC 4.3.7.1; the reference updates the
+// parameters outside its channel loop, so all channels see the same
+// old -> current -> new transition).
+fn celt_postfilter_advance(d as *st.CeltDec, lm as i64, new_period as i64,
+                           new_gain as f64, new_tap as i64) as void {
+    d.pf_period_old = d.pf_period;
+    d.pf_gain_old = d.pf_gain;
+    d.pf_tapset_old = d.pf_tapset;
+    d.pf_period = new_period;
+    d.pf_gain = new_gain;
+    d.pf_tapset = new_tap;
+    if (lm != 0) {
+        d.pf_period_old = d.pf_period;
+        d.pf_gain_old = d.pf_gain;
+        d.pf_tapset_old = d.pf_tapset;
+    }
+}
+
+// De-emphasis and interleaved write (RFC 4.3.7.2). `pcm` is interleaved by
+// `channels`; `c` selects the lane.
+fn celt_deemphasis_write(d as *st.CeltDec, c as i64, n as i64, channels as i64,
+                         pcm as *f64) as i64 {
+    let is *f64 as hist = &d.pf_hist[c * 2048];
+    let is *f64 as base = celt_tbl_offset(hist, 1024);
+    let is f64 as mem with mut = d.preemph[c];
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is f64 as tmp = base[i] + mem;
+        mem = CELT_DEEMPH * tmp;
+        pcm[i * channels + c] = tmp;
+        i = i + 1;
+    }
+    d.preemph[c] = mem;
+    return errno.I_OK;
+}
+
+// Shift the post-filter history down by one frame so the next frame writes
+// its samples at the same offset.
+fn celt_postfilter_shift(d as *st.CeltDec, c as i64, n as i64) as void {
+    if (n <= 0 || n > 1024) { return; }
+    let is *f64 as hist = &d.pf_hist[c * 2048];
+    let is i64 as j with mut = 0;
+    let is i64 as lim = 2048 - n;
+    while (j < lim) {
+        hist[j] = hist[j + n];
+        j = j + 1;
+    }
+}
+
+fn celt_tbl_offset(base as *f64, off as i64) as *f64 {
+    return cast(*f64, cast(i64, base) + off * 8);
+}

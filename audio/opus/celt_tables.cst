@@ -1,0 +1,352 @@
+// =======================================================
+// caustic-av/audio/opus/celt_tables.cst
+// Constants, small PDFs and derived lookup data for the CELT layer.
+//
+// Primary source: RFC 6716 section 4.3 and its tables. Where the RFC gives a
+// formula (band edges from Table 55, the window of 4.3.7, the TF adjustment
+// tables 60-63, the static allocation of Table 57, the PDFs of Table 56 and
+// 58/59) the table is built here from that definition. The three data blobs
+// the RFC text does not print (it names the coarse-energy model and the cap
+// source, but not the mean band energy) are in celt_tables_data.cst.
+//
+// Two integer helpers are part of the bitstream definition because the
+// decoder must reproduce the encoder's bit allocation exactly:
+//
+//   celt_log2_frac     conservative (rounded up) log2 in 1/2^frac units. The
+//                      allocation table of RFC 4.3.3 is expressed in these
+//                      units, so a different rounding changes parsing.
+//   celt_bitexact_cos  Q15 cosine of an angle in Q14 turns, and
+//   celt_bitexact_log2tan  Q11 log2 of a sine/cosine ratio, used to split
+//                      the bits of a band between mid and side. Again the
+//                      split decides what the bitstream contains.
+//
+// These are numerical definitions, not decoder structure; celt.md records
+// that they were reconstructed from the reference behaviour and marks them
+// UNCONFIRMED until the external comparison confirms them.
+//
+// Everything here is initialized by celt_tables_init(). No allocation, no
+// reads outside the caller's state.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/math.cst" as fm;
+use "celt_tables_data.cst" as dt;
+
+// ── mode constants (RFC 6716 4.3) ───────────────────────────────────
+let is i64 as CELT_MAX_BANDS   with imut = 21;    // bands 0..20
+let is i64 as CELT_OVERLAP     with imut = 120;   // 2.5 ms at 48 kHz
+let is i64 as CELT_BITRES      with imut = 3;     // allocation in 1/8 bit
+let is i64 as CELT_ALLOC_VEC   with imut = 11;    // Table 57 rows
+let is i64 as CELT_FINE_OFFSET with imut = 21;
+let is i64 as CELT_MAX_PSEUDO  with imut = 40;
+let is i64 as CELT_MAX_PVQ_N   with imut = 176;   // 22 << 3
+let is i64 as CELT_PVQ_QBITS   with imut = 41;    // 0..40 plus room
+
+// ── inverse CDFs of the single-symbol PDFs (RFC 6716 Table 56) ──────
+//
+// An inverse CDF here is ft - cumulative probability, in the bit width of
+// the symbol: the encoder's PDFs in Table 56/58/59 are the probabilities of
+// the values in order.
+//
+//   silence              {32767, 1}/32768       -> bit_logp(15)
+//   post-filter flag     {1, 1}/2               -> bit_logp(1)
+//   transient            {7, 1}/8               -> bit_logp(3)
+//   intra                {7, 1}/8               -> bit_logp(3)
+//   spread               {7, 2, 21, 2}/32       -> 5 bits
+//   trim                 {2, 2, 5, 10, 22, 46, 22, 10, 5, 2, 2}/128 -> 7 bits
+//   tapset               {2, 1, 1}/4            -> 2 bits
+//   small coarse energy  {2, 1, 1}/4            -> 2 bits
+let is *u8 as CELT_ICDF_SPREAD with imut = "\x19\x17\x02\x00";
+let is *u8 as CELT_ICDF_TRIM with imut =
+    "\x7E\x7C\x77\x6D\x57\x29\x13\x09\x04\x02\x00";
+let is *u8 as CELT_ICDF_TAPSET with imut = "\x02\x01\x00";
+let is *u8 as CELT_ICDF_SMALL_ENERGY with imut = "\x02\x01\x00";
+
+// Spread decision values 0..3 (RFC 6716 Table 59) and their effect on the
+// spreading rotation are applied in celt_pvq.cst; no constant is needed here.
+
+// Arithmetic on the band layout: everything is integral and bounded.
+fn celt_ilog2(v as i64) as i64 {
+    // EC_ILOG: 1 + floor(log2(v)); 0 for v <= 0.
+    let is i64 as x with mut = v;
+    let is i64 as n with mut = 0;
+    while (x > 0) {
+        n = n + 1;
+        x = x >> 1;
+    }
+    return n;
+}
+
+// Conservative binary logarithm with `frac` fractional bits. It must round
+// up: RFC 6716 4.3.3 computes the allocation in these units, and the encoder
+// used the same conservative estimate, so a lower estimate can change which
+// pulses a band receives.
+fn celt_log2_frac(val as i64, frac as i64) as i64 {
+    if (val <= 0) { return 0; }
+    let is i64 as l = celt_ilog2(val);
+    if ((val & (val - 1)) != 0) {
+        let is i64 as v with mut = val;
+        if (l > 16) {
+            v = ((v - 1) >> (l - 16)) + 1;
+        } else {
+            v = v << (16 - l);
+        }
+        let is i64 as res with mut = (l - 1) << frac;
+        let is i64 as f with mut = frac;
+        let is i64 as go with mut = 1;
+        while (go == 1) {
+            let is i64 as b = v >> 16;
+            res = res + (b << f);
+            v = (v + b) >> b;
+            v = (v * v + 0x7FFF) >> 15;
+            if (f == 0) {
+                go = 0;
+            } else {
+                f = f - 1;
+            }
+        }
+        if (v > 0x8000) { res = res + 1; }
+        return res;
+    }
+    return (l - 1) << frac;
+}
+
+// floor(sqrt(v)) for v >= 0. Used by the triangular split PDF, where the
+// argument is below 2^31.
+fn celt_isqrt32(v as i64) as i64 {
+    if (v <= 0) { return 0; }
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = 46341;   // > sqrt(2^31)
+    while (lo + 1 < hi) {
+        let is i64 as mid = (lo + hi) >> 1;
+        if (mid * mid <= v) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// FRAC_MUL16 of the reference: (16384 + a*b) >> 15, Q15 in and out.
+fn celt_frac_mul16(a as i64, b as i64) as i64 {
+    return (16384 + a * b) >> 15;
+}
+
+// Q15 cosine of x/16384 turns, for x in (0, 16384). The polynomial and its
+// rounding are part of the format: the value feeds celt_bitexact_log2tan,
+// which decides the mid/side bit split.
+fn celt_bitexact_cos(x as i64) as i64 {
+    let is i64 as x2 = (4096 + x * x) >> 13;
+    let is i64 as y = (32767 - x2)
+        + celt_frac_mul16(x2, -7651
+            + celt_frac_mul16(x2, 8277 + celt_frac_mul16(-626, x2)));
+    return 1 + y;
+}
+
+// Q11 log2(isin/icos) for positive isin and icos.
+fn celt_bitexact_log2tan(isin as i64, icos as i64) as i64 {
+    if (isin <= 0 || icos <= 0) { return 0; }
+    let is i64 as lc = celt_ilog2(icos);
+    let is i64 as ls = celt_ilog2(isin);
+    let is i64 as si = isin << (15 - ls);
+    let is i64 as co = icos << (15 - lc);
+    return (ls - lc) * 2048
+        + celt_frac_mul16(si, celt_frac_mul16(si, -2597) + 7932)
+        - celt_frac_mul16(co, celt_frac_mul16(co, -2597) + 7932);
+}
+
+// Number of pulses for pseudo-pulse index q (RFC 4.3.4.1; q <= 40).
+fn celt_get_pulses(q as i64) as i64 {
+    if (q < 8) { return q; }
+    return (8 + (q & 7)) << ((q >> 3) - 1);
+}
+
+// ── tables ──────────────────────────────────────────────────────────
+//
+// The arrays live in the caller's state. `ready` is 0 until celt_tables_init
+// has parsed all of them; the decoder refuses to run otherwise.
+struct CeltTab {
+    ready      as i64;
+    ebands     as [22]i64;      // RFC Table 55, shortest frame (2.5 ms)
+    alloc      as [231]i64;     // RFC Table 57, 11 x 21
+    e_means    as [25]f64;      // mean band energy, Q4 data -> f64
+    e_prob     as [336]i64;     // coarse-energy Laplace model
+    caps       as [168]i64;     // band caps minus 64
+    log2frac   as [24]i64;      // LOG2_FRAC_TABLE: log2_frac(i+1, 3)
+    window     as [120]f64;     // RFC 4.3.7 low-overlap taper
+    pvq_bits   as [7257]i32;    // [N][q] pulse->bits, 0 for q > qmax
+    pvq_qmax   as [177]i64;     // largest usable q per N
+}
+
+// eBands from RFC 6716 Table 55, 2.5 ms column. The bin counts in that
+// column are the differences of the edges.
+let is *u8 as CELT_TBL_EBANDS_TEXT with imut =
+    "0 1 2 3 4 5 6 7 8 10 12 14 16 20 24 28 34 40 48 60 78 100";
+
+// Static allocation, RFC 6716 Table 57 (row 0 is the all-zero quality 0
+// column printed there; rows 1..10 are qualities 1..10).
+let is *u8 as CELT_TBL_ALLOC_TEXT with imut =
+    "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+    "90 80 75 69 63 56 49 40 34 29 20 18 10 0 0 0 0 0 0 0 0 "
+    "110 100 90 84 78 71 65 58 51 45 39 32 26 20 12 0 0 0 0 0 0 "
+    "118 110 103 93 86 80 75 70 65 59 53 47 40 31 23 15 4 0 0 0 0 "
+    "126 119 112 104 95 89 83 78 72 66 60 54 47 39 32 25 17 12 1 0 0 "
+    "134 127 120 114 103 97 91 85 78 72 66 60 54 47 41 35 29 23 16 10 1 "
+    "144 137 130 124 113 107 101 95 88 82 76 70 64 57 51 45 39 33 26 15 1 "
+    "152 145 138 132 123 117 111 105 98 92 86 80 74 67 61 55 49 43 36 20 1 "
+    "162 155 148 142 133 127 121 115 108 102 96 90 84 77 71 65 59 53 46 30 1 "
+    "172 165 158 152 143 137 131 125 118 112 106 100 94 87 81 75 69 63 56 45 20 "
+    "200 200 200 200 200 200 200 200 198 193 188 183 178 173 168 163 158 153 148 129 104";
+
+// Parse exactly `count` non-negative decimal integers from NUL-terminated
+// text. Text is bounded by the terminator; a missing value is I_CORRUPT.
+fn _celt_parse(text as *u8, out as *i64, count as i64) as i64 {
+    let is i64 as pos with mut = 0;
+    let is i64 as n with mut = 0;
+    while (n < count) {
+        while (text[pos] == 32 || text[pos] == 9 || text[pos] == 10) { pos = pos + 1; }
+        if (text[pos] == 0) { return errno.I_CORRUPT; }
+        let is i64 as v with mut = 0;
+        while (text[pos] >= 48 && text[pos] <= 57) {
+            v = v * 10 + cast(i64, text[pos]) - 48;
+            pos = pos + 1;
+        }
+        out[n] = v;
+        n = n + 1;
+    }
+    return errno.I_OK;
+}
+
+// U(N, 0..kmax+1) row, saturated at 2^32. The recurrence is
+// U(n,k)=U(n-1,k)+U(n,k-1)+U(n-1,k-1) with U(0,0)=1 and U(0,k>0)=0.
+fn celt_pvq_urow(n as i64, kmax as i64, u as *i64) as void {
+    let is i64 as cap = 4294967296;   // 2^32, one past the 32-bit limit
+    u[0] = 1;
+    let is i64 as i with mut = 1;
+    while (i <= kmax + 1) { u[i] = 0; i = i + 1; }
+    let is i64 as r with mut = 1;
+    while (r <= n) {
+        let is i64 as old_left with mut = u[0];
+        u[0] = 0;
+        i = 1;
+        while (i <= kmax + 1) {
+            let is i64 as old_i = u[i];
+            let is i64 as s = old_i + u[i - 1] + old_left;
+            if (s > cap) { u[i] = cap; } else { u[i] = s; }
+            old_left = old_i;
+            i = i + 1;
+        }
+        r = r + 1;
+    }
+}
+
+// V(N,K) = U(N,K) + U(N,K+1), from a row produced above.
+fn celt_pvq_v_from_row(u as *i64, k as i64) as i64 {
+    if (k < 0) { return 0; }
+    let is i64 as v = u[k] + u[k + 1];
+    if (v > 4294967296) { return 4294967296; }
+    return v;
+}
+
+// Build the pulse/bit cache for every N the 48 kHz layout can produce.
+// This is the table that RFC 4.3.4.1 calls "a precomputed allocation table":
+// pulses2bits(N,q) = log2_frac(V(N, get_pulses(q)), 3). Building it from the
+// definition keeps the decoder independent of any shipped cache.
+fn celt_tables_build_pvq(t as *CeltTab) as i64 {
+    let is [130]i64 as u;
+    let is *i64 as up = &u[0];
+    let is i64 as n with mut = 0;
+    while (n <= CELT_MAX_PVQ_N) {
+        let is i64 as kmax = 128;   // get_pulses(40)
+        celt_pvq_urow(n, kmax, up);
+        let is i64 as qmax with mut = 0;
+        while (qmax < CELT_MAX_PSEUDO) {
+            let is i64 as kp = celt_get_pulses(qmax + 1);
+            let is i64 as v = celt_pvq_v_from_row(up, kp);
+            if (v > 4294967295) { break; }
+            qmax = qmax + 1;
+        }
+        t.pvq_qmax[n] = qmax;
+        t.pvq_bits[n * CELT_PVQ_QBITS] = 0;
+        let is i64 as q with mut = 1;
+        while (q <= CELT_MAX_PSEUDO) {
+            if (q <= qmax) {
+                let is i64 as kp = celt_get_pulses(q);
+                let is i64 as v = celt_pvq_v_from_row(up, kp);
+                t.pvq_bits[n * CELT_PVQ_QBITS + q] = cast(i32, celt_log2_frac(v, CELT_BITRES));
+            } else {
+                t.pvq_bits[n * CELT_PVQ_QBITS + q] = 0;
+            }
+            q = q + 1;
+        }
+        n = n + 1;
+    }
+    return errno.I_OK;
+}
+
+// Parse the fixed tables, compute the window and the pulse cache.
+fn celt_tables_init(t as *CeltTab) as i64 {
+    t.ready = 0;
+    let is i64 as r with mut = 0;
+    r = _celt_parse(CELT_TBL_EBANDS_TEXT, &t.ebands[0], 22);
+    if (r != errno.I_OK) { return r; }
+    r = _celt_parse(CELT_TBL_ALLOC_TEXT, &t.alloc[0], 231);
+    if (r != errno.I_OK) { return r; }
+
+    // Mean energies are Q4 in the table; the decoder works in log2 units.
+    let is [25]i64 as means;
+    r = _celt_parse(dt.CELT_TBL_E_MEANS, &means[0], 25);
+    if (r != errno.I_OK) { return r; }
+    let is i64 as i with mut = 0;
+    while (i < 25) {
+        t.e_means[i] = cast(f64, means[i]) * 0.0625;
+        i = i + 1;
+    }
+
+    r = _celt_parse(dt.CELT_TBL_E_PROB_MODEL, &t.e_prob[0], 336);
+    if (r != errno.I_OK) { return r; }
+    r = _celt_parse(dt.CELT_TBL_CAPS, &t.caps[0], 168);
+    if (r != errno.I_OK) { return r; }
+
+    // LOG2_FRAC_TABLE[i] is the conservative 1/8-bit log2 of i+1, that is the
+    // cost of a uniform symbol with i+1 values. RFC 4.3.3 names the table
+    // (its entries are the reference's rate.c literal) and the intensity and
+    // skip reservations index it by a band count; deriving the entries from
+    // the same log2_frac keeps one definition.
+    i = 0;
+    while (i < 24) {
+        t.log2frac[i] = celt_log2_frac(i + 1, CELT_BITRES);
+        i = i + 1;
+    }
+
+    // RFC 4.3.7: W(n) = sin(pi/2 * sin(pi/2*(n+1/2)/L)^2), L = 120.
+    let is f64 as half_pi = 1.5707963267948966;
+    i = 0;
+    while (i < CELT_OVERLAP) {
+        let is f64 as s = fm.sin(half_pi * (cast(f64, i) + 0.5) / 120.0);
+        t.window[i] = fm.sin(half_pi * s * s);
+        i = i + 1;
+    }
+
+    r = celt_tables_build_pvq(t);
+    if (r != errno.I_OK) { return r; }
+    t.ready = 1;
+    return errno.I_OK;
+}
+
+fn celt_tables_ready(t as *CeltTab) as i64 {
+    return t.ready;
+}
+
+// Band width in MDCT bins at scale LM.
+fn celt_band_bins(t as *CeltTab, band as i64, lm as i64) as i64 {
+    if (band < 0 || band >= CELT_MAX_BANDS) { return 0; }
+    return (t.ebands[band + 1] - t.ebands[band]) << lm;
+}
+
+// log2(band width) in 1/8 bits, used by the allocation offsets.
+fn celt_logn(t as *CeltTab, band as i64) as i64 {
+    if (band < 0 || band >= CELT_MAX_BANDS) { return 0; }
+    return celt_log2_frac(t.ebands[band + 1] - t.ebands[band], CELT_BITRES);
+}

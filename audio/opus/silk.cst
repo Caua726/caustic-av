@@ -1,0 +1,821 @@
+// =======================================================
+// caustic-av/audio/opus/silk.cst
+// The SILK layer of RFC 6716: frame organization (section 4.2.2 to 4.2.6),
+// per-frame parameter decoding (4.2.7), stereo unmixing (4.2.8) and the
+// output path to 8/12/16/24/48 kHz.
+//
+// One call decodes the whole SILK part of one Opus frame, exactly as the
+// Opus decoder sees it: the caller has already split the packet into Opus
+// frames and initialised the range decoder on this frame's slice. On
+// return the range decoder sits at the first bit after the SILK layer, so
+// a Hybrid frame can decode its CELT part next. LBRR frames are parsed
+// (all symbols, including excitation) so the range decoder advances
+// correctly, but they are not synthesized: this decoder has no PLC/FEC
+// path, and silk_decode_lost() says so.
+//
+// `bandwidth` is the SILK internal bandwidth, numbered as SILK_BW_* in
+// silk_tables.cst: 0 NB, 1 MB, 2 WB. Only those three values are accepted;
+// anything else returns I_BADPARAM. It is not literally the Opus TOC
+// configuration group (config >> 2): configurations 12-15 are Hybrid
+// (SWB/FB), whose SILK layer runs at WB, so the Opus layer must pass 2
+// for them rather than 3.
+// `duration_ms` is the Opus frame duration: 10, 20, 40 or 60. A 40/60 ms
+// Opus frame contains two/three 20 ms SILK frames. `coded_channels` is the
+// packet's stereo flag plus one.
+//
+// Output is planar f64 with a nominal range of -1..1, already resampled to
+// the decoder's output rate and carrying the one-sample unmix delay the
+// specification requires for both mono and stereo. The caller provides one
+// buffer per output channel and its capacity in frames.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "range.cst" as rc;
+use "silk_bits.cst" as bits;
+use "silk_core.cst" as core;
+use "silk_defs.cst" as defs;
+use "silk_nlsf.cst" as nlsf;
+use "silk_resample.cst" as rsm;
+use "silk_tables.cst" as t;
+use "silk_tables_data.cst" as data;
+
+struct SilkDecoder {
+    channels   as i64;   // output channels, 1 or 2
+    rate       as i64;   // output sampling rate
+    bandwidth  as i64;   // current internal bandwidth, -1 before first use
+    prev_coded as i64;   // previous internal channel count, 0 initially
+    prev_mid_only as i64; // previous interval's mid-only flag
+    ch0        as defs.SilkChan;
+    ch1        as defs.SilkChan;
+    prev_w0    as i64;   // previous stereo weights, Q13
+    prev_w1    as i64;
+    st_mid1    as f64;   // mid[-1] for the one-sample delay
+    st_mid2    as f64;   // mid[-2] for the stereo low-pass
+    st_side1   as f64;   // side[-1]
+    rs         as rsm.SilkResampler;
+}
+
+fn _silk_zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = 0;
+        i = i + 1;
+    }
+}
+
+// Internal sampling rate of a bandwidth index.
+fn _silk_rate(bw as i64) as i64 {
+    if (bw == t.SILK_BW_NB) { return 8000; }
+    if (bw == t.SILK_BW_MB) { return 12000; }
+    if (bw == t.SILK_BW_WB) { return 16000; }
+    return 0 - 1;
+}
+
+fn _silk_lag_min(bw as i64) as i64 {
+    if (bw == t.SILK_BW_NB) { return 16; }
+    if (bw == t.SILK_BW_MB) { return 24; }
+    return 32;
+}
+
+fn _silk_lag_max(bw as i64) as i64 {
+    if (bw == t.SILK_BW_NB) { return 144; }
+    if (bw == t.SILK_BW_MB) { return 216; }
+    return 288;
+}
+
+fn _silk_lag_scale(bw as i64) as i64 {
+    if (bw == t.SILK_BW_NB) { return 4; }
+    if (bw == t.SILK_BW_MB) { return 6; }
+    return 8;
+}
+
+fn _clampi(v as i64, lo as i64, hi as i64) as i64 {
+    let is i64 as x with mut = v;
+    if (x < lo) { x = lo; }
+    if (x > hi) { x = hi; }
+    return x;
+}
+
+// 2**(x/128) approximation of section 4.2.7.4, returned in Q16.
+fn _silk_log2lin(x as i64) as i64 {
+    let is i64 as ipart = x >> 7;
+    let is i64 as fpart = x & 127;
+    if (ipart < 0) { return 0; }
+    let is i64 as base with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < ipart && i < 40) {
+        base = base << 1;
+        i = i + 1;
+    }
+    let is i64 as frac = ((0 - 174 * fpart * (128 - fpart)) >> 16) + fpart;
+    return base + frac * (base >> 7);
+}
+
+// ── stereo weights (section 4.2.7.1) ───────────────────────────────
+fn _silk_stereo_weights(r as *rc.OpusRange, p as *defs.SilkParams) as i64 {
+    let is i64 as n = bits.silk_sym(r, data.SILK_TBL_STEREO_S1, 0, t.SILK_STEREO_S1_N);
+    if (n < 0) { return n; }
+    let is i64 as i0 = bits.silk_sym(r, data.SILK_TBL_STEREO_S2, 0, t.SILK_STEREO_S2_N);
+    if (i0 < 0) { return i0; }
+    let is i64 as i1 = bits.silk_sym(r, data.SILK_TBL_STEREO_S3, 0, t.SILK_STEREO_S3_N);
+    if (i1 < 0) { return i1; }
+    let is i64 as i2 = bits.silk_sym(r, data.SILK_TBL_STEREO_S2, 0, t.SILK_STEREO_S2_N);
+    if (i2 < 0) { return i2; }
+    let is i64 as i3 = bits.silk_sym(r, data.SILK_TBL_STEREO_S3, 0, t.SILK_STEREO_S3_N);
+    if (i3 < 0) { return i3; }
+    if (n >= 25 || i0 >= 3 || i1 >= 5 || i2 >= 3 || i3 >= 5) {
+        return errno.I_CORRUPT;
+    }
+
+    let is i64 as wi0 = i0 + 3 * (n / 5);
+    let is i64 as wi1 = i2 + 3 * (n % 5);
+    if (wi0 < 0 || wi0 >= 15 || wi1 < 0 || wi1 >= 15) { return errno.I_CORRUPT; }
+    let is i64 as w0 = t.silk_tbl_i(data.SILK_TBL_STEREO_W, wi0);
+    let is i64 as w0n = t.silk_tbl_i(data.SILK_TBL_STEREO_W, wi0 + 1);
+    let is i64 as w1 = t.silk_tbl_i(data.SILK_TBL_STEREO_W, wi1);
+    let is i64 as w1n = t.silk_tbl_i(data.SILK_TBL_STEREO_W, wi1 + 1);
+
+    let is i64 as p1 = w1 + (((w1n - w1) * 6554) >> 16) * (2 * i3 + 1);
+    let is i64 as p0 = w0 + (((w0n - w0) * 6554) >> 16) * (2 * i1 + 1) - p1;
+    p.w1_Q13 = p1;
+    p.w0_Q13 = p0;
+    return errno.I_OK;
+}
+
+// ── per-frame parameter parsing (section 4.2.7) ────────────────────
+//
+// `active` is the VAD flag or 1 for an LBRR frame. `cond` is a SILK_COND_*
+// value; `prev_lag` and `prev_voiced` are the same-type history for the
+// pitch-delta decision. Nothing outside `p` is changed.
+fn _silk_parse_frame(r as *rc.OpusRange, p as *defs.SilkParams,
+                     wb as i64, subframes as i64, frame_len as i64,
+                     active as i64, cond as i64,
+                     prev_lag as i64, prev_voiced as i64) as i64 {
+    let is i64 as order with mut = 10;
+    if (wb == t.SILK_BW_WB) { order = 16; }
+
+    // Frame type jointly codes signal type and quantization offset type.
+    if (active != 0) {
+        let is i64 as type = bits.silk_sym(r, data.SILK_TBL_FRAME_ACTIVE, 0,
+                                           t.SILK_FRAME_TYPE_N);
+        if (type < 0) { return type; }
+        if (type < 2 || type > 5) { return errno.I_CORRUPT; }
+        p.signal_type = type >> 1;
+        p.qoff_high = type & 1;
+    } else {
+        let is i64 as type = bits.silk_sym(r, data.SILK_TBL_FRAME_INACTIVE, 0,
+                                           t.SILK_FRAME_TYPE_N);
+        if (type < 0) { return type; }
+        if (type > 1) { return errno.I_CORRUPT; }
+        p.signal_type = t.SILK_SIG_INACTIVE;
+        p.qoff_high = type;
+    }
+    p.voiced = 0;
+    if (p.signal_type == t.SILK_SIG_VOICED) { p.voiced = 1; }
+
+    // Gains: the first subframe is absolute in an independent frame and a
+    // delta otherwise; later subframes are always deltas.
+    let is *u8 as gpdf with mut = data.SILK_TBL_GAIN_MSB_INACTIVE;
+    if (p.signal_type == t.SILK_SIG_UNVOICED) { gpdf = data.SILK_TBL_GAIN_MSB_UNVOICED; }
+    else if (p.signal_type == t.SILK_SIG_VOICED) { gpdf = data.SILK_TBL_GAIN_MSB_VOICED; }
+
+    let is i64 as k with mut = 0;
+    while (k < subframes) {
+        let is i64 as idx with mut = 0;
+        if (k == 0 && cond != t.SILK_COND_CONDITIONAL) {
+            let is i64 as msb = bits.silk_sym(r, gpdf, 0, t.SILK_GAIN_MSB_N);
+            if (msb < 0) { return msb; }
+            let is i64 as lsb = bits.silk_uniform(r, 8);
+            if (lsb < 0) { return lsb; }
+            idx = msb * 8 + lsb;
+        } else {
+            idx = bits.silk_sym(r, data.SILK_TBL_GAIN_DELTA, 0, t.SILK_GAIN_DELTA_N);
+            if (idx < 0) { return idx; }
+        }
+        p.gain_idx[k] = idx;
+        k = k + 1;
+    }
+
+    // Normalized LSF: stage-1 index, then one stage-2 residual per
+    // coefficient with the extension symbol at the ends of the range.
+    let is *u8 as s1 with mut = data.SILK_TBL_LSF_S1_NBMB_INACTIVE;
+    if (wb == t.SILK_BW_WB) {
+        if (p.voiced != 0) { s1 = data.SILK_TBL_LSF_S1_WB_VOICED; }
+        else               { s1 = data.SILK_TBL_LSF_S1_WB_INACTIVE; }
+    } else {
+        if (p.voiced != 0) { s1 = data.SILK_TBL_LSF_S1_NBMB_VOICED; }
+    }
+    let is i64 as i1 = bits.silk_sym(r, s1, 0, t.SILK_LSF_S1_N);
+    if (i1 < 0) { return i1; }
+    if (i1 >= t.SILK_LSF_S1_N) { return errno.I_CORRUPT; }
+
+    let is *u8 as sel with mut = data.SILK_TBL_LSF_S2_SEL_NBMB;
+    let is i64 as sel_cols with mut = t.SILK_LSF_SEL_NB_COLS;
+    let is i64 as s2_base with mut = 0;
+    if (wb == t.SILK_BW_WB) {
+        sel = data.SILK_TBL_LSF_S2_SEL_WB;
+        sel_cols = t.SILK_LSF_SEL_WB_COLS;
+        s2_base = 8;
+    }
+
+    let is [16]i64 as idx2;
+    k = 0;
+    while (k < order) {
+        let is i64 as which = t.silk_tbl2(sel, i1, k, sel_cols);
+        if (which < 0 || which > 7) { return errno.I_CORRUPT; }
+        let is i64 as off = (s2_base + which) * t.SILK_LSF_S2_N;
+        let is i64 as sym = bits.silk_sym(r, data.SILK_TBL_LSF_S2, off,
+                                          t.SILK_LSF_S2_N);
+        if (sym < 0) { return sym; }
+        if (sym > 8) { return errno.I_CORRUPT; }
+        let is i64 as v with mut = sym - 4;
+        if (v == 0 - 4 || v == 4) {
+            let is i64 as ext = bits.silk_sym(r, data.SILK_TBL_LSF_S2_EXT, 0,
+                                              t.SILK_LSF_S2_EXT_N);
+            if (ext < 0) { return ext; }
+            if (v < 0) { v = v - ext; } else { v = v + ext; }
+        }
+        idx2[k] = v;
+        k = k + 1;
+    }
+
+    let is i64 as is_wb with mut = 0;
+    if (wb == t.SILK_BW_WB) { is_wb = 1; }
+    let is i64 as st = nlsf.silk_nlsf_reconstruct(i1, &idx2[0], &p.nlsf[0],
+                                                  order, is_wb);
+    if (st < 0) { return st; }
+
+    p.interp = 4;
+    if (subframes == 4) {
+        let is i64 as ip = bits.silk_sym(r, data.SILK_TBL_LSF_INTERP, 0,
+                                         t.SILK_LSF_INTERP_N);
+        if (ip < 0) { return ip; }
+        if (ip > 4) { return errno.I_CORRUPT; }
+        p.interp = ip;
+    }
+
+    // Long-term prediction parameters, voiced frames only.
+    p.ltp_scale = 15565;
+    p.primary_lag = 0;
+    k = 0;
+    while (k < t.SILK_SUBFRAMES_MAX) {
+        p.pitch[k] = 0;
+        let is i64 as j with mut = 0;
+        while (j < t.SILK_LTP_ORDER) { p.ltp_taps[k][j] = 0; j = j + 1; }
+        k = k + 1;
+    }
+
+    if (p.voiced != 0) {
+        let is i64 as primary with mut = 0;
+        let is i64 as absolute with mut = 1;
+        if (cond == t.SILK_COND_CONDITIONAL && prev_voiced != 0) {
+            let is i64 as delta = bits.silk_sym(r, data.SILK_TBL_PITCH_DELTA, 0,
+                                                t.SILK_PITCH_DELTA_N);
+            if (delta < 0) { return delta; }
+            if (delta != 0) {
+                primary = prev_lag + delta - 9;
+                absolute = 0;
+            }
+        }
+        if (absolute != 0) {
+            let is i64 as high = bits.silk_sym(r, data.SILK_TBL_PITCH_HIGH, 0,
+                                               t.SILK_PITCH_HIGH_N);
+            if (high < 0) { return high; }
+            let is *u8 as low_pdf with mut = data.SILK_TBL_PITCH_LOW_NB;
+            let is i64 as low_n with mut = 4;
+            if (wb == t.SILK_BW_MB) { low_pdf = data.SILK_TBL_PITCH_LOW_MB; low_n = 6; }
+            else if (wb == t.SILK_BW_WB) { low_pdf = data.SILK_TBL_PITCH_LOW_WB; low_n = 8; }
+            let is i64 as low = bits.silk_sym(r, low_pdf, 0, low_n);
+            if (low < 0) { return low; }
+            primary = high * _silk_lag_scale(wb) + low + _silk_lag_min(wb);
+        }
+        p.primary_lag = primary;
+
+        let is *u8 as cpdf with mut = data.SILK_TBL_CONTOUR_PDF_NB10;
+        let is *u8 as ccb with mut = data.SILK_TBL_CONTOUR_CB_NB10;
+        let is i64 as cn with mut = 3;
+        if (subframes == 2) {
+            if (wb != t.SILK_BW_NB) {
+                cpdf = data.SILK_TBL_CONTOUR_PDF_MBWB10;
+                ccb = data.SILK_TBL_CONTOUR_CB_MBWB10;
+                cn = 12;
+            }
+        } else {
+            if (wb == t.SILK_BW_NB) {
+                cpdf = data.SILK_TBL_CONTOUR_PDF_NB20;
+                ccb = data.SILK_TBL_CONTOUR_CB_NB20;
+                cn = 11;
+            } else {
+                cpdf = data.SILK_TBL_CONTOUR_PDF_MBWB20;
+                ccb = data.SILK_TBL_CONTOUR_CB_MBWB20;
+                cn = 34;
+            }
+        }
+        let is i64 as ci = bits.silk_sym(r, cpdf, 0, cn);
+        if (ci < 0) { return ci; }
+        if (ci >= cn) { return errno.I_CORRUPT; }
+        k = 0;
+        while (k < subframes) {
+            let is i64 as off = t.silk_tbl2(ccb, ci, k, subframes);
+            p.pitch[k] = _clampi(primary + off, _silk_lag_min(wb), _silk_lag_max(wb));
+            k = k + 1;
+        }
+
+        let is i64 as per = bits.silk_sym(r, data.SILK_TBL_LTP_PERIOD, 0,
+                                          t.SILK_LTP_PERIOD_N);
+        if (per < 0) { return per; }
+        if (per > 2) { return errno.I_CORRUPT; }
+        let is *u8 as lpdf with mut = data.SILK_TBL_LTP_PDF0;
+        let is *u8 as lcb with mut = data.SILK_TBL_LTP_CB0;
+        let is i64 as ln with mut = 8;
+        if (per == 1) { lpdf = data.SILK_TBL_LTP_PDF1; lcb = data.SILK_TBL_LTP_CB1; ln = 16; }
+        else if (per == 2) { lpdf = data.SILK_TBL_LTP_PDF2; lcb = data.SILK_TBL_LTP_CB2; ln = 32; }
+        k = 0;
+        while (k < subframes) {
+            let is i64 as ix = bits.silk_sym(r, lpdf, 0, ln);
+            if (ix < 0) { return ix; }
+            if (ix >= ln) { return errno.I_CORRUPT; }
+            let is i64 as j with mut = 0;
+            while (j < t.SILK_LTP_ORDER) {
+                p.ltp_taps[k][j] = t.silk_tbl_i(lcb, ix * t.SILK_LTP_ORDER + j);
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+
+        if (cond == t.SILK_COND_INDEPENDENT) {
+            let is i64 as si = bits.silk_sym(r, data.SILK_TBL_LTP_SCALE_PDF, 0,
+                                             t.SILK_LTP_SCALE_N);
+            if (si < 0) { return si; }
+            if (si >= t.SILK_LTP_SCALE_N) { return errno.I_CORRUPT; }
+            p.ltp_scale = t.silk_tbl_i(data.SILK_TBL_LTP_SCALE, si);
+        }
+    }
+
+    p.seed = bits.silk_uniform(r, 4);
+    if (p.seed < 0) { return p.seed; }
+
+    return core.silk_decode_pulses(r, p, frame_len);
+}
+
+// ── gain dequantization, NLSF interpolation and LPC conversion ─────
+fn _silk_prepare(ch as *defs.SilkChan, p as *defs.SilkParams,
+                 order as i64, subframes as i64, cond as i64) as i64 {
+    // Dequantize the subframe gains (section 4.2.7.4).
+    let is i64 as prev with mut = ch.log_gain;
+    let is i64 as k with mut = 0;
+    while (k < subframes) {
+        let is i64 as d = p.gain_idx[k];
+        if (d < 0) { return errno.I_CORRUPT; }
+        let is i64 as g with mut = 0;
+        if (k == 0 && cond != t.SILK_COND_CONDITIONAL) {
+            g = d;
+            if (prev >= 0 && g < prev - 16) { g = prev - 16; }
+        } else {
+            if (prev < 0) { return errno.I_CORRUPT; }
+            let is i64 as cand = prev + d - 4;
+            let is i64 as two = 2 * d - 16;
+            g = cand;
+            if (two > g) { g = two; }
+        }
+        g = _clampi(g, 0, 63);
+        let is i64 as lg = ((0x1D1C71 * g) >> 16) + 2090;
+        p.gain_q16[k] = _silk_log2lin(lg);
+        prev = g;
+        k = k + 1;
+    }
+    ch.log_gain = prev;
+
+    // Interpolation of section 4.2.7.5.5; a decoded factor is ignored
+    // after a reset or an uncoded side frame.
+    let is i64 as ip with mut = p.interp;
+    if (subframes != 4 || ch.first_reset != 0) { ip = 4; }
+    p.interp = ip;
+
+    let is i64 as st with mut = nlsf.silk_nlsf2a(&p.nlsf[0], order, &p.lpc_a[1][0]);
+    if (st < 0) { return st; }
+    if (ip < 4) {
+        let is [16]i64 as n1;
+        k = 0;
+        while (k < order) {
+            n1[k] = ch.nlsf[k] + ((ip * (p.nlsf[k] - ch.nlsf[k])) >> 2);
+            k = k + 1;
+        }
+        st = nlsf.silk_nlsf2a(&n1[0], order, &p.lpc_a[0][0]);
+        if (st < 0) { return st; }
+    } else {
+        k = 0;
+        while (k < order) {
+            p.lpc_a[0][k] = p.lpc_a[1][k];
+            k = k + 1;
+        }
+    }
+
+    k = 0;
+    while (k < order) {
+        ch.nlsf[k] = p.nlsf[k];
+        k = k + 1;
+    }
+    ch.first_reset = 0;
+    return errno.I_OK;
+}
+
+// ── stereo unmixing, one 10/20 ms SILK frame (section 4.2.8) ───────
+fn _silk_unmix(d as *SilkDecoder, p as *defs.SilkParams,
+               mid as *f64, side as *f64, l as *f64, r as *f64,
+               len as i64, wb as i64) as void {
+    let is i64 as n1 with mut = 64;
+    if (wb == t.SILK_BW_MB) { n1 = 96; }
+    else if (wb == t.SILK_BW_WB) { n1 = 128; }
+
+    let is f64 as prev0 = cast(f64, d.prev_w0) / 8192.0;
+    let is f64 as prev1 = cast(f64, d.prev_w1) / 8192.0;
+    let is f64 as cur0 = cast(f64, p.w0_Q13) / 8192.0;
+    let is f64 as cur1 = cast(f64, p.w1_Q13) / 8192.0;
+    let is f64 as den = cast(f64, n1);
+
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is f64 as m0 = mid[i];
+        let is f64 as m1 with mut = 0.0;
+        let is f64 as m2 with mut = 0.0;
+        let is f64 as s1 with mut = 0.0;
+        if (i == 0) {
+            m1 = d.st_mid1;
+            m2 = d.st_mid2;
+            s1 = d.st_side1;
+        } else {
+            m1 = mid[i - 1];
+            s1 = side[i - 1];
+            if (i == 1) { m2 = d.st_mid1; }
+            else        { m2 = mid[i - 2]; }
+        }
+
+        let is i64 as tpos with mut = i;
+        if (tpos > n1) { tpos = n1; }
+        let is f64 as w0 = prev0 + cast(f64, tpos) * (cur0 - prev0) / den;
+        let is f64 as w1 = prev1 + cast(f64, tpos) * (cur1 - prev1) / den;
+        let is f64 as p0 = (m2 + 2.0 * m1 + m0) / 4.0;
+
+        let is f64 as lv with mut = (1.0 + w1) * m1 + s1 + w0 * p0;
+        let is f64 as rv with mut = (1.0 - w1) * m1 - s1 - w0 * p0;
+        if (lv < 0.0 - 1.0) { lv = 0.0 - 1.0; }
+        if (lv > 1.0) { lv = 1.0; }
+        if (rv < 0.0 - 1.0) { rv = 0.0 - 1.0; }
+        if (rv > 1.0) { rv = 1.0; }
+        l[i] = lv;
+        r[i] = rv;
+        i = i + 1;
+    }
+
+    d.st_mid2 = mid[len - 2];
+    d.st_mid1 = mid[len - 1];
+    d.st_side1 = side[len - 1];
+    d.prev_w0 = p.w0_Q13;
+    d.prev_w1 = p.w1_Q13;
+}
+
+// Mono/stereo-compatible one-sample delay: out[i] = mid[i-1].
+fn _silk_delay_mid(d as *SilkDecoder, mid as *f64, out as *f64,
+                   len as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (i == 0) { out[0] = d.st_mid1; }
+        else { out[i] = mid[i - 1]; }
+        i = i + 1;
+    }
+    d.st_mid2 = mid[len - 2];
+    d.st_mid1 = mid[len - 1];
+}
+
+// ── public interface ───────────────────────────────────────────────
+
+fn _silk_clear_state(d as *SilkDecoder) as void {
+    defs.silk_chan_reset(&d.ch0);
+    defs.silk_chan_reset(&d.ch1);
+    d.prev_w0 = 0;
+    d.prev_w1 = 0;
+    d.st_mid1 = 0.0;
+    d.st_mid2 = 0.0;
+    d.st_side1 = 0.0;
+    d.prev_mid_only = 0;
+    d.prev_coded = 0;
+    rsm.silk_resampler_reset(&d.rs);
+    d.rs.ready = 0;
+    d.rs.in_rate = 0;
+    d.rs.out_rate = 0;
+}
+
+fn silk_decoder_init(d as *SilkDecoder, channels as i64, rate as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (channels != 1 && channels != 2) { return errno.I_BADPARAM; }
+    if (rate != 8000 && rate != 12000 && rate != 16000 &&
+        rate != 24000 && rate != 48000) {
+        return errno.I_UNSUPPORTED;
+    }
+
+    _silk_zero(cast(*u8, d), sizeof(SilkDecoder));
+    d.channels = channels;
+    d.rate = rate;
+    d.bandwidth = 0 - 1;
+    _silk_clear_state(d);
+    d.bandwidth = 0 - 1;
+    return errno.I_OK;
+}
+
+fn silk_decoder_reset(d as *SilkDecoder) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    _silk_clear_state(d);
+    d.bandwidth = 0 - 1;
+    return errno.I_OK;
+}
+
+// There is no packet-loss concealment or FEC path in this decoder. The
+// Opus layer calls this instead of guessing a frame; it always refuses.
+fn silk_decode_lost(d as *SilkDecoder) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    return errno.I_UNSUPPORTED;
+}
+
+fn silk_output_frames(d as *SilkDecoder, bandwidth as i64,
+                      duration_ms as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    let is i64 as in_rate = _silk_rate(bandwidth);
+    if (in_rate < 0) { return errno.I_BADPARAM; }
+    let is i64 as nframes with mut = 1;
+    if (duration_ms == 40) { nframes = 2; }
+    else if (duration_ms == 60) { nframes = 3; }
+    else if (duration_ms != 10 && duration_ms != 20) { return errno.I_BADPARAM; }
+
+    let is i64 as subframes with mut = 4;
+    if (duration_ms == 10) { subframes = 2; }
+    let is i64 as frame_len = 5 * (in_rate / 1000) * subframes;
+    let is i64 as num = frame_len * d.rate;
+    if (num % in_rate != 0) { return errno.I_DIMS; }
+    return nframes * (num / in_rate);
+}
+
+fn silk_decode(d as *SilkDecoder, r as *rc.OpusRange,
+               bandwidth as i64, duration_ms as i64, coded_channels as i64,
+               out_l as *f64, out_r as *f64, cap as i64,
+               frames_out as *i64) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, r) == 0 || cast(i64, frames_out) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (coded_channels != 1 && coded_channels != 2) { return errno.I_BADPARAM; }
+    let is i64 as in_rate = _silk_rate(bandwidth);
+    if (in_rate < 0) { return errno.I_BADPARAM; }
+
+    let is i64 as nframes with mut = 1;
+    if (duration_ms == 40) { nframes = 2; }
+    else if (duration_ms == 60) { nframes = 3; }
+    else if (duration_ms != 10 && duration_ms != 20) { return errno.I_BADPARAM; }
+    let is i64 as subframes with mut = 4;
+    if (duration_ms == 10) { subframes = 2; }
+
+    let is i64 as n = 5 * (in_rate / 1000);    // 5 ms subframe length
+    let is i64 as frame_len = n * subframes;
+    let is i64 as order with mut = 10;
+    if (bandwidth == t.SILK_BW_WB) { order = 16; }
+
+    // A bandwidth change resets SILK, as the state-reset rules require.
+    if (d.bandwidth != bandwidth) {
+        _silk_clear_state(d);
+        d.bandwidth = bandwidth;
+    }
+    if (d.rs.in_rate != in_rate || d.rs.out_rate != d.rate) {
+        let is i64 as st = rsm.silk_resampler_init(&d.rs, in_rate, d.rate);
+        if (st < 0) { return st; }
+    }
+
+    // Mono -> stereo: the side channel and the stereo predictor start
+    // fresh (sections 4.2.7.1 and 4.5.2), and the right output channel
+    // inherits the resampler's memory so both channels start aligned.
+    if (coded_channels == 2 && d.prev_coded == 1) {
+        defs.silk_chan_reset(&d.ch1);
+        d.prev_w0 = 0;
+        d.prev_w1 = 0;
+        d.st_side1 = 0.0;
+        let is i64 as hi with mut = 0;
+        while (hi < 20) {
+            d.rs.hist[1][hi] = d.rs.hist[0][hi];
+            hi = hi + 1;
+        }
+    }
+    d.prev_coded = coded_channels;
+
+    let is i64 as out_per_frame = rsm.silk_resampler_frames(&d.rs, frame_len);
+    if (out_per_frame < 0) { return out_per_frame; }
+    let is i64 as total = nframes * out_per_frame;
+    if (cap < total) { return errno.I_NOMEM; }
+    if (total > 0 && cast(i64, out_l) == 0) { return errno.I_BADPARAM; }
+    if (d.channels == 2 && total > 0 && cast(i64, out_r) == 0) {
+        return errno.I_BADPARAM;
+    }
+
+    // Header bits (section 4.2.3): per-channel VAD flags, then the LBRR
+    // flag, for the mid channel first.
+    let is [2][3]i64 as vad;
+    let is [2][3]i64 as lbrr;
+    let is [2]i64 as lbrr_flag;
+    let is i64 as ch with mut = 0;
+    while (ch < coded_channels) {
+        let is i64 as i with mut = 0;
+        while (i < nframes) {
+            let is i64 as b = bits.silk_bit(r);
+            if (b < 0) { return b; }
+            vad[ch][i] = b;
+            lbrr[ch][i] = 0;
+            i = i + 1;
+        }
+        let is i64 as b2 = bits.silk_bit(r);
+        if (b2 < 0) { return b2; }
+        lbrr_flag[ch] = b2;
+        ch = ch + 1;
+    }
+
+    // Per-frame LBRR flags (section 4.2.4).
+    ch = 0;
+    while (ch < coded_channels) {
+        if (lbrr_flag[ch] != 0) {
+            if (nframes == 1) {
+                lbrr[ch][0] = 1;
+            } else {
+                let is *u8 as pdf with mut = data.SILK_TBL_LBRR40;
+                let is i64 as pn with mut = 4;
+                if (nframes == 3) { pdf = data.SILK_TBL_LBRR60; pn = 8; }
+                let is i64 as sym = bits.silk_sym(r, pdf, 0, pn);
+                if (sym < 0) { return sym; }
+                if (sym <= 0 || sym >= (1 << nframes)) { return errno.I_CORRUPT; }
+                let is i64 as i with mut = 0;
+                while (i < nframes) {
+                    lbrr[ch][i] = (sym >> i) & 1;
+                    i = i + 1;
+                }
+            }
+        }
+        ch = ch + 1;
+    }
+
+    // LBRR frames are parsed, never synthesized. Their conditional coding
+    // history is separate from the regular frames' (section 4.2.7.4:
+    // "first SILK frame of its type").
+    let is [2]i64 as lbrr_lag;
+    let is [2]i64 as lbrr_voiced;
+    lbrr_lag[0] = 0;
+    lbrr_lag[1] = 0;
+    lbrr_voiced[0] = 0;
+    lbrr_voiced[1] = 0;
+
+    let is defs.SilkParams as lp;
+    let is i64 as i2 with mut = 0;
+    while (i2 < nframes) {
+        ch = 0;
+        while (ch < coded_channels) {
+            if (lbrr[ch][i2] != 0) {
+                lp.w0_Q13 = 0;
+                lp.w1_Q13 = 0;
+                if (coded_channels == 2 && ch == 0) {
+                    let is i64 as sw = _silk_stereo_weights(r, &lp);
+                    if (sw < 0) { return sw; }
+                    if (lbrr[1][i2] == 0) {
+                        let is i64 as mo = bits.silk_sym(r, data.SILK_TBL_MID_ONLY, 0,
+                                                         t.SILK_MID_ONLY_N);
+                        if (mo < 0) { return mo; }
+                        // The value only tells a PLC-capable decoder
+                        // whether to conceal a side channel; this one has
+                        // no PLC, so it is parsed and discarded.
+                    }
+                }
+                let is i64 as cond with mut = t.SILK_COND_CONDITIONAL;
+                if (i2 == 0 || lbrr[ch][i2 - 1] == 0) {
+                    cond = t.SILK_COND_INDEPENDENT;
+                }
+                let is i64 as st = _silk_parse_frame(r, &lp, bandwidth,
+                                                     subframes, frame_len, 1, cond,
+                                                     lbrr_lag[ch], lbrr_voiced[ch]);
+                if (st < 0) { return st; }
+                lbrr_voiced[ch] = lp.voiced;
+                if (lp.voiced != 0) { lbrr_lag[ch] = lp.primary_lag; }
+            }
+            ch = ch + 1;
+        }
+        i2 = i2 + 1;
+    }
+
+    // Regular SILK frames. Each 20 ms interval decodes mid then (unless
+    // mid-only) side, then produces output.
+    let is [320]f64 as mid;
+    let is [320]f64 as side;
+    let is [320]f64 as left;
+    let is [320]f64 as right;
+    let is [320]f64 as mono;
+    let is defs.SilkParams as pm;
+
+    let is i64 as fi with mut = 0;
+    while (fi < nframes) {
+        let is i64 as mid_only with mut = 0;
+
+        pm.w0_Q13 = d.prev_w0;
+        pm.w1_Q13 = d.prev_w1;
+        if (coded_channels == 2) {
+            let is i64 as sw = _silk_stereo_weights(r, &pm);
+            if (sw < 0) { return sw; }
+            if (vad[1][fi] == 0) {
+                let is i64 as mo = bits.silk_sym(r, data.SILK_TBL_MID_ONLY, 0,
+                                                 t.SILK_MID_ONLY_N);
+                if (mo < 0) { return mo; }
+                mid_only = mo;
+            }
+        }
+
+        let is i64 as cond_mid with mut = t.SILK_COND_INDEPENDENT;
+        if (fi != 0) { cond_mid = t.SILK_COND_CONDITIONAL; }
+        let is i64 as st with mut = _silk_parse_frame(r, &pm, bandwidth, subframes,
+                                                     frame_len, vad[0][fi], cond_mid,
+                                                     d.ch0.prev_lag, d.ch0.prev_voiced);
+        if (st < 0) { return st; }
+        st = _silk_prepare(&d.ch0, &pm, order, subframes, cond_mid);
+        if (st < 0) { return st; }
+        core.silk_build_excitation(&pm, frame_len);
+        core.silk_synthesize(&d.ch0, &pm, order, subframes, n, frame_len, &mid[0]);
+        d.ch0.prev_voiced = pm.voiced;
+        if (pm.voiced != 0) { d.ch0.prev_lag = pm.primary_lag; }
+
+        if (coded_channels == 2 && mid_only == 0) {
+            let is i64 as cond_side with mut = t.SILK_COND_CONDITIONAL;
+            if (fi == 0) { cond_side = t.SILK_COND_INDEPENDENT; }
+            else if (d.prev_mid_only != 0) { cond_side = t.SILK_COND_INDEP_NOLTP; }
+
+            let is defs.SilkParams as ps;
+            ps.w0_Q13 = 0;
+            ps.w1_Q13 = 0;
+            let is i64 as ss with mut = _silk_parse_frame(r, &ps, bandwidth, subframes,
+                                                 frame_len, vad[1][fi], cond_side,
+                                                 d.ch1.prev_lag, d.ch1.prev_voiced);
+            if (ss < 0) { return ss; }
+            ss = _silk_prepare(&d.ch1, &ps, order, subframes, cond_side);
+            if (ss < 0) { return ss; }
+            core.silk_build_excitation(&ps, frame_len);
+            core.silk_synthesize(&d.ch1, &ps, order, subframes, n, frame_len, &side[0]);
+            d.ch1.prev_voiced = ps.voiced;
+            if (ps.voiced != 0) { d.ch1.prev_lag = ps.primary_lag; }
+        } else if (coded_channels == 2) {
+            let is i64 as k with mut = 0;
+            while (k < frame_len) {
+                side[k] = 0.0;
+                k = k + 1;
+            }
+            defs.silk_chan_reset(&d.ch1);
+            // st_side1 is deliberately kept: 4.2.8 uses side[-1] at
+            // i = 0 for this interval, and only this interval's
+            // side[0..len) is zero. _silk_unmix stores side[len-1]
+            // (zero here) when it finishes.
+        }
+
+        // Output for this interval.
+        if (d.channels == 2 && coded_channels == 2) {
+            _silk_unmix(d, &pm, &mid[0], &side[0], &left[0], &right[0],
+                        frame_len, bandwidth);
+            let is i64 as off = fi * out_per_frame;
+            let is *f64 as ol = cast(*f64, cast(i64, out_l) + off * 8);
+            let is *f64 as orr = cast(*f64, cast(i64, out_r) + off * 8);
+            let is i64 as ro with mut = rsm.silk_resampler_run(&d.rs, 0, &left[0],
+                                                               frame_len, ol, out_per_frame);
+            if (ro < 0) { return ro; }
+            ro = rsm.silk_resampler_run(&d.rs, 1, &right[0], frame_len,
+                                        orr, out_per_frame);
+            if (ro < 0) { return ro; }
+        } else {
+            _silk_delay_mid(d, &mid[0], &mono[0], frame_len);
+            if (coded_channels == 2) {
+                d.st_side1 = side[frame_len - 1];
+            } else {
+                d.st_side1 = 0.0;
+            }
+            let is i64 as off = fi * out_per_frame;
+            let is *f64 as ol = cast(*f64, cast(i64, out_l) + off * 8);
+            let is i64 as ro with mut = rsm.silk_resampler_run(&d.rs, 0, &mono[0],
+                                                               frame_len, ol, out_per_frame);
+            if (ro < 0) { return ro; }
+            if (d.channels == 2) {
+                let is *f64 as orr = cast(*f64, cast(i64, out_r) + off * 8);
+                ro = rsm.silk_resampler_run(&d.rs, 1, &mono[0], frame_len,
+                                            orr, out_per_frame);
+                if (ro < 0) { return ro; }
+            }
+        }
+
+        if (coded_channels == 2) {
+            d.prev_w0 = pm.w0_Q13;
+            d.prev_w1 = pm.w1_Q13;
+            d.prev_mid_only = mid_only;
+        } else {
+            d.prev_mid_only = 0;
+        }
+        fi = fi + 1;
+    }
+
+    *frames_out = total;
+    return errno.I_OK;
+}

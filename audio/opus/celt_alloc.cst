@@ -1,0 +1,409 @@
+// =======================================================
+// caustic-av/audio/opus/celt_alloc.cst
+// Bit allocation for the CELT layer, RFC 6716 section 4.3.3.
+//
+// The allocation must be recovered bit-for-bit: it decides how many pulses
+// each band carries and therefore what the range decoder reads next. The
+// procedure here follows the RFC in the reference's order:
+//
+//   caps          per-band maximum from the cap table, converted to 1/8 bits
+//   boosts        dynalloc symbols (decoded by the caller)
+//   trim          one of 11 allocation curves, linearly interpolated
+//   skip          backwards from the last band, with one reserved bit
+//   intensity     one uniform symbol; dual-stereo one raw bit
+//   rebalance     leftover 1/8 bits spread over the coded bands
+//   fine split    per band, the fine-energy/PVQ split and two priorities
+//
+// Two integer divisions deserve a note: the reference divides by the band
+// edge difference in *2.5 ms bin units* (not multiplied by LM) when
+// redistributing leftovers, and its `<<LM>>2` on the static table is applied
+// before the trim offset. Both are reproduced here; using the frame-size bin
+// count instead would change every band's allocation.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "range.cst" as rc;
+use "celt_state.cst" as st;
+use "celt_tables.cst" as tbl;
+
+fn _alloc_min(a as i64, b as i64) as i64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn _alloc_max(a as i64, b as i64) as i64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+// Per-band caps in 1/8 bits, including the channel count (RFC 4.3.3,
+// init_caps). cap[] fits signed 16 bits but not 8.
+fn celt_alloc_caps(d as *st.CeltDec) as i64 {
+    let is i64 as c = d.stream_channels;
+    let is i64 as lm = d.lm;
+    let is i64 as i with mut = 0;
+    while (i < 21) {
+        let is i64 as n = tbl.celt_band_bins(&d.tab, i, lm);
+        let is i64 as v = d.tab.caps[21 * (2 * lm + c - 1) + i] + 64;
+        d.cap[i] = v * c * n / 4;
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// Number of bits the cache assigns to `q` pseudo-pulses in N dimensions,
+// i.e. log2_frac(V(N, get_pulses(q)), 3). q = 0 means no pulses.
+fn celt_pulses2bits(d as *st.CeltDec, n as i64, q as i64) as i64 {
+    if (q <= 0) { return 0; }
+    if (n < 0 || n > tbl.CELT_MAX_PVQ_N) { return 0; }
+    if (q > tbl.CELT_MAX_PSEUDO) { return 0; }
+    return cast(i64, d.tab.pvq_bits[n * 41 + q]);
+}
+
+// Largest q whose cost does not exceed `bits`, with the reference's tie
+// break: it compares the distance to the bit count on both sides and picks
+// the nearer, rounding down on an exact tie.
+fn celt_bits2pulses(d as *st.CeltDec, n as i64, bits as i64) as i64 {
+    if (n <= 0 || n > tbl.CELT_MAX_PVQ_N) { return 0; }
+    let is i64 as qmax = d.tab.pvq_qmax[n];
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = qmax;
+    let is i64 as target = bits - 1;
+    let is i64 as i with mut = 0;
+    while (i < 6) {
+        let is i64 as mid = (lo + hi + 1) >> 1;
+        if (celt_pulses2bits(d, n, mid) - 1 >= target) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+        i = i + 1;
+    }
+    let is i64 as blo with mut = 0 - 1;
+    if (lo != 0) { blo = celt_pulses2bits(d, n, lo) - 1; }
+    let is i64 as bhi = celt_pulses2bits(d, n, hi) - 1;
+    if (target - blo <= bhi - target) { return lo; }
+    return hi;
+}
+
+// LOG2_FRAC_TABLE lookup for a band count, 0..23: the table entry n is
+// log2_frac(n+1, 3), the 1/8-bit cost of the uniform intensity symbol over
+// n+1 values, so callers pass the count itself (RFC 4.3.3). The table lives
+// in the state because it is derived at init, not shipped.
+fn celt_log2frac_at(d as *st.CeltDec, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (n >= 24) { return d.tab.log2frac[23]; }
+    return d.tab.log2frac[n];
+}
+
+// interp_bits2pulses: bisect between the two neighbouring static curves,
+// then walk bands backwards deciding which ones to skip.
+fn _interp_bits2pulses(d as *st.CeltDec, r as *rc.OpusRange,
+                       bits1 as *i64, bits2 as *i64, thresh as *i64,
+                       start as i64, end as i64, skip_start as i64,
+                       total_in as i64, skip_rsv as i64,
+                       intensity_rsv_in as i64, dual_rsv_in as i64,
+                       C as i64, lm as i64) as i64 {
+    let is i64 as alloc_floor = C << 3;
+    let is i64 as stereo with mut = 0;
+    if (C > 1) { stereo = 1; }
+    let is i64 as total with mut = total_in;
+    let is i64 as intensity_rsv with mut = intensity_rsv_in;
+    let is i64 as dual_rsv with mut = dual_rsv_in;
+    let is i64 as lo with mut = 0;
+    let is i64 as hi with mut = 64;
+    let is i64 as step with mut = 0;
+    while (step < 6) {
+        let is i64 as mid = (lo + hi) >> 1;
+        let is i64 as psum with mut = 0;
+        let is i64 as done with mut = 0;
+        let is i64 as j with mut = end;
+        while (j > start) {
+            j = j - 1;
+            let is i64 as tmp = bits1[j] + (mid * bits2[j] >> 6);
+            if (tmp >= thresh[j] || done != 0) {
+                done = 1;
+                psum = psum + _alloc_min(tmp, d.cap[j]);
+            } else if (tmp >= alloc_floor) {
+                psum = psum + alloc_floor;
+            }
+        }
+        if (psum > total) { hi = mid; } else { lo = mid; }
+        step = step + 1;
+    }
+    let is i64 as psum with mut = 0;
+    let is i64 as done with mut = 0;
+    let is i64 as j with mut = end;
+    while (j > start) {
+        j = j - 1;
+        let is i64 as tmp with mut = bits1[j] + (lo * bits2[j] >> 6);
+        if (tmp < thresh[j] && done == 0) {
+            if (tmp >= alloc_floor) { tmp = alloc_floor; } else { tmp = 0; }
+        } else {
+            done = 1;
+        }
+        tmp = _alloc_min(tmp, d.cap[j]);
+        d.pulses[j] = tmp;
+        psum = psum + tmp;
+    }
+
+    // Skip decisions, last coded band first.
+    let is i64 as coded with mut = end;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as jj = coded - 1;
+        if (jj <= skip_start) {
+            total = total + skip_rsv;
+            go = 0;
+        } else {
+            let is i64 as span = d.tab.ebands[coded] - d.tab.ebands[start];
+            let is i64 as left = total - psum;
+            let is i64 as percoeff = left / span;
+            let is i64 as rem0 = left - span * percoeff;
+            let is i64 as rem with mut = rem0 - (d.tab.ebands[jj] - d.tab.ebands[start]);
+            if (rem < 0) { rem = 0; }
+            let is i64 as band_bits with mut = d.pulses[jj]
+                + percoeff * (d.tab.ebands[coded] - d.tab.ebands[jj]) + rem;
+            let is i64 as skip_thresh = _alloc_max(thresh[jj], alloc_floor + 8);
+            if (band_bits >= skip_thresh) {
+                if (rc.opus_range_bit_logp(r, 1) != 0) {
+                    go = 0;
+                } else {
+                    psum = psum + 8;
+                    band_bits = band_bits - 8;
+                }
+            }
+            if (go == 0) {
+                // The band is kept; leave its allocation alone.
+            } else {
+                psum = psum - d.pulses[jj] - intensity_rsv;
+                if (intensity_rsv > 0) {
+                    intensity_rsv = celt_log2frac_at(d, jj - start);
+                }
+                psum = psum + intensity_rsv;
+                if (band_bits >= alloc_floor) {
+                    psum = psum + alloc_floor;
+                    d.pulses[jj] = alloc_floor;
+                } else {
+                    d.pulses[jj] = 0;
+                }
+                coded = coded - 1;
+            }
+        }
+    }
+
+    // Intensity and dual-stereo parameters.
+    if (intensity_rsv > 0) {
+        d.intensity = start + rc.opus_range_uint(r, coded + 1 - start);
+    } else {
+        d.intensity = 0;
+    }
+    if (d.intensity <= start) {
+        total = total + dual_rsv;
+        dual_rsv = 0;
+    }
+    if (dual_rsv > 0) {
+        d.dual_stereo = rc.opus_range_bit_logp(r, 1);
+    } else {
+        d.dual_stereo = 0;
+    }
+
+    // Spread the leftover bits over the coded bands.
+    let is i64 as left = total - psum;
+    let is i64 as span = d.tab.ebands[coded] - d.tab.ebands[start];
+    let is i64 as percoeff = left / span;
+    let is i64 as rem with mut = left - span * percoeff;
+    let is i64 as j2 with mut = start;
+    while (j2 < coded) {
+        d.pulses[j2] = d.pulses[j2]
+            + percoeff * (d.tab.ebands[j2 + 1] - d.tab.ebands[j2]);
+        j2 = j2 + 1;
+    }
+    j2 = start;
+    while (j2 < coded) {
+        let is i64 as width = d.tab.ebands[j2 + 1] - d.tab.ebands[j2];
+        let is i64 as take = _alloc_min(rem, width);
+        d.pulses[j2] = d.pulses[j2] + take;
+        rem = rem - take;
+        j2 = j2 + 1;
+    }
+
+    // Fine-energy / PVQ split.
+    let is i64 as balance with mut = 0;
+    j2 = start;
+    while (j2 < coded) {
+        let is i64 as width = d.tab.ebands[j2 + 1] - d.tab.ebands[j2];
+        let is i64 as n = width << lm;
+        let is i64 as bit = d.pulses[j2] + balance;
+        let is i64 as excess with mut = 0;
+        let is i64 as ebits with mut = 0;
+        if (n > 1) {
+            excess = _alloc_max(bit - d.cap[j2], 0);
+            d.pulses[j2] = bit - excess;
+            let is i64 as den with mut = C * n;
+            if (C == 2 && n > 2 && d.dual_stereo == 0 && j2 < d.intensity) {
+                den = den + 1;
+            }
+            let is i64 as nclogn = den * (tbl.celt_logn(&d.tab, j2) + (lm << 3));
+            let is i64 as offset with mut = (nclogn >> 1) - den * tbl.CELT_FINE_OFFSET;
+            if (n == 2) { offset = offset + (den << 1); }
+            if (d.pulses[j2] + offset < den * 2 << 3) {
+                offset = offset + (nclogn >> 2);
+            } else if (d.pulses[j2] + offset < den * 3 << 3) {
+                offset = offset + (nclogn >> 3);
+            }
+            ebits = _alloc_max(0, d.pulses[j2] + offset + (den << 2));
+            ebits = (ebits / den) >> 3;
+            if (C * ebits > (d.pulses[j2] >> 3)) {
+                ebits = (d.pulses[j2] >> stereo) >> 3;
+            }
+            ebits = _alloc_min(ebits, 8);
+            if (ebits * (den << 3) >= d.pulses[j2] + offset) {
+                d.fine_priority[j2] = 1;
+            } else {
+                d.fine_priority[j2] = 0;
+            }
+            d.pulses[j2] = d.pulses[j2] - (C * ebits << 3);
+        } else {
+            excess = _alloc_max(0, bit - (C << 3));
+            d.pulses[j2] = bit - excess;
+            ebits = 0;
+            d.fine_priority[j2] = 1;
+        }
+        if (excess > 0) {
+            let is i64 as extra_fine = _alloc_min(excess >> (stereo + 3), 8 - ebits);
+            ebits = ebits + extra_fine;
+            let is i64 as extra_bits = extra_fine * C << 3;
+            if (extra_bits >= excess - balance) {
+                d.fine_priority[j2] = 1;
+            } else {
+                d.fine_priority[j2] = 0;
+            }
+            excess = excess - extra_bits;
+        }
+        balance = excess;
+        d.fine_quant[j2] = ebits;
+        j2 = j2 + 1;
+    }
+    d.balance = balance;
+
+    // Skipped bands spend everything on fine energy.
+    while (j2 < end) {
+        d.fine_quant[j2] = (d.pulses[j2] >> stereo) >> 3;
+        d.pulses[j2] = 0;
+        if (d.fine_quant[j2] < 1) {
+            d.fine_priority[j2] = 1;
+        } else {
+            d.fine_priority[j2] = 0;
+        }
+        j2 = j2 + 1;
+    }
+    return coded;
+}
+
+// clt_compute_allocation. Returns the number of coded bands, or a negative
+// error. Writes pulses, fine_quant, fine_priority, intensity, dual_stereo and
+// balance into the state.
+fn celt_compute_allocation(d as *st.CeltDec, r as *rc.OpusRange,
+                           start as i64, end as i64, total_in as i64,
+                           C as i64, lm as i64) as i64 {
+    let is i64 as total with mut = total_in;
+    if (total < 0) { total = 0; }
+    let is i64 as skip_start with mut = start;
+    let is i64 as skip_rsv with mut = 0;
+    if (total >= 8) { skip_rsv = 8; }
+    total = total - skip_rsv;
+
+    let is i64 as intensity_rsv with mut = 0;
+    let is i64 as dual_rsv with mut = 0;
+    if (C == 2) {
+        intensity_rsv = celt_log2frac_at(d, end - start);
+        if (intensity_rsv > total) {
+            intensity_rsv = 0;
+        } else {
+            total = total - intensity_rsv;
+            if (total >= 8) { dual_rsv = 8; }
+            total = total - dual_rsv;
+        }
+    }
+
+    let is [21]i64 as bits1;
+    let is [21]i64 as bits2;
+    let is [21]i64 as thresh;
+    let is [21]i64 as trim_offset;
+    let is *i64 as b1 = &bits1[0];
+    let is *i64 as b2 = &bits2[0];
+    let is *i64 as th = &thresh[0];
+    let is i64 as j with mut = start;
+    while (j < end) {
+        let is i64 as width = d.tab.ebands[j + 1] - d.tab.ebands[j];
+        let is i64 as t1 = (3 * (width << lm) << 3) >> 4;
+        thresh[j] = _alloc_max(C << 3, t1);
+        let is i64 as tilt = C * width * (d.alloc_trim - 5 - lm) * (end - j - 1);
+        trim_offset[j] = (tilt * (1 << (lm + 3))) >> 6;
+        if ((width << lm) == 1) {
+            trim_offset[j] = trim_offset[j] - (C << 3);
+        }
+        j = j + 1;
+    }
+
+    // Static curve bisection (RFC 4.3.3: interpolate q in 1/64 steps).
+    let is i64 as lo with mut = 1;
+    let is i64 as hi with mut = tbl.CELT_ALLOC_VEC - 1;
+    let is i64 as go with mut = 1;
+    while (go == 1) {
+        let is i64 as mid = (lo + hi) >> 1;
+        let is i64 as done with mut = 0;
+        let is i64 as psum with mut = 0;
+        let is i64 as jj with mut = end;
+        while (jj > start) {
+            jj = jj - 1;
+            let is i64 as width = d.tab.ebands[jj + 1] - d.tab.ebands[jj];
+            let is i64 as bitsj with mut = C * width * d.tab.alloc[mid * 21 + jj] << lm >> 2;
+            if (bitsj > 0) {
+                bitsj = _alloc_max(0, bitsj + trim_offset[jj]);
+            }
+            bitsj = bitsj + d.offsets[jj];
+            if (bitsj >= thresh[jj] || done != 0) {
+                done = 1;
+                psum = psum + _alloc_min(bitsj, d.cap[jj]);
+            } else if (bitsj >= (C << 3)) {
+                psum = psum + (C << 3);
+            }
+        }
+        if (psum > total) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+        if (lo > hi) { go = 0; }
+    }
+    hi = lo;
+    lo = lo - 1;
+
+    j = start;
+    while (j < end) {
+        let is i64 as width = d.tab.ebands[j + 1] - d.tab.ebands[j];
+        let is i64 as bits1j = C * width * d.tab.alloc[lo * 21 + j] << lm >> 2;
+        let is i64 as bits2j with mut = 0;
+        if (hi >= tbl.CELT_ALLOC_VEC) {
+            bits2j = d.cap[j];
+        } else {
+            bits2j = C * width * d.tab.alloc[hi * 21 + j] << lm >> 2;
+        }
+        let is i64 as x1 with mut = bits1j;
+        if (x1 > 0) { x1 = _alloc_max(0, x1 + trim_offset[j]); }
+        if (bits2j > 0) { bits2j = _alloc_max(0, bits2j + trim_offset[j]); }
+        if (lo > 0) { x1 = x1 + d.offsets[j]; }
+        bits2j = bits2j + d.offsets[j];
+        if (d.offsets[j] > 0) { skip_start = j; }
+        b1[j] = x1;
+        b2[j] = _alloc_max(0, bits2j - x1);
+        j = j + 1;
+    }
+
+    let is i64 as coded = _interp_bits2pulses(d, r, b1, b2, th, start, end,
+        skip_start, total, skip_rsv, intensity_rsv, dual_rsv, C, lm);
+    d.coded_bands = coded;
+    return coded;
+}

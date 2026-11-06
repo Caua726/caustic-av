@@ -1,0 +1,298 @@
+// =======================================================
+// caustic-av/audio/opus/silk_resample.cst
+// Conversion from the internal SILK rate (8, 12 or 16 kHz) to an output
+// rate the caller asks for (8, 12, 16, 24 or 48 kHz).
+//
+// RFC 6716 section 4.2.9 makes the resampler non-normative: a decoder may
+// use any method, as long as the delay stays within the allocation of
+// Table 54 (the CELT layer is delayed to match in Hybrid mode). This is a
+// polyphase windowed-sinc interpolator designed here, not taken from any
+// reference decoder:
+//
+//   - L/M is the reduced output/input ratio, so output sample m is
+//     evaluated at input time m*M/L. L is at most 6 for the supported
+//     rate pairs.
+//   - The kernel is h(u) = cutoff * sinc(cutoff*u) with
+//     sinc(x) = sin(pi*x)/(pi*x) and cutoff = min(1, out_rate/in_rate).
+//     With that sinc the passband edge lies at cutoff/2 cycles per input
+//     sample, so this puts it at 0.5*min(1, ratio) cycles per input
+//     sample: the Nyquist frequency of the lower of the two rates. A
+//     21-tap Kaiser window (beta 8) is evaluated at the same distance u
+//     from the fractional evaluation point, and each phase is normalised
+//     to unit DC gain. Coefficients are computed once at init.
+//   - A 21-tap kernel needs ten input samples of look-ahead, so the
+//     output is delayed by ten input samples: output m uses input samples
+//     i0-20 .. i0 with i0 = floor(m*M/L). That is 0.625 ms at 16 kHz,
+//     0.833 ms at 12 kHz and 1.25 ms at 8 kHz. The one-sample unmix delay
+//     adds another input sample. WB (the only bandwidth used by Hybrid
+//     frames) therefore stays inside Table 54's 0.706 ms allocation;
+//     SILK-only MB/NB are later than their allocations, which the
+//     specification permits because there is no CELT layer to align.
+//
+// No libm is used: sin is a Taylor series after range reduction, the
+// Kaiser window's I0 is its power series, and square root is Newton. All
+// of them run only during init.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "silk_tables.cst" as t;
+
+let is f64 as SILK_PI      with imut = 3.141592653589793;
+let is f64 as SILK_TWO_PI  with imut = 6.283185307179586;
+let is f64 as SILK_RS_BETA with imut = 8.0;
+
+struct SilkResampler {
+    ready    as i64;    // 0 when input rate == output rate
+    in_rate  as i64;
+    out_rate as i64;
+    L        as i64;    // output samples per L/M input samples
+    M        as i64;
+    taps     as i64;
+    coef     as [6][21]f64;
+    hist     as [2][20]f64;   // one history per output channel
+}
+
+fn _fabs(x as f64) as f64 {
+    if (x < 0.0) { return 0.0 - x; }
+    return x;
+}
+
+fn _fsqrt(x as f64) as f64 {
+    if (x <= 0.0) { return 0.0; }
+    let is f64 as g with mut = x;
+    let is i64 as i with mut = 0;
+    while (i < 40) {
+        g = 0.5 * (g + x / g);
+        i = i + 1;
+    }
+    return g;
+}
+
+// sin(x) by range reduction to [-pi, pi] and a Taylor series to x^17.
+fn _fsin(x as f64) as f64 {
+    let is f64 as q = x / SILK_TWO_PI;
+    let is i64 as qi = cast(i64, q);
+    let is f64 as r with mut = x - cast(f64, qi) * SILK_TWO_PI;
+    if (r > SILK_PI) { r = r - SILK_TWO_PI; }
+    if (r < 0.0 - SILK_PI) { r = r + SILK_TWO_PI; }
+
+    let is f64 as x2 = r * r;
+    let is f64 as term with mut = r;
+    let is f64 as sum with mut = r;
+    let is i64 as k with mut = 1;
+    while (k < 9) {
+        term = (0.0 - term) * x2 / cast(f64, (2 * k) * (2 * k + 1));
+        sum = sum + term;
+        k = k + 1;
+    }
+    return sum;
+}
+
+fn _fsinc(x as f64) as f64 {
+    if (_fabs(x) < 1.0e-12) { return 1.0; }
+    let is f64 as a = SILK_PI * x;
+    return _fsin(a) / a;
+}
+
+// Modified Bessel function I0, power series (x = 8 at most here).
+fn _fbessel_i0(x as f64) as f64 {
+    let is f64 as y = x * x / 4.0;
+    let is f64 as term with mut = 1.0;
+    let is f64 as sum with mut = 1.0;
+    let is i64 as k with mut = 1;
+    while (k < 30) {
+        term = term * y / cast(f64, k * k);
+        sum = sum + term;
+        k = k + 1;
+    }
+    return sum;
+}
+
+fn _gcd(a as i64, b as i64) as i64 {
+    let is i64 as x with mut = a;
+    let is i64 as y with mut = b;
+    while (y != 0) {
+        let is i64 as r = x % y;
+        x = y;
+        y = r;
+    }
+    return x;
+}
+
+fn silk_resampler_reset(rs as *SilkResampler) as void {
+    let is i64 as c with mut = 0;
+    while (c < 2) {
+        let is i64 as i with mut = 0;
+        while (i < 20) {
+            rs.hist[c][i] = 0.0;
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+}
+
+// Configure the resampler. Returns 0, I_BADPARAM for a rate outside the
+// supported set, or I_UNSUPPORTED when the reduced ratio needs more phases
+// than the coefficient array holds.
+fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as i64 {
+    rs.ready = 0;
+    rs.in_rate = 0;
+    rs.out_rate = 0;
+    rs.L = 1;
+    rs.M = 1;
+    rs.taps = 0;
+    silk_resampler_reset(rs);
+
+    if (in_rate != 8000 && in_rate != 12000 && in_rate != 16000) {
+        return errno.I_BADPARAM;
+    }
+    if (out_rate != 8000 && out_rate != 12000 && out_rate != 16000 &&
+        out_rate != 24000 && out_rate != 48000) {
+        return errno.I_BADPARAM;
+    }
+
+    rs.in_rate = in_rate;
+    rs.out_rate = out_rate;
+    if (in_rate == out_rate) { return errno.I_OK; }
+
+    let is i64 as g = _gcd(in_rate, out_rate);
+    let is i64 as L = out_rate / g;
+    let is i64 as M = in_rate / g;
+    if (L < 1 || L > t.SILK_RS_PHASES_MAX || M < 1) {
+        return errno.I_UNSUPPORTED;
+    }
+    rs.L = L;
+    rs.M = M;
+    rs.taps = t.SILK_RS_TAPS;
+
+    let is f64 as ratio = cast(f64, out_rate) / cast(f64, in_rate);
+    // cutoff = min(1, ratio). h(u) = cutoff*sinc(cutoff*u) has its
+    // passband edge at cutoff/2 cycles per input sample, i.e. at the
+    // Nyquist frequency of the lower of the two rates.
+    let is f64 as cutoff with mut = ratio;
+    if (cutoff > 1.0) { cutoff = 1.0; }
+    let is i64 as delay = rs.taps / 2;
+    let is f64 as den = cast(f64, delay);
+    let is f64 as i0beta = _fbessel_i0(SILK_RS_BETA);
+
+    let is i64 as p with mut = 0;
+    while (p < L) {
+        let is f64 as frac = cast(f64, p) / cast(f64, L);
+        let is f64 as sum with mut = 0.0;
+        let is i64 as j with mut = 0;
+        while (j < rs.taps) {
+            // Tap j reads input sample i0 - j; the delayed evaluation
+            // point is i0 + frac - delay, so its distance is
+            // frac - delay + j. Both the sinc and the Kaiser window use
+            // that distance, centring the kernel on the evaluation
+            // point rather than on the integer tap position.
+            let is f64 as u = frac + cast(f64, j - delay);
+            let is f64 as v = u / den;
+            let is f64 as w with mut = 1.0;
+            let is f64 as arg = 1.0 - v * v;
+            if (arg > 0.0) {
+                w = _fbessel_i0(SILK_RS_BETA * _fsqrt(arg)) / i0beta;
+            } else {
+                w = 0.0;
+            }
+            let is f64 as h = cutoff * _fsinc(cutoff * u) * w;
+            rs.coef[p][j] = h;
+            sum = sum + h;
+            j = j + 1;
+        }
+        if (_fabs(sum) < 1.0e-12) { return errno.I_CORRUPT; }
+        j = 0;
+        while (j < rs.taps) {
+            rs.coef[p][j] = rs.coef[p][j] / sum;
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+
+    rs.ready = 1;
+    return errno.I_OK;
+}
+
+// Number of output samples for in_len input samples at the configured
+// ratio. Returns a negative code when the ratio does not divide the frame
+// (it always does for the SILK frame sizes this decoder uses).
+fn silk_resampler_frames(rs as *SilkResampler, in_len as i64) as i64 {
+    if (in_len < 0) { return errno.I_BADPARAM; }
+    if (rs.ready == 0) { return in_len; }
+    let is i64 as num = in_len * rs.L;
+    if (num % rs.M != 0) { return errno.I_DIMS; }
+    return num / rs.M;
+}
+
+// Resample in[0..in_len) of output channel `ch` into out[0..out_len).
+// The caller checks out_len with silk_resampler_frames first.
+fn silk_resampler_run(rs as *SilkResampler, ch as i64,
+                      in as *f64, in_len as i64,
+                      out as *f64, out_len as i64) as i64 {
+    if (ch < 0 || ch > 1) { return errno.I_BADPARAM; }
+    if (in_len < 0 || out_len < 0) { return errno.I_BADPARAM; }
+    if (in_len > 0 && cast(i64, in) == 0) { return errno.I_BADPARAM; }
+    if (out_len > 0 && cast(i64, out) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as keep = rs.taps - 1;
+    if (rs.ready == 0) {
+        if (out_len != in_len) { return errno.I_CORRUPT; }
+        let is i64 as i with mut = 0;
+        while (i < in_len) {
+            out[i] = in[i];
+            i = i + 1;
+        }
+        return errno.I_OK;
+    }
+
+    let is i64 as expect = silk_resampler_frames(rs, in_len);
+    if (expect < 0) { return expect; }
+    if (expect != out_len) { return errno.I_DIMS; }
+
+    let is i64 as m with mut = 0;
+    while (m < out_len) {
+        let is i64 as num = m * rs.M;
+        let is i64 as i0 = num / rs.L;
+        let is i64 as fr = num % rs.L;
+        let is f64 as sum with mut = 0.0;
+        let is i64 as j with mut = 0;
+        while (j < rs.taps) {
+            let is i64 as n = i0 - j;
+            let is f64 as x with mut = 0.0;
+            if (n < 0) {
+                let is i64 as h = keep + n;
+                if (h < 0 || h >= keep) { return errno.I_CORRUPT; }
+                x = rs.hist[ch][h];
+            } else {
+                if (n >= in_len) { return errno.I_CORRUPT; }
+                x = in[n];
+            }
+            sum = sum + x * rs.coef[fr][j];
+            j = j + 1;
+        }
+        out[m] = sum;
+        m = m + 1;
+    }
+
+    // Keep the last `keep` input samples for the next frame.
+    if (in_len >= keep) {
+        let is i64 as i with mut = 0;
+        while (i < keep) {
+            rs.hist[ch][i] = in[in_len - keep + i];
+            i = i + 1;
+        }
+    } else {
+        let is i64 as shift = keep - in_len;
+        let is i64 as i with mut = 0;
+        while (i < shift) {
+            rs.hist[ch][i] = rs.hist[ch][i + in_len];
+            i = i + 1;
+        }
+        i = 0;
+        while (i < in_len) {
+            rs.hist[ch][shift + i] = in[i];
+            i = i + 1;
+        }
+    }
+    return errno.I_OK;
+}

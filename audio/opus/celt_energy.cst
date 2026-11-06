@@ -1,0 +1,242 @@
+// =======================================================
+// caustic-av/audio/opus/celt_energy.cst
+// Band energy decoding for the CELT layer, RFC 6716 section 4.3.2.
+//
+// Three passes:
+//   coarse  6 dB steps, predicted in time (previous frame, `old_e`) and in
+//           frequency (previous band), with a Laplace model per frame size;
+//           the prediction is disabled for intra frames.
+//   fine    B_i raw bits per band and channel, mapped to
+//           (f + 1/2)/2^B_i - 1/2.
+//   final   one extra bit per band and channel, in two priority passes, while
+//           the frame has bits left.
+//
+// The prediction updates follow RFC 4.3.2.1: q = decoded integer, the band
+// value becomes coef*max(-9, old) + prev + q and prev becomes
+// prev + q - beta*q. The reference's optional ±28 clamps are fixed-point
+// dynamic-range guards; the float path does not need them, and clamping here
+// would change valid-stream output, so the values are left unclamped.
+//
+// The Laplace decoder is the counterpart of the encoder described in the
+// RFC, with the PDF of the reference: probability fs0 of zero, a decaying
+// tail, and a floor of one unit of probability for the remaining values.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "range.cst" as rc;
+use "celt_state.cst" as st;
+use "celt_tables.cst" as tbl;
+
+let is i64 as CELT_LAPLACE_MINP with imut = 1;   // one unit out of 32768
+
+// Probability of the value 1 and beyond, given the zero probability and the
+// decay rate (Q15).
+fn _celt_laplace_freq1(fs0 as i64, decay as i64) as i64 {
+    let is i64 as ft = 32768 - 2 * 16 * CELT_LAPLACE_MINP - fs0;
+    return (ft * (16384 - decay)) >> 15;
+}
+
+// Decode one coarse-energy integer and advance the range decoder. Mirrors
+// the encoder's laplace distribution exactly: the symbol occupies
+// [fl, fl+fs) out of 32768. Returns the signed value.
+fn celt_laplace_decode(r as *rc.OpusRange, fs0 as i64, decay as i64) as i64 {
+    let is i64 as val with mut = 0;
+    let is i64 as fl with mut = 0;
+    let is i64 as fs with mut = fs0;
+    let is i64 as fm = rc.opus_range_decode_bin(r, 15);
+    if (fm >= fs) {
+        val = 1;
+        fl = fs;
+        fs = _celt_laplace_freq1(fs0, decay) + CELT_LAPLACE_MINP;
+        while (fs > CELT_LAPLACE_MINP && fm >= fl + 2 * fs) {
+            fs = fs * 2;
+            fl = fl + fs;
+            fs = ((fs - 2 * CELT_LAPLACE_MINP) * decay) >> 15;
+            fs = fs + CELT_LAPLACE_MINP;
+            val = val + 1;
+        }
+        if (fs <= CELT_LAPLACE_MINP) {
+            let is i64 as di = (fm - fl) >> 1;
+            val = val + di;
+            fl = fl + 2 * di * CELT_LAPLACE_MINP;
+        }
+        if (fm < fl + fs) {
+            val = -val;
+        } else {
+            fl = fl + fs;
+        }
+    }
+    let is i64 as fh = fl + fs;
+    let is i64 as hi with mut = fh;
+    if (hi > 32768) { hi = 32768; }
+    rc.opus_range_update(r, fl, hi, 32768);
+    return val;
+}
+
+// Inverse of the integer the encoder wrote for a small energy: Gray-style
+// sign folding, q -> (q>>1) ^ -(q&1).
+fn celt_unfold_small_energy(q as i64) as i64 {
+    if ((q & 1) != 0) { return -(q >> 1) - 1; }
+    return q >> 1;
+}
+
+// Prediction coefficients per frame size LM (RFC 4.3.2.1: 0.9, 0.8, 0.65,
+// 0.5) and the matching beta values.
+fn celt_energy_coef(lm as i64) as f64 {
+    if (lm == 0) { return 29440.0 / 32768.0; }
+    if (lm == 1) { return 26112.0 / 32768.0; }
+    if (lm == 2) { return 21248.0 / 32768.0; }
+    return 16384.0 / 32768.0;
+}
+
+fn celt_energy_beta(lm as i64) as f64 {
+    if (lm == 0) { return 30147.0 / 32768.0; }
+    if (lm == 1) { return 22282.0 / 32768.0; }
+    if (lm == 2) { return 12124.0 / 32768.0; }
+    return 6554.0 / 32768.0;
+}
+
+// Coarse pass. `budget` is the whole frame in bits; the per-symbol choice of
+// model degrades exactly as RFC 4.3.2.1 describes when the frame runs out.
+fn celt_coarse_energy(d as *st.CeltDec, r as *rc.OpusRange, budget as i64,
+                      start as i64, end as i64, C as i64, lm as i64,
+                      intra as i64) as i64 {
+    let is f64 as coef with mut = 0.0;
+    let is f64 as beta with mut = 4915.0 / 32768.0;
+    if (intra == 0) {
+        coef = celt_energy_coef(lm);
+        beta = celt_energy_beta(lm);
+    }
+    let is [2]f64 as prev;
+    prev[0] = 0.0;
+    prev[1] = 0.0;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        // The model saturates at band 20 (RFC 4.3.2.1, 21 bands).
+        let is i64 as pi2 with mut = 2 * i;
+        if (i >= 20) { pi2 = 40; }
+        let is i64 as c with mut = 0;
+        while (c < C) {
+            let is i64 as tell = rc.opus_range_tell(r);
+            let is i64 as avail = budget - tell;
+            let is i64 as qi with mut = 0;
+            if (avail >= 15) {
+                let is i64 as model = d.tab.e_prob[(lm * 2 + intra) * 42 + pi2];
+                let is i64 as decay = d.tab.e_prob[(lm * 2 + intra) * 42 + pi2 + 1];
+                qi = celt_laplace_decode(r, model << 7, decay << 6);
+            } else if (avail >= 2) {
+                let is i64 as q = rc.opus_range_icdf(r, tbl.CELT_ICDF_SMALL_ENERGY, 2);
+                qi = celt_unfold_small_energy(q);
+            } else if (avail >= 1) {
+                qi = 0 - rc.opus_range_bit_logp(r, 1);
+            } else {
+                qi = -1;
+            }
+            let is i64 as idx = c * 21 + i;
+            let is f64 as old = d.old_e[idx];
+            let is f64 as clamped with mut = old;
+            if (clamped < -9.0) { clamped = -9.0; }
+            let is f64 as qf = cast(f64, qi);
+            d.old_e[idx] = coef * clamped + prev[c] + qf;
+            prev[c] = prev[c] + qf - beta * qf;
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// Fine pass: B_i raw bits per band and channel. Bands with no bits left in
+// the frame are skipped rather than read past the end.
+fn celt_fine_energy(d as *st.CeltDec, r as *rc.OpusRange, budget as i64,
+                    start as i64, end as i64, C as i64) as i64 {
+    let is i64 as i with mut = start;
+    while (i < end) {
+        let is i64 as b = d.fine_quant[i];
+        if (b > 0) {
+            let is i64 as tell = rc.opus_range_tell(r);
+            if (tell + C * b <= budget) {
+                let is f64 as scale = cast(f64, 1 << (14 - b)) / 16384.0;
+                let is i64 as c with mut = 0;
+                while (c < C) {
+                    let is i64 as q2 = rc.opus_range_bits(r, b);
+                    let is f64 as off = (cast(f64, q2) + 0.5) * scale - 0.5;
+                    d.old_e[c * 21 + i] = d.old_e[c * 21 + i] + off;
+                    c = c + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// Final pass: one bit per band and channel in two priority classes. Returns
+// the number of bits still unused.
+fn celt_final_energy(d as *st.CeltDec, r as *rc.OpusRange, bits_left_in as i64,
+                     start as i64, end as i64, C as i64) as i64 {
+    let is i64 as bits_left with mut = bits_left_in;
+    let is i64 as prio with mut = 0;
+    while (prio < 2) {
+        let is i64 as i with mut = start;
+        while (i < end && bits_left >= C) {
+            if (d.fine_quant[i] >= 8 || d.fine_priority[i] != prio) {
+                i = i + 1;
+            } else {
+                let is f64 as scale = cast(f64, 1 << (14 - d.fine_quant[i] - 1)) / 16384.0;
+                let is i64 as c with mut = 0;
+                while (c < C) {
+                    let is i64 as q2 = rc.opus_range_bits(r, 1);
+                    let is f64 as off = (cast(f64, q2) - 0.5) * scale;
+                    d.old_e[c * 21 + i] = d.old_e[c * 21 + i] + off;
+                    bits_left = bits_left - 1;
+                    c = c + 1;
+                }
+                i = i + 1;
+            }
+        }
+        prio = prio + 1;
+    }
+    return bits_left;
+}
+
+// Roll the energy history. Long frames keep two previous values for the
+// anti-collapse minimum; transient frames only push the current value down.
+// Bands outside [start,end) are reset as RFC 4.3.2 requires for a mode or
+// bandwidth change.
+fn celt_energy_update(d as *st.CeltDec, start as i64, end as i64,
+                      transient as i64) as void {
+    let is i64 as i with mut = 0;
+    if (transient == 0) {
+        while (i < 42) {
+            d.old_log_e2[i] = d.old_log_e[i];
+            d.old_log_e[i] = d.old_e[i];
+            i = i + 1;
+        }
+    } else {
+        while (i < 42) {
+            if (d.old_e[i] < d.old_log_e[i]) {
+                d.old_log_e[i] = d.old_e[i];
+            }
+            i = i + 1;
+        }
+    }
+    let is i64 as c with mut = 0;
+    while (c < 2) {
+        i = 0;
+        while (i < start) {
+            d.old_e[c * 21 + i] = 0.0;
+            d.old_log_e[c * 21 + i] = -28.0;
+            d.old_log_e2[c * 21 + i] = -28.0;
+            i = i + 1;
+        }
+        i = end;
+        while (i < 21) {
+            d.old_e[c * 21 + i] = 0.0;
+            d.old_log_e[c * 21 + i] = -28.0;
+            d.old_log_e2[c * 21 + i] = -28.0;
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+}

@@ -1,0 +1,189 @@
+// =======================================================
+// caustic-av/audio/opus/opus_head.cst
+// The two mandatory Ogg Opus header packets of RFC 7845 Section 5:
+//
+//   OpusHead  the identification header (Section 5.1)
+//   OpusTags  the comment header (Section 5.2)
+//
+// Everything here is a borrowed view over the caller's packet bytes; nothing
+// is copied and nothing is allocated.
+//
+// OpusHead:
+//   magic "OpusHead", version, output channel count C, pre-skip (u16 LE),
+//   input sample rate (u32 LE), output gain (s16 LE, Q7.8 dB), channel
+//   mapping family. Family 0 carries no mapping table and maps a mono or
+//   stereo stream one-to-one, so only family 0 is accepted: families 1 and
+//   255 describe multichannel layouts that this stage does not implement and
+//   return I_UNSUPPORTED rather than a guessed channel order.
+//
+//   Version is accepted for 0..15. RFC 7845 Section 5.1 splits it into major
+//   (upper four bits) and minor (lower four) and says an implementation
+//   SHOULD accept 15 or less and treat 16 or more as incompatible; that is
+//   the rule applied here. The stored value is reported, so a caller can tell
+//   a minor revision from version 1.
+//
+//   C MUST NOT be zero (Section 5.1). A zero is I_CORRUPT. Family 0 defines
+//   only one and two channels (Section 5.1.1.1), so C > 2 is I_UNSUPPORTED:
+//   such a stream needs family 1 or 255, not a reinterpretation of family 0.
+//
+//   Pre-skip counts samples at 48 kHz that are decoded but discarded at the
+//   start of playback (Section 4.2). It is reported raw; this module does not
+//   subtract it from anything.
+//
+//   Input sample rate is metadata about the encoder's input, not a playback
+//   rate (Section 5.1); 0 means unspecified. It is reported as the unsigned
+//   32-bit value the header stores, with no clamping.
+//
+//   Output gain is 20*log10 of the playback scale in Q7.8 dB (Section 5.1),
+//   sign-extended to i64. Applying it is the player's job.
+//
+//   Bytes after the fixed fields are accepted and ignored: RFC 7845 says a
+//   compatible-version header with additional data MUST NOT be treated as
+//   invalid, and version 0..15 is exactly that compatible range. For a
+//   family 0 header the mapping table is required to be absent, so those
+//   bytes can only be future fields.
+//
+// OpusTags:
+//   magic "OpusTags", vendor string length (u32 LE), vendor string, then the
+//   user comment count (u32 LE). The vendor is returned as a borrowed slice.
+//   The individual comments are not walked: the count is the field the
+//   header stores, and walking it would turn an untrusted 32-bit count into a
+//   loop over attacker-chosen lengths. A caller that wants a comment reads
+//   the list itself with its own limits. Because of that, `comment_count` is
+//   reported even when the comment list is truncated; only the fixed prefix
+//   is validated. This is noted in opus.md.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+struct OpusHead {
+    version        as i64;  // 0..15
+    channels       as i64;  // 1 or 2
+    pre_skip       as i64;  // samples at 48 kHz, 0..65535
+    input_rate     as i64;  // Hz, 0 = unspecified, 0..2^32-1
+    output_gain    as i64;  // Q7.8 dB, -32768..32767
+    mapping_family as i64;  // always 0 here
+}
+
+struct OpusTags {
+    vendor        as *u8;   // borrowed UTF-8, not NUL-terminated
+    vendor_len    as i64;   // bytes
+    comment_count as i64;   // user comment list length field
+}
+
+fn _u16le(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off]) | (cast(i64, p[off + 1]) << 8);
+}
+
+fn _u32le(p as *u8, off as i64) as i64 {
+    return cast(i64, p[off])
+        | (cast(i64, p[off + 1]) << 8)
+        | (cast(i64, p[off + 2]) << 16)
+        | (cast(i64, p[off + 3]) << 24);
+}
+
+// 1 when p[0..8] is "OpusHead", 0 otherwise.
+fn _is_head_magic(p as *u8, len as i64) as i64 {
+    if (len < 8) { return 0; }
+    if (cast(i64, p[0]) != 79) { return 0; }   // 'O'
+    if (cast(i64, p[1]) != 112) { return 0; }  // 'p'
+    if (cast(i64, p[2]) != 117) { return 0; }  // 'u'
+    if (cast(i64, p[3]) != 115) { return 0; }  // 's'
+    if (cast(i64, p[4]) != 72) { return 0; }   // 'H'
+    if (cast(i64, p[5]) != 101) { return 0; }  // 'e'
+    if (cast(i64, p[6]) != 97) { return 0; }   // 'a'
+    if (cast(i64, p[7]) != 100) { return 0; }  // 'd'
+    return 1;
+}
+
+// 1 when p[0..8] is "OpusTags", 0 otherwise.
+fn _is_tags_magic(p as *u8, len as i64) as i64 {
+    if (len < 8) { return 0; }
+    if (cast(i64, p[0]) != 79) { return 0; }   // 'O'
+    if (cast(i64, p[1]) != 112) { return 0; }  // 'p'
+    if (cast(i64, p[2]) != 117) { return 0; }  // 'u'
+    if (cast(i64, p[3]) != 115) { return 0; }  // 's'
+    if (cast(i64, p[4]) != 84) { return 0; }   // 'T'
+    if (cast(i64, p[5]) != 97) { return 0; }   // 'a'
+    if (cast(i64, p[6]) != 103) { return 0; }  // 'g'
+    if (cast(i64, p[7]) != 115) { return 0; }  // 's'
+    return 1;
+}
+
+fn opus_head_is_magic(p as *u8, len as i64) as i64 {
+    return _is_head_magic(p, len);
+}
+
+fn opus_tags_is_magic(p as *u8, len as i64) as i64 {
+    return _is_tags_magic(p, len);
+}
+
+// Parse an identification header. The fixed part is 19 bytes (Section 5.1).
+// Returns 0 with *h filled, or a negative code:
+//   I_BADPARAM  null packet pointer or negative length
+//   I_EOF       fewer than 19 bytes
+//   I_BADMAGIC  not "OpusHead"
+//   I_CORRUPT   channel count zero
+//   I_UNSUPPORTED version > 15, channels > 2, or mapping family != 0
+// *h is written only on success.
+fn opus_head_parse(p as *u8, len as i64, h as *OpusHead) as i64 {
+    if (cast(i64, h) == 0) { return errno.I_BADPARAM; }
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, p) == 0) { return errno.I_BADPARAM; }
+    if (len >= 8 && _is_head_magic(p, len) == 0) { return errno.I_BADMAGIC; }
+    if (len < 19) { return errno.I_EOF; }
+
+    let is i64 as version = cast(i64, p[8]);
+    let is i64 as channels = cast(i64, p[9]);
+    let is i64 as pre_skip = _u16le(p, 10);
+    let is i64 as rate = _u32le(p, 12);
+    let is i64 as gain with mut = _u16le(p, 16);
+    let is i64 as family = cast(i64, p[18]);
+
+    if (version > 15) { return errno.I_UNSUPPORTED; }
+    if (channels == 0) { return errno.I_CORRUPT; }
+    if (channels > 2) { return errno.I_UNSUPPORTED; }
+    if (family != 0) { return errno.I_UNSUPPORTED; }
+
+    // Output gain is a signed 16-bit two's complement Q7.8 value.
+    if ((gain & 32768) != 0) { gain = gain - 65536; }
+
+    h.version = version;
+    h.channels = channels;
+    h.pre_skip = pre_skip;
+    h.input_rate = rate;
+    h.output_gain = gain;
+    h.mapping_family = family;
+    return errno.I_OK;
+}
+
+// Parse a comment header far enough to report its vendor and comment count.
+// The fixed part is the 8-byte magic plus an 8-byte prefix of length and
+// count (Section 5.2). Returns 0 with *t filled, or a negative code:
+//   I_BADPARAM  null packet pointer or negative length
+//   I_EOF       fewer bytes than the fields being read
+//   I_BADMAGIC  not "OpusTags"
+//   I_CORRUPT   vendor length past the end of the packet
+// Only the vendor slice is clamped to the packet; the comment list is not
+// walked, so a truncated list is not detected here.
+fn opus_tags_parse(p as *u8, len as i64, t as *OpusTags) as i64 {
+    if (cast(i64, t) == 0) { return errno.I_BADPARAM; }
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, p) == 0) { return errno.I_BADPARAM; }
+    if (len >= 8 && _is_tags_magic(p, len) == 0) { return errno.I_BADMAGIC; }
+    if (len < 16) { return errno.I_EOF; }
+
+    let is i64 as vendor_len = _u32le(p, 8);
+    // The vendor string must fit between the length field and the comment
+    // count field (RFC 7845 Section 5.2: it MUST NOT be longer than the rest
+    // of the packet).
+    if (vendor_len > len - 16) { return errno.I_CORRUPT; }
+
+    let is i64 as count_off = 12 + vendor_len;
+    if (count_off + 4 > len) { return errno.I_CORRUPT; }
+
+    t.vendor = cast(*u8, cast(i64, p) + 12);
+    t.vendor_len = vendor_len;
+    t.comment_count = _u32le(p, count_off);
+    return errno.I_OK;
+}

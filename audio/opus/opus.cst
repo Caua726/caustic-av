@@ -1,0 +1,649 @@
+// =======================================================
+// caustic-av/audio/opus/opus.cst
+// The Opus decoder's public state and entry point. It joins the three layers
+// that already exist: the packet framing of RFC 6716 Section 3
+// (opus_packet.cst), the SILK decoder of Section 4.2 (silk.cst) and the CELT
+// decoder of Section 4.3 (celt.cst).
+//
+// One call decodes one Opus packet. Every frame in the packet is decoded in
+// order, each with its own range decoder; a hybrid frame is the exception in
+// that SILK and CELT share one range decoder over the same frame slice, as
+// Section 4 defines. Output is interleaved signed 16-bit PCM at 48 kHz.
+//
+// Mode selection comes from the TOC configuration (Section 3.1, Table 2):
+//
+//   config 0..11    SILK-only, NB/MB/WB, 10/20/40/60 ms
+//   config 12..15   Hybrid, SWB/FB, 10/20 ms (SILK is always WB, 16 kHz)
+//   config 16..31   CELT-only, NB/WB/SWB/FB, 2.5/5/10/20 ms
+//
+// SILK runs internally at 8, 12 or 16 kHz and silk.cst resamples it to the
+// decoder rate (fixed at 48 kHz here). CELT synthesises at 48 kHz directly.
+// In a hybrid frame CELT codes only bands 17..end (the range above 8 kHz);
+// its output is added sample for sample to SILK's, which carries the low
+// band. Both layers already produce the decoder's output channel count, so
+// the sum needs no upmix: a mono frame in a stereo decoder is duplicated by
+// each layer, and a stereo frame in a mono decoder is the mid channel.
+//
+// State lifetime: OpusDecoder owns SILK and CELT state by value, so no
+// allocator is involved. opus_decoder_init parses OpusHead and initialises
+// both layers; opus_decoder_reset clears the predictive state for a new
+// logical stream without reparsing the header. Configuration switching
+// follows RFC 6716 Section 4.5.2: SILK is reset when a SILK or Hybrid frame
+// follows a CELT-only frame, and CELT is reset on every mode change whose
+// new mode is Hybrid or CELT-only. The redundancy header of Section 4.5.1
+// is parsed and the range slice is shrunk past the redundant CELT frame so
+// the main frame stays aligned, but that redundant frame is not
+// synthesised. Packet-loss concealment and FEC are not implemented.
+//
+// Pre-skip and end trimming are hooks for the caller (RFC 7845 Sections
+// 4.2 and 4.4). Decoding is never skipped: the first pre_skip samples are
+// produced and then dropped, because the decoder is predictive. The hooks
+// are stateful, so a caller can decode a whole page and let the decoder drop
+// the leading samples and the final EOS granule overrun.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/math.cst" as fm;
+use "celt.cst" as celt;
+use "celt_state.cst" as cs;
+use "opus_head.cst" as opus_head;
+use "opus_packet.cst" as opus_packet;
+use "range.cst" as rc;
+use "silk.cst" as silk;
+use "silk_tables.cst" as silk_tables;
+
+// The only output rate this stage defines. Opus codes at 48 kHz with lower
+// rates formed by decimation, and RFC 7845 Section 4 counts granules at
+// 48 kHz, so an internal fixed rate keeps pre-skip and packet durations
+// exact.
+let is i64 as OPUS_OUTPUT_RATE with imut = 48000;
+// Output gain is Q7.8 dB; 20*256 = 5120 in the 10^(g/5120) scale.
+let is f64 as OPUS_GAIN_DIVISOR with imut = 5120.0;
+
+struct OpusDecoder {
+    head           as opus_head.OpusHead; // parsed OpusHead; its pre_skip is the packet value
+    channels       as i64;                // 1 or 2
+    sample_rate    as i64;                // 48000
+    pre_skip       as i64;                // effective samples at 48 kHz to discard at the start
+    skip_remaining as i64;                // pre-skip not yet dropped
+    end_trim       as i64;                // samples to drop from the end of the next output
+    apply_gain     as i64;                // 1 when output_gain is applied
+    gain           as f64;                // linear 10^(output_gain/5120)
+    packets        as i64;                // packets decoded successfully
+    prev_mode      as i64;                // OPUS_MODE_* of the previous frame, -1 before the first
+
+    silk           as silk.SilkDecoder;   // SILK state and resampler
+    celt           as cs.CeltDec;         // CELT state and tables
+
+    // Frame scratch. SILK writes planar f64 at 48 kHz; CELT and the hybrid
+    // sum write interleaved f64 at 48 kHz. Fixed sizes keep the decoder
+    // allocation-free: 60 ms is the longest SILK frame and 20 ms stereo the
+    // longest CELT frame.
+    silk_l         as [2880]f64;
+    silk_r         as [2880]f64;
+    mix            as [1920]f64;
+}
+
+fn _opus_zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = 0;
+        i = i + 1;
+    }
+}
+
+// Clear every field, including the embedded codec state. A decoder that has
+// been cleared is unusable until opus_decoder_init succeeds; prev_mode is
+// left at -1 so the first frame never triggers a configuration reset.
+fn opus_decoder_clear(d as *OpusDecoder) as void {
+    if (cast(i64, d) == 0) { return; }
+    _opus_zero(cast(*u8, d), sizeof(OpusDecoder));
+    d.prev_mode = 0 - 1;
+    d.gain = 1.0;
+}
+
+// Initialise a decoder from an OpusHead packet, as Ogg carries it on the BOS
+// page (RFC 7845 Section 5.1). Returns 0, or the parse error:
+// I_BADMAGIC, I_EOF, I_CORRUPT and I_UNSUPPORTED as opus_head_parse reports
+// them. On failure the decoder is left cleared, with no channels and no rate.
+//
+// The output rate is always 48 kHz. Pre-skip is armed immediately, so the
+// first opus_decode calls drop exactly OpusHead.pre_skip output samples.
+// Output gain is stored but not applied unless the caller enables it.
+fn opus_decoder_init(d as *OpusDecoder, pkt as *u8, len as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    opus_decoder_clear(d);
+
+    let is opus_head.OpusHead as h;
+    let is i64 as r = opus_head.opus_head_parse(pkt, len, &h);
+    if (r < 0) { return r; }
+
+    d.head.version = h.version;
+    d.head.channels = h.channels;
+    d.head.pre_skip = h.pre_skip;
+    d.head.input_rate = h.input_rate;
+    d.head.output_gain = h.output_gain;
+    d.head.mapping_family = h.mapping_family;
+    d.channels = h.channels;
+    d.sample_rate = OPUS_OUTPUT_RATE;
+    d.pre_skip = h.pre_skip;
+    d.skip_remaining = h.pre_skip;
+    d.gain = fm.pow(10.0, cast(f64, h.output_gain) / OPUS_GAIN_DIVISOR);
+
+    let is i64 as sr = silk.silk_decoder_init(&d.silk, h.channels,
+                                              OPUS_OUTPUT_RATE);
+    if (sr < 0) {
+        opus_decoder_clear(d);
+        return sr;
+    }
+    let is i64 as cr = celt.celt_init(&d.celt, h.channels, h.channels);
+    if (cr < 0) {
+        opus_decoder_clear(d);
+        return cr;
+    }
+    return errno.I_OK;
+}
+
+// Clear predictive state for a new logical stream that reuses the same
+// header: both codecs, the mode history, the pre-skip and the end trim.
+// Returns 0 or a negative code from the codec resets.
+fn opus_decoder_reset(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    let is i64 as sr = silk.silk_decoder_reset(&d.silk);
+    if (sr < 0) { return sr; }
+    let is i64 as cr = celt.celt_reset(&d.celt);
+    if (cr < 0) { return cr; }
+    d.prev_mode = 0 - 1;
+    d.skip_remaining = d.pre_skip;
+    d.end_trim = 0;
+    d.packets = 0;
+    return errno.I_OK;
+}
+
+fn opus_decoder_channels(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.channels;
+}
+
+fn opus_decoder_rate(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.sample_rate;
+}
+
+// Samples at 48 kHz that the first decoded output must drop.
+fn opus_decoder_pre_skip(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.pre_skip;
+}
+
+// Pre-skip still to be dropped. Zero once the decoder has passed the start.
+fn opus_decoder_skip_remaining(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.skip_remaining;
+}
+
+// Packets decoded successfully since init or reset. A packet that returned
+// a negative code is not counted.
+fn opus_decoder_packets(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.packets;
+}
+
+// Replace the effective pre-skip and re-arm it. It is a stream-start
+// control: set it before the first packet (or when cropping a stream).
+// Calling it after decoding has started begins a new skip at the current
+// output position. head.pre_skip keeps the value parsed from the packet;
+// pre_skip and skip_remaining are the effective controls.
+fn opus_decoder_set_pre_skip(d as *OpusDecoder, samples as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (samples < 0) { return errno.I_BADPARAM; }
+    d.pre_skip = samples;
+    d.skip_remaining = samples;
+    return errno.I_OK;
+}
+
+// Raw OpusHead output gain, Q7.8 dB. Applying it is optional.
+fn opus_decoder_output_gain(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.head.output_gain;
+}
+
+// Enable or disable the linear output-gain factor derived from OpusHead.
+// Off by default: RFC 7845 Section 5.1 leaves the decision to the player.
+fn opus_decoder_set_apply_gain(d as *OpusDecoder, on as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (on != 0) { d.apply_gain = 1; } else { d.apply_gain = 0; }
+    return errno.I_OK;
+}
+
+fn opus_decoder_apply_gain(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.apply_gain;
+}
+
+// Samples to drop from the end of the next decoded output. The caller
+// sets this from the EOS granule (RFC 7845 Section 4.4) just before the
+// final packet. A count larger than that packet can emit continues into the
+// following packet, so a trim that spans a packet boundary also works.
+fn opus_decoder_set_end_trim(d as *OpusDecoder, samples as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (samples < 0) { return errno.I_BADPARAM; }
+    d.end_trim = samples;
+    return errno.I_OK;
+}
+
+fn opus_decoder_end_trim(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.end_trim;
+}
+
+// log2 of a CELT frame size in units of 2.5 ms (120 samples at 48 kHz).
+fn _opus_lm(samples as i64) as i64 {
+    if (samples == 120) { return 0; }
+    if (samples == 240) { return 1; }
+    if (samples == 480) { return 2; }
+    if (samples == 960) { return 3; }
+    return 0 - 1;
+}
+
+// Opus frame duration in milliseconds for the SILK layer: 10, 20, 40 or 60.
+fn _opus_duration_ms(samples as i64) as i64 {
+    return samples / 48;
+}
+
+// First uncoded CELT band for an audio bandwidth (Section 4.3, Table 55).
+// NB stops at band 13, so the last coded band is band 12 and the coded
+// range ends at 4.0 kHz; MB and WB at 17 (8 kHz), SWB at 19 (12 kHz) and
+// FB at 21 (20 kHz). The value is the first *uncoded* band.
+fn _opus_celt_end(bandwidth as i64) as i64 {
+    if (bandwidth == opus_packet.OPUS_BANDWIDTH_NARROWBAND) { return 13; }
+    if (bandwidth == opus_packet.OPUS_BANDWIDTH_MEDIUMBAND) { return 17; }
+    if (bandwidth == opus_packet.OPUS_BANDWIDTH_WIDEBAND) { return 17; }
+    if (bandwidth == opus_packet.OPUS_BANDWIDTH_SUPERWIDEBAND) { return 19; }
+    return 21;
+}
+
+// f64 to signed 16-bit with rounding to nearest and saturation, the same
+// convention as the reference float-to-int16 conversion: scale by 32768,
+// then clamp to [-32768, 32767].
+fn _opus_i16(x as f64) as i64 {
+    let is f64 as v with mut = x * 32768.0;
+    // A corrupt frame can leave a NaN in the spectral pipeline. Turning it
+    // into silence is better than an undefined float-to-integer cast.
+    let is i64 as bits = *cast(*i64, &v);
+    if (((bits >> 52) & 2047) == 2047 && (bits & 4503599627370495) != 0) {
+        return 0;
+    }
+    if (v > 32767.0) { v = 32767.0; }
+    if (v < -32768.0) { v = -32768.0; }
+    return cast(i64, fm.round(v));
+}
+
+// RFC 6716 Section 4.5.1: after the SILK part of a SILK-only or Hybrid
+// frame, the range stream may carry a redundant CELT frame for a mode
+// transition. Its presence is signalled by the bit budget; Hybrid also
+// reads one flag. This decoder does not synthesise the redundant frame, but
+// it must consume the header and shrink the range slice so the main CELT
+// part reads its raw bits from the end of the main frame, not from the
+// redundancy tail. The reference does exactly the same before decoding the
+// main CELT frame.
+//
+// Returns 0 on success. A negative result is a range-decoder failure.
+fn _opus_skip_redundancy(r as *rc.OpusRange, mode as i64) as i64 {
+    let is i64 as len = r.len;
+    let is i64 as tell = rc.opus_range_tell(r);
+    if (tell < 0) { return tell; }
+    let is i64 as need with mut = 17;
+    if (mode == opus_packet.OPUS_MODE_HYBRID) { need = 37; }
+    if (tell + need > len * 8) { return errno.I_OK; }
+
+    let is i64 as red with mut = 1;
+    if (mode == opus_packet.OPUS_MODE_HYBRID) {
+        red = rc.opus_range_bit_logp(r, 12);
+        if (red < 0) { return red; }
+    }
+    if (red == 0) { return errno.I_OK; }
+
+    let is i64 as celt_to_silk = rc.opus_range_bit_logp(r, 1);
+    if (celt_to_silk < 0) { return celt_to_silk; }
+
+    let is i64 as bytes with mut = 0;
+    if (mode == opus_packet.OPUS_MODE_HYBRID) {
+        let is i64 as u = rc.opus_range_uint(r, 256);
+        if (u < 0) { return u; }
+        bytes = u + 2;
+    } else {
+        let is i64 as t2 = rc.opus_range_tell(r);
+        if (t2 < 0) { return t2; }
+        bytes = len - ((t2 + 7) >> 3);
+    }
+    if (bytes < 0) { return errno.I_CORRUPT; }
+
+    // The reference disables a redundancy whose size does not leave the
+    // main frame at least as long as the bits already consumed. That is
+    // equivalent to redundancy_bytes > (8*len - tell) >> 3, the whole bytes
+    // remaining after the size symbol. Such a packet is malformed; reject
+    // it rather than decode a desynchronised main frame.
+    let is i64 as main = len - bytes;
+    if (main < 0) { return errno.I_CORRUPT; }
+    let is i64 as now = rc.opus_range_tell(r);
+    if (now < 0) { return now; }
+    if (main * 8 < now) { return errno.I_CORRUPT; }
+
+    // Shrinking len redirects both cursors: the forward zero-fill boundary
+    // and the raw-bit reader at ptr[len - end_offs]. That is valid only if
+    // no raw bit has been read yet. SILK uses none, and uint(256) stays on
+    // the range-coded path, so this holds; a future change that reads raw
+    // bits before this point must reset end_offs and nend_bits as well.
+    if (r.end_offs != 0 || r.nend_bits != 0) { return errno.I_CORRUPT; }
+
+    r.len = main;
+    return errno.I_OK;
+}
+
+// RFC 6716 Section 4.5.2 and Figure 18: switching from Hybrid to SILK adds
+// the final CELT overlap buffer to the first 2.5 ms of the SILK-only
+// packet. Decoding a 2.5 ms silence frame with CELT flushes that tail
+// without adding any new high-band audio. The CELT state is deliberately
+// not reset before this, and the caller has already decoded the SILK part
+// of the frame. This runs for every SILK bandwidth: WB is the normative
+// direct-mixing case, while NB/MB also reset SILK through the bandwidth
+// change and still receive the CELT overlap.
+fn _opus_hybrid_to_silk(d as *OpusDecoder, end as i64,
+                        stream_channels as i64) as i64 {
+    let is i64 as fr = celt.celt_set_frame(&d.celt, 0, end, 0,
+                                           stream_channels);
+    if (fr < 0) { return fr; }
+    let is [2]u8 as sil;
+    sil[0] = 255;
+    sil[1] = 255;
+    let is i64 as got = celt.celt_decode(&d.celt, &sil[0], 2, &d.mix[0],
+                                         120 * d.channels);
+    if (got < 0) { return got; }
+    if (got != 120) { return errno.I_CORRUPT; }
+
+    let is i64 as j with mut = 0;
+    while (j < 120) {
+        d.silk_l[j] = d.silk_l[j] + d.mix[j * d.channels];
+        if (d.channels == 2) {
+            d.silk_r[j] = d.silk_r[j] + d.mix[j * 2 + 1];
+        }
+        j = j + 1;
+    }
+    return errno.I_OK;
+}
+
+// Decode one Opus packet into interleaved i16 samples at 48 kHz.
+//
+// `cap` counts i16 scalar values the caller made available; frames per
+// channel times channels is what the call needs. On success the return value
+// and `*got` are the number of frames per channel written to `out` after
+// pre-skip and end trimming; this is 0 while pre-skip still covers the whole
+// packet.
+//
+// All structural validation (framing, mode parameters, zero-length frames
+// and the output capacity) happens before the first frame is decoded, so
+// those failures write nothing and leave the codec state untouched. A range
+// decode failure after that point returns the negative code, leaves `*got`
+// untouched and may have written part of the packet to `out`; the caller
+// must discard that output and reset or re-init the decoder.
+//
+// The whole packet is validated before the first frame is decoded, so a
+// malformed frame or a zero-length (DTX / lost) frame does not advance the
+// predictive state. A zero-length frame is refused with I_UNSUPPORTED
+// because this decoder has no PLC; it never fills the gap with fabricated
+// samples.
+//
+// `out` may be NULL only when the call would emit no samples, which happens
+// while pre-skip is being consumed.
+fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
+               cap as i64, got as *i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, got) == 0) { return errno.I_BADPARAM; }
+    if (d.channels < 1 || d.channels > 2) { return errno.I_BADPARAM; }
+    if (cap < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
+
+    let is opus_packet.OpusPacket as p;
+    let is i64 as pr = opus_packet.opus_packet_parse(pkt, len, &p);
+    if (pr < 0) { return pr; }
+
+    // Validate the mode-specific parameters once for the whole packet.
+    if (p.mode == opus_packet.OPUS_MODE_SILK) {
+        if (p.bandwidth > opus_packet.OPUS_BANDWIDTH_WIDEBAND) {
+            return errno.I_CORRUPT;
+        }
+        let is i64 as dur = p.frame_duration;
+        if (dur != 480 && dur != 960 && dur != 1920 && dur != 2880) {
+            return errno.I_CORRUPT;
+        }
+    } else {
+        if (_opus_lm(p.frame_duration) < 0) { return errno.I_CORRUPT; }
+        if (p.mode == opus_packet.OPUS_MODE_HYBRID) {
+            if (p.bandwidth != opus_packet.OPUS_BANDWIDTH_SUPERWIDEBAND &&
+                p.bandwidth != opus_packet.OPUS_BANDWIDTH_FULLBAND) {
+                return errno.I_CORRUPT;
+            }
+        }
+    }
+
+    // A zero-length frame means DTX or a lost frame (Section 3.2.1). This
+    // decoder has no concealment, so refuse the whole packet before any
+    // frame advances the codec state. A standalone CELT frame with one byte
+    // is the same PLC case in celt_decode (it rejects len <= 1), so it is
+    // refused here too instead of failing after earlier frames advanced.
+    let is i64 as i with mut = 0;
+    while (i < p.frame_count) {
+        if (p.frames[i].len < 1) { return errno.I_UNSUPPORTED; }
+        if (p.mode == opus_packet.OPUS_MODE_CELT && p.frames[i].len < 2) {
+            return errno.I_UNSUPPORTED;
+        }
+        i = i + 1;
+    }
+
+    // How much this packet will actually emit. The counters are committed
+    // only after every frame decoded, so a failure leaves them untouched.
+    let is i64 as total = p.total_duration;
+    let is i64 as skip with mut = d.skip_remaining;
+    if (skip > total) { skip = total; }
+    let is i64 as keep = total - skip;
+    let is i64 as trim with mut = d.end_trim;
+    if (trim > keep) { trim = keep; }
+    let is i64 as emitted = keep - trim;
+    let is i64 as need = emitted * d.channels;
+    if (cap < need) { return errno.I_NOMEM; }
+    if (need > 0 && cast(i64, out) == 0) { return errno.I_BADPARAM; }
+
+    // The global position of the next frame within this packet, and the
+    // output cursor, both in frames.
+    let is i64 as gpos with mut = 0;
+    let is i64 as outpos with mut = 0;
+    let is i64 as skip_left with mut = skip;
+    let is i64 as keep_end = total - trim;
+
+    i = 0;
+    while (i < p.frame_count) {
+        let is i64 as fdur = p.frame_duration;
+        let is *u8 as fp = p.frames[i].ptr;
+        let is i64 as flen = p.frames[i].len;
+
+        // Section 4.5.2 resets. CELT is reset when the mode changes and the
+        // new mode keeps or introduces the MDCT layer. SILK is reset when a
+        // SILK/Hybrid frame follows a CELT-only frame; a bandwidth change
+        // inside SILK is handled by silk_decode itself.
+        if (d.prev_mode >= 0 && p.mode != d.prev_mode) {
+            if (p.mode == opus_packet.OPUS_MODE_CELT ||
+                p.mode == opus_packet.OPUS_MODE_HYBRID) {
+                let is i64 as cr = celt.celt_reset(&d.celt);
+                if (cr < 0) { return cr; }
+            }
+        }
+        if (d.prev_mode == opus_packet.OPUS_MODE_CELT) {
+            if (p.mode == opus_packet.OPUS_MODE_SILK ||
+                p.mode == opus_packet.OPUS_MODE_HYBRID) {
+                let is i64 as sr = silk.silk_decoder_reset(&d.silk);
+                if (sr < 0) { return sr; }
+            }
+        }
+
+        let is i64 as planar with mut = 0;
+        if (p.mode == opus_packet.OPUS_MODE_SILK) {
+            let is rc.OpusRange as fr;
+            let is i64 as rr = rc.opus_range_init(&fr, fp, flen);
+            if (rr < 0) { return rr; }
+            let is i64 as sframes with mut = 0;
+            let is i64 as sr = silk.silk_decode(&d.silk, &fr,
+                p.bandwidth, _opus_duration_ms(fdur), p.stereo + 1,
+                &d.silk_l[0], &d.silk_r[0], fdur, &sframes);
+            if (sr < 0) { return sr; }
+            if (sframes != fdur) { return errno.I_CORRUPT; }
+            let is i64 as xr = _opus_skip_redundancy(&fr,
+                opus_packet.OPUS_MODE_SILK);
+            if (xr < 0) { return xr; }
+            planar = 1;
+
+            // Hybrid -> SILK transition: mix in the retained CELT overlap
+            // before the SILK output is used. WB keeps the SILK state (the
+            // normative direct-mixing case); NB/MB reset SILK inside
+            // silk_decode and still get the CELT overlap.
+            if (d.prev_mode == opus_packet.OPUS_MODE_HYBRID) {
+                let is i64 as hr = _opus_hybrid_to_silk(d,
+                    _opus_celt_end(p.bandwidth), p.stereo + 1);
+                if (hr < 0) { return hr; }
+            }
+        } else if (p.mode == opus_packet.OPUS_MODE_HYBRID) {
+            // One range decoder for both layers: SILK reads the header and
+            // low band, CELT continues with the high band.
+            let is rc.OpusRange as fr;
+            let is i64 as rr = rc.opus_range_init(&fr, fp, flen);
+            if (rr < 0) { return rr; }
+            let is i64 as sframes with mut = 0;
+            // Hybrid configs 12-15 are SWB/FB in the TOC, but their SILK
+            // layer is always WB: pass SILK_BW_WB (2), never config>>2
+            // (which is 3).
+            let is i64 as sr = silk.silk_decode(&d.silk, &fr,
+                silk_tables.SILK_BW_WB, _opus_duration_ms(fdur),
+                p.stereo + 1, &d.silk_l[0], &d.silk_r[0], fdur, &sframes);
+            if (sr < 0) { return sr; }
+            if (sframes != fdur) { return errno.I_CORRUPT; }
+            let is i64 as xr = _opus_skip_redundancy(&fr,
+                opus_packet.OPUS_MODE_HYBRID);
+            if (xr < 0) { return xr; }
+
+            let is i64 as lm = _opus_lm(fdur);
+            let is i64 as cf = celt.celt_set_frame(&d.celt, 17,
+                _opus_celt_end(p.bandwidth), lm, p.stereo + 1);
+            if (cf < 0) { return cf; }
+            let is i64 as cr = celt.celt_decode_with_range(&d.celt, &fr,
+                &d.mix[0], fdur * d.channels);
+            if (cr < 0) { return cr; }
+            if (cr != fdur) { return errno.I_CORRUPT; }
+
+            // SILK low band + CELT high band, aligned by output sample.
+            // SILK is delayed by the resampler's ten-input + one-unmix
+            // samples (0.6875 ms at WB, inside the 4.2.9 budget); the
+            // encoder compensates that delay on the MDCT side, so no
+            // extra CELT delay is applied here.
+            let is i64 as j with mut = 0;
+            while (j < fdur) {
+                d.mix[j * d.channels] = d.mix[j * d.channels] + d.silk_l[j];
+                if (d.channels == 2) {
+                    d.mix[j * 2 + 1] = d.mix[j * 2 + 1] + d.silk_r[j];
+                }
+                j = j + 1;
+            }
+        } else {
+            let is i64 as lm = _opus_lm(fdur);
+            let is i64 as cf = celt.celt_set_frame(&d.celt, 0,
+                _opus_celt_end(p.bandwidth), lm, p.stereo + 1);
+            if (cf < 0) { return cf; }
+            let is i64 as cr = celt.celt_decode(&d.celt, fp, flen,
+                &d.mix[0], fdur * d.channels);
+            if (cr < 0) { return cr; }
+            if (cr != fdur) { return errno.I_CORRUPT; }
+        }
+
+        // Drop the frames this position must not emit. Decoding still
+        // happened: pre-skip and end trim are output filters, not decode
+        // filters.
+        let is i64 as l0 with mut = 0;
+        if (skip_left > 0) {
+            if (skip_left >= fdur) {
+                skip_left = skip_left - fdur;
+                l0 = fdur;
+            } else {
+                l0 = skip_left;
+                skip_left = 0;
+            }
+        }
+        let is i64 as l1 with mut = fdur;
+        if (gpos + fdur > keep_end) {
+            l1 = keep_end - gpos;
+            if (l1 < 0) { l1 = 0; }
+            if (l1 < l0) { l1 = l0; }
+        }
+
+        let is f64 as g with mut = 1.0;
+        if (d.apply_gain != 0) { g = d.gain; }
+
+        if (planar != 0) {
+            let is i64 as k with mut = l0;
+            while (k < l1) {
+                let is f64 as xl = d.silk_l[k] * g;
+                out[outpos] = cast(i16, _opus_i16(xl));
+                outpos = outpos + 1;
+                if (d.channels == 2) {
+                    let is f64 as xr = d.silk_r[k] * g;
+                    out[outpos] = cast(i16, _opus_i16(xr));
+                    outpos = outpos + 1;
+                }
+                k = k + 1;
+            }
+        } else {
+            let is i64 as k with mut = l0;
+            while (k < l1) {
+                let is i64 as base = k * d.channels;
+                let is i64 as c with mut = 0;
+                while (c < d.channels) {
+                    let is f64 as x = d.mix[base + c] * g;
+                    out[outpos] = cast(i16, _opus_i16(x));
+                    outpos = outpos + 1;
+                    c = c + 1;
+                }
+                k = k + 1;
+            }
+        }
+
+        d.prev_mode = p.mode;
+        gpos = gpos + fdur;
+        i = i + 1;
+    }
+
+    d.skip_remaining = d.skip_remaining - skip;
+    d.end_trim = d.end_trim - trim;
+    d.packets = d.packets + 1;
+    *got = emitted;
+    return emitted;
+}
+
+// There is no packet-loss concealment in this decoder. The Opus layer calls
+// this instead of guessing a frame; it always refuses and writes nothing.
+fn opus_decode_lost(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    return errno.I_UNSUPPORTED;
+}
+
+// Forward error correction (RFC 6716 Section 4.5.1) is not implemented. The
+// packet framing and the LBRR symbols are parsed by the SILK slice, but no
+// concealed audio is produced, so this entry point refuses rather than
+// returning invented samples.
+fn opus_decode_fec(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
+                   cap as i64, got as *i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, got) == 0) { return errno.I_BADPARAM; }
+    if (cap < 0) { return errno.I_BADPARAM; }
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
+    if (cap > 0 && cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    return errno.I_UNSUPPORTED;
+}

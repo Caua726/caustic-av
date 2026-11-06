@@ -1,0 +1,764 @@
+// =======================================================
+// caustic-av/container/ogg.cst
+// Demuxer for Ogg (RFC 3533) as used by Ogg Opus (RFC 7845). It parses
+// pages, checks their CRC, reassembles packets across pages, tracks logical
+// bitstreams by serial number and hands out one contiguous packet per call.
+// Every byte it exposes is borrowed from the caller's source; nothing is
+// allocated and no file is opened.
+//
+// Page layout (RFC 3533 Section 6), all integers little endian:
+//
+//   0..3    "OggS"
+//   4       stream_structure_version, must be 0
+//   5       header_type_flag: 0x01 continued, 0x02 BOS, 0x04 EOS
+//   6..13   granule_position, signed 64-bit; -1 means no packet completes
+//   14..17  bitstream_serial_number
+//   18..21  page_sequence_number
+//   22..25  CRC_checksum
+//   26      number_page_segments, 0..255
+//   27..    segment_table, one lacing value per segment
+//
+// header_size = 27 + number_page_segments and page_size = header_size +
+// sum(lacing values), so a page is at most 65307 bytes. Every length is
+// checked against the source before a byte is read: a truncated page is
+// I_EOF, never a read past len.
+//
+// CRC: the checksum field is computed over the whole page with those four
+// bytes treated as zero, using the non-reflected polynomial 0x04C11DB7 with
+// an initial value of 0 and no final inversion. It is computed bit by bit
+// here; a mismatch is I_CORRUPT and no packet from that page is published.
+// The version byte is checked after the CRC, so a page that is not Ogg at
+// all fails as I_BADMAGIC and a well-formed page with a future version fails
+// as I_UNSUPPORTED. Reserved header-type bits are I_CORRUPT.
+//
+// Packets and lacing (RFC 3533 Section 5): a lacing value of 255 continues
+// the packet into the next segment; 0..254 ends it after that many bytes. A
+// packet of exactly 255 bytes therefore ends with a 0 lacing, and a nil
+// packet is a single 0 lacing. A packet may span pages: the first page ends
+// with 255 and the next page of that logical stream sets the continued flag.
+// RFC 7845 Section 3 additionally says that when the continued flag and the
+// previous page disagree, or the page sequence numbers are not consecutive,
+// the partial packet must not be decoded; that packet is dropped here.
+//
+// Reassembly: a packet that fits in one page is returned as a view into the
+// source. A packet that spans pages is described by up to OGG_MAX_FRAGS
+// (offset, length) fragments into the source and copied, when it completes,
+// into the Ogg's own OGG_MAX_PACKET-byte buffer. That buffer is a member of
+// the caller-owned Ogg, so no allocation happens. A packet larger than
+// OGG_MAX_PACKET, or one needing more than OGG_MAX_FRAGS page fragments, is
+// I_UNSUPPORTED: it is never truncated. The returned view stays valid until
+// the next ogg_next call, like every borrowed view in this library.
+//
+// Logical streams: a serial number selects a track. The first page of a
+// stream must be BOS, a second BOS page for the same serial is I_CORRUPT, and
+// no page may follow that stream's EOS page. Streams may be interleaved
+// (grouping) and concatenated (chaining); a new serial after the previous
+// chain closes appends a track while OGG_MAX_TRACKS allows. A serial is
+// unique within a physical bitstream (RFC 3533 Section 4), so a chained stream
+// reusing one is I_CORRUPT rather than a second track.
+//
+// Track discovery: ogg_open walks the leading BOS pages (RFC 3533 requires
+// them together at the start) and registers each serial with its codec. It
+// does not consume anything: ogg_next starts at byte 0, walks the same pages,
+// consumes their first packet as a codec header and then delivers audio
+// packets. A BOS page must contain its initial header packet completely on
+// that page (RFC 3533 Section 5), so the header bytes are always contiguous
+// in the source. `head` and `head_len` on a track point at that packet. The
+// second Opus header (OpusTags) is kept on the track as `tags`/`tags_len`
+// when that packet was contiguous; it is null and 0 when the comment header
+// spanned pages, because the assembled copy would be overwritten by the
+// next packet.
+//
+// Codec identification uses the first bytes of the BOS packet:
+//   "OpusHead"         OGG_CODEC_OPUS
+//   0x01 "vorbis"      OGG_CODEC_VORBIS
+//   0x7F "FLAC"        OGG_CODEC_FLAC
+//   0x80 "theora"      OGG_CODEC_THEORA
+// anything else is OGG_CODEC_UNKNOWN. The first packet of every stream is
+// its BOS header and is not handed out. For Opus, RFC 7845 Section 5 also
+// defines a second mandatory header packet (OpusTags), which is consumed and
+// not handed out. The other mappings put their secondary headers after the
+// BOS packet with counts this stage does not implement, so those packets are
+// delivered as packets; consumers must not treat them as audio.
+//
+// Timestamps: packet.pts and packet.dts are the granule position of the page
+// the packet completes on, as the task contract specifies. RFC 7845 Section 4
+// defines that granule as the total 48 kHz samples through the last packet
+// completed on the page, so on a page holding several packets only the last
+// one gets its exact position; earlier packets share it. The Opus layer
+// derives exact per-packet sample positions from the TOC durations when it
+// needs them. Granule -1 is passed through unchanged. packet.duration is 0:
+// Ogg does not carry a duration per packet, and this module does not parse
+// Opus TOCs. packet.keyframe is 1 for every Opus packet (Opus is all-intra)
+// and 0 for other codecs.
+//
+// Errors: ogg_open returns I_BADMAGIC when the source does not begin with a
+// complete Ogg page, I_EOF for a truncated first page or an empty source,
+// I_CORRUPT for a page that violates the format or lacks a BOS page, and
+// I_UNSUPPORTED for too many tracks. ogg_next returns 1 with a packet, 0 at a
+// clean end of file, or a negative code; a partially written packet at EOF is
+// dropped. A truncated final page is I_EOF rather than a clean end.
+// =======================================================
+
+use "../core/errno.cst" as errno;
+use "../core/packet.cst" as packet;
+
+// Fixed capacities. A page is at most 65307 bytes; a packet may span pages
+// and is bounded by OGG_MAX_PACKET. Both are compile-time constants so a
+// hostile lacing value can never drive an allocation.
+let is i64 as OGG_MAX_TRACKS with imut = 16;
+let is i64 as OGG_MAX_FRAGS  with imut = 32;
+let is i64 as OGG_MAX_PACKET with imut = 65536;
+let is i64 as OGG_PAGE_HEADER with imut = 27;
+let is i64 as OGG_CRC_POLY with imut = 0x04C11DB7;
+
+// header_type_flag bits (RFC 3533 Section 6).
+let is i64 as OGG_FLAG_CONT with imut = 1;
+let is i64 as OGG_FLAG_BOS  with imut = 2;
+let is i64 as OGG_FLAG_EOS  with imut = 4;
+
+// Codec identifiers derived from the BOS packet.
+let is i64 as OGG_CODEC_UNKNOWN with imut = 0;
+let is i64 as OGG_CODEC_OPUS    with imut = 1;
+let is i64 as OGG_CODEC_VORBIS  with imut = 2;
+let is i64 as OGG_CODEC_FLAC    with imut = 3;
+let is i64 as OGG_CODEC_THEORA  with imut = 4;
+
+struct OggFrag {
+    off as i64;   // absolute source offset
+    len as i64;   // bytes, > 0
+}
+
+struct OggTrack {
+    serial         as i64;   // 0..2^32-1
+    codec          as i64;   // OGG_CODEC_*
+    head           as *u8;   // borrowed BOS packet, head_len bytes
+    head_len       as i64;   // full BOS packet length
+    tags           as *u8;   // borrowed OpusTags packet when it was contiguous
+    tags_len       as i64;   // 0 when the comment header spanned pages
+    bos_pos        as i64;   // source offset of the BOS page, -1 if none
+    header_packets as i64;   // packets consumed as codec headers
+    packet_index   as i64;   // packets seen on this track, headers included
+    packets        as i64;   // data packets handed out
+    granule        as i64;   // granule of the most recent page
+    eos            as i64;   // 1 once an EOS page was seen
+    seq            as i64;   // next expected page sequence, -1 before the first
+    frags          as [32]OggFrag;
+    frag_count     as i64;
+    frag_len       as i64;   // sum of frags lengths
+}
+
+struct OggPage {
+    start      as i64;   // offset of "OggS"
+    header_len as i64;   // 27 + nsegs
+    body_off   as i64;   // start + header_len
+    body_len   as i64;   // sum of lacing values
+    next       as i64;   // body_off + body_len
+    version    as i64;
+    flags      as i64;
+    granule    as i64;   // raw 64-bit value; -1 means no packet completes
+    serial     as i64;   // 0..2^32-1
+    seq        as i64;   // 0..2^32-1
+    nsegs      as i64;   // 0..255
+}
+
+struct Ogg {
+    src as *u8;
+    len as i64;
+    pos as i64;          // next page to read
+
+    tracks      as [16]OggTrack;
+    track_count as i64;
+
+    // The page currently being walked. Only one page is open at a time
+    // because pages are consumed in physical order.
+    page_active   as i64;
+    page_track    as i64;
+    page_tab      as i64;   // absolute offset of the segment table
+    page_body     as i64;   // absolute offset of the next segment's bytes
+    page_seg      as i64;   // next segment index
+    page_nsegs    as i64;
+    page_in_pkt   as i64;   // 1 while a packet has data on this page
+    page_pkt_start as i64;  // absolute offset where that packet's page range starts
+    page_granule  as i64;
+    page_discard  as i64;   // 1 while dropping a continued packet whose start was lost
+
+    // Assembled packets only; direct page views do not use it.
+    pktbuf as [65536]u8;
+}
+
+// ── Page parsing ────────────────────────────────────────────────────
+
+fn _u32le(src as *u8, off as i64) as i64 {
+    return cast(i64, src[off])
+        | (cast(i64, src[off + 1]) << 8)
+        | (cast(i64, src[off + 2]) << 16)
+        | (cast(i64, src[off + 3]) << 24);
+}
+
+// Raw 64-bit little-endian value. Bit 63 set returns a negative i64; that is
+// data (granule positions are unsigned except for the -1 sentinel).
+fn _u64le(src as *u8, off as i64) as i64 {
+    let is i64 as lo = _u32le(src, off);
+    let is i64 as hi = _u32le(src, off + 4);
+    return lo | (hi << 32);
+}
+
+// One CRC step: absorb a byte into the non-reflected 0x04C11DB7 register.
+fn _crc_byte(crc as i64, byte as i64) as i64 {
+    let is i64 as v with mut = crc ^ ((byte & 255) << 24);
+    let is i64 as i with mut = 0;
+    while (i < 8) {
+        if ((v & 0x80000000) != 0) {
+            v = ((v << 1) & 0xFFFFFFFF) ^ OGG_CRC_POLY;
+        } else {
+            v = (v << 1) & 0xFFFFFFFF;
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _crc_bytes(crc as i64, src as *u8, off as i64, n as i64) as i64 {
+    let is i64 as v with mut = crc;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        v = _crc_byte(v, cast(i64, src[off + i]));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _crc_zeros(crc as i64, n as i64) as i64 {
+    let is i64 as v with mut = crc;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        v = _crc_byte(v, 0);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Parse and validate one page at src[pos]. On success *pg is filled and 0
+// returned. Every field is bounded before use:
+//   I_BADPARAM   null source pointer with a page present
+//   I_EOF        fewer than 27 header bytes or a body past the source
+//   I_BADMAGIC   the capture pattern is not "OggS"
+//   I_UNSUPPORTED stream_structure_version != 0
+//   I_CORRUPT    reserved header-type bits set, or a CRC mismatch
+// The CRC is checked over the header (with the checksum field zeroed) and the
+// body, and nothing is published from a page that fails it.
+fn ogg_page_parse(src as *u8, len as i64, pos as i64, pg as *OggPage) as i64 {
+    if (cast(i64, pg) == 0) { return errno.I_BADPARAM; }
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (pos < 0) { return errno.I_BADPARAM; }
+    if (pos > len) { return errno.I_EOF; }
+    if (len - pos < 4) { return errno.I_EOF; }
+    if (cast(i64, src) == 0) { return errno.I_BADPARAM; }
+
+    if (cast(i64, src[pos]) != 79) { return errno.I_BADMAGIC; }      // 'O'
+    if (cast(i64, src[pos + 1]) != 103) { return errno.I_BADMAGIC; } // 'g'
+    if (cast(i64, src[pos + 2]) != 103) { return errno.I_BADMAGIC; } // 'g'
+    if (cast(i64, src[pos + 3]) != 83) { return errno.I_BADMAGIC; }  // 'S'
+
+    if (len - pos < OGG_PAGE_HEADER) { return errno.I_EOF; }
+
+    let is i64 as nsegs = cast(i64, src[pos + 26]);
+    let is i64 as header_len = OGG_PAGE_HEADER + nsegs;
+    if (len - pos < header_len) { return errno.I_EOF; }
+
+    let is i64 as body_len with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < nsegs) {
+        body_len = body_len + cast(i64, src[pos + OGG_PAGE_HEADER + i]);
+        i = i + 1;
+    }
+    if (len - pos - header_len < body_len) { return errno.I_EOF; }
+
+    // CRC over the page with the checksum field treated as zero. It is
+    // checked before version and flags so a corrupt page is reported as
+    // such, and no field is interpreted from it.
+    let is i64 as crc with mut = 0;
+    crc = _crc_bytes(crc, src, pos, 22);
+    crc = _crc_zeros(crc, 4);
+    crc = _crc_bytes(crc, src, pos + 26, header_len - 26);
+    crc = _crc_bytes(crc, src, pos + header_len, body_len);
+    if (crc != _u32le(src, pos + 22)) { return errno.I_CORRUPT; }
+
+    let is i64 as version = cast(i64, src[pos + 4]);
+    if (version != 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as flags = cast(i64, src[pos + 5]);
+    if ((flags & 0xF8) != 0) { return errno.I_CORRUPT; }
+
+    pg.start = pos;
+    pg.header_len = header_len;
+    pg.body_off = pos + header_len;
+    pg.body_len = body_len;
+    pg.next = pg.body_off + body_len;
+    pg.version = version;
+    pg.flags = flags;
+    pg.granule = _u64le(src, pos + 6);
+    pg.serial = _u32le(src, pos + 14);
+    pg.seq = _u32le(src, pos + 18);
+    pg.nsegs = nsegs;
+    return errno.I_OK;
+}
+
+// ── Codec identification ────────────────────────────────────────────
+
+// Codec from the first bytes of a BOS packet. Never reads past len.
+fn _identify(p as *u8, len as i64) as i64 {
+    if (len < 5 || cast(i64, p) == 0) { return OGG_CODEC_UNKNOWN; }
+    // "OpusHead"
+    if (len >= 8
+        && cast(i64, p[0]) == 79 && cast(i64, p[1]) == 112
+        && cast(i64, p[2]) == 117 && cast(i64, p[3]) == 115
+        && cast(i64, p[4]) == 72 && cast(i64, p[5]) == 101
+        && cast(i64, p[6]) == 97 && cast(i64, p[7]) == 100) {
+        return OGG_CODEC_OPUS;
+    }
+    // 0x01 "vorbis"
+    if (len >= 7 && cast(i64, p[0]) == 1
+        && cast(i64, p[1]) == 118 && cast(i64, p[2]) == 111
+        && cast(i64, p[3]) == 114 && cast(i64, p[4]) == 98
+        && cast(i64, p[5]) == 105 && cast(i64, p[6]) == 115) {
+        return OGG_CODEC_VORBIS;
+    }
+    // 0x7F "FLAC"
+    if (len >= 5 && cast(i64, p[0]) == 127
+        && cast(i64, p[1]) == 70 && cast(i64, p[2]) == 76
+        && cast(i64, p[3]) == 65 && cast(i64, p[4]) == 67) {
+        return OGG_CODEC_FLAC;
+    }
+    // 0x80 "theora"
+    if (len >= 7 && cast(i64, p[0]) == 128
+        && cast(i64, p[1]) == 116 && cast(i64, p[2]) == 104
+        && cast(i64, p[3]) == 101 && cast(i64, p[4]) == 111
+        && cast(i64, p[5]) == 114 && cast(i64, p[6]) == 97) {
+        return OGG_CODEC_THEORA;
+    }
+    return OGG_CODEC_UNKNOWN;
+}
+
+fn ogg_codec_name(codec as i64) as *u8 {
+    if (codec == OGG_CODEC_OPUS) { return "opus"; }
+    if (codec == OGG_CODEC_VORBIS) { return "vorbis"; }
+    if (codec == OGG_CODEC_FLAC) { return "flac"; }
+    if (codec == OGG_CODEC_THEORA) { return "theora"; }
+    return "unknown";
+}
+
+fn ogg_track_codec_name(t as *OggTrack) as *u8 {
+    if (cast(i64, t) == 0) { return "unknown"; }
+    return ogg_codec_name(t.codec);
+}
+
+// Number of header packets a codec's mapping defines: two for Opus
+// (RFC 7845 Section 5), one (the BOS packet) for everything else. Secondary
+// header counts for the other mappings are not implemented at this stage.
+fn _header_packets(codec as i64) as i64 {
+    if (codec == OGG_CODEC_OPUS) { return 2; }
+    return 1;
+}
+
+// ── Track bookkeeping ───────────────────────────────────────────────
+
+fn _find_track(o as *Ogg, serial as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < o.track_count) {
+        if (o.tracks[i].serial == serial) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _track_init(t as *OggTrack) as void {
+    t.serial = 0;
+    t.codec = OGG_CODEC_UNKNOWN;
+    t.head = cast(*u8, 0);
+    t.head_len = 0;
+    t.tags = cast(*u8, 0);
+    t.tags_len = 0;
+    t.bos_pos = 0 - 1;
+    t.header_packets = 0;
+    t.packet_index = 0;
+    t.packets = 0;
+    t.granule = 0 - 1;
+    t.eos = 0;
+    t.seq = 0 - 1;
+    t.frag_count = 0;
+    t.frag_len = 0;
+}
+
+// Length of the first packet on a page, reading its lacing values from the
+// start of the segment table. Returns 0 or a negative code. The caller has
+// already validated the page.
+fn _first_packet_len(o as *Ogg, pg as *OggPage, out as *i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as n with mut = 0;
+    while (i < pg.nsegs) {
+        let is i64 as s = cast(i64, o.src[pg.start + OGG_PAGE_HEADER + i]);
+        n = n + s;
+        i = i + 1;
+        if (s < 255) {
+            *out = n;
+            return errno.I_OK;
+        }
+    }
+    return errno.I_CORRUPT;   // the first packet does not complete on the page
+}
+
+// ── Opening ─────────────────────────────────────────────────────────
+
+// Walk the leading BOS pages and register their streams. Nothing is
+// consumed; ogg_next starts again at byte 0. A BOS page must carry its
+// initial header packet completely (RFC 3533 Section 5), so the header view
+// is contiguous in the source.
+fn _scan_bos(o as *Ogg) as i64 {
+    let is i64 as pos with mut = 0;
+    while (pos < o.len) {
+        let is OggPage as pg;
+        let is i64 as r with mut = ogg_page_parse(o.src, o.len, pos, &pg);
+        if (r < 0) { return r; }
+        if ((pg.flags & OGG_FLAG_BOS) == 0) { break; }
+
+        if ((pg.flags & OGG_FLAG_CONT) != 0) { return errno.I_CORRUPT; }
+        if (pg.nsegs == 0) { return errno.I_CORRUPT; }
+        if (cast(i64, o.src[pg.start + OGG_PAGE_HEADER + pg.nsegs - 1]) == 255) {
+            return errno.I_CORRUPT;
+        }
+        if (_find_track(o, pg.serial) >= 0) { return errno.I_CORRUPT; }
+        if (o.track_count >= OGG_MAX_TRACKS) { return errno.I_UNSUPPORTED; }
+
+        let is i64 as ti = o.track_count;
+        _track_init(&o.tracks[ti]);
+        o.tracks[ti].serial = pg.serial;
+        o.tracks[ti].bos_pos = pg.start;
+
+        let is i64 as plen with mut = 0;
+        r = _first_packet_len(o, &pg, &plen);
+        if (r < 0) { return r; }
+        if (plen <= 0) { return errno.I_CORRUPT; }
+        o.tracks[ti].head = cast(*u8, cast(i64, o.src) + pg.body_off);
+        o.tracks[ti].head_len = plen;
+        o.tracks[ti].codec = _identify(o.tracks[ti].head, plen);
+        o.tracks[ti].header_packets = _header_packets(o.tracks[ti].codec);
+        o.track_count = o.track_count + 1;
+
+        pos = pg.next;
+    }
+
+    if (o.track_count == 0) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+// Bind the demuxer to src[0..len] and register the leading streams. Returns
+// 0, or a negative code. On failure the state is empty and no packet may be
+// read. An empty source is I_EOF.
+fn ogg_open(o as *Ogg, src as *u8, len as i64) as i64 {
+    if (cast(i64, o) == 0) { return errno.I_BADPARAM; }
+    o.src = cast(*u8, 0);
+    o.len = 0;
+    o.pos = 0;
+    o.track_count = 0;
+    o.page_active = 0;
+    o.page_track = 0;
+    o.page_tab = 0;
+    o.page_body = 0;
+    o.page_seg = 0;
+    o.page_nsegs = 0;
+    o.page_in_pkt = 0;
+    o.page_pkt_start = 0;
+    o.page_granule = 0;
+    o.page_discard = 0;
+
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, src) == 0) { return errno.I_BADPARAM; }
+    o.src = src;
+    o.len = len;
+    if (len == 0) {
+        o.src = cast(*u8, 0);
+        return errno.I_EOF;
+    }
+    let is i64 as r = _scan_bos(o);
+    if (r < 0) {
+        o.src = cast(*u8, 0);
+        o.len = 0;
+        o.pos = 0;
+        o.track_count = 0;
+        o.page_active = 0;
+    }
+    return r;
+}
+
+// ── Page walking ────────────────────────────────────────────────────
+
+// Add src[off..end) as a fragment of the packet in progress on the current
+// track. Returns 0 or a negative code; a packet that would need more than
+// OGG_MAX_FRAGS fragments or OGG_MAX_PACKET bytes is I_UNSUPPORTED.
+fn _frag_add(o as *Ogg, off as i64, end as i64) as i64 {
+    if (off < 0 || end < off || end > o.len) { return errno.I_CORRUPT; }
+    let is i64 as n = end - off;
+    if (n == 0) { return errno.I_OK; }
+    let is *OggTrack as t = &o.tracks[o.page_track];
+    if (t.frag_count >= OGG_MAX_FRAGS) { return errno.I_UNSUPPORTED; }
+    if (t.frag_len > OGG_MAX_PACKET - n) { return errno.I_UNSUPPORTED; }
+    t.frags[t.frag_count].off = off;
+    t.frags[t.frag_count].len = n;
+    t.frag_count = t.frag_count + 1;
+    t.frag_len = t.frag_len + n;
+    return errno.I_OK;
+}
+
+// Publish a completed packet made of the accumulated fragments plus
+// src[start..end). Returns 1 when a packet was handed out, 0 when it was a
+// consumed header packet, or a negative code.
+fn _finish_packet(o as *Ogg, start as i64, end as i64,
+                  pkt as *packet.Packet) as i64 {
+    if (start < 0 || end < start || end > o.len) { return errno.I_CORRUPT; }
+    let is i64 as ti = o.page_track;
+    let is *OggTrack as t = &o.tracks[ti];
+    let is i64 as in_page = end - start;
+    if (t.frag_len > OGG_MAX_PACKET - in_page) { return errno.I_UNSUPPORTED; }
+    let is i64 as total = t.frag_len + in_page;
+
+    // A BOS header packet must complete on its page, so the first packet of a
+    // track is never continued; that keeps `head` pointing into the source.
+    if (t.packet_index == 0 && t.frag_count != 0) { return errno.I_CORRUPT; }
+
+    let is *u8 as ptr with mut = cast(*u8, 0);
+    if (t.frag_count == 0) {
+        ptr = cast(*u8, cast(i64, o.src) + start);
+    } else {
+        let is i64 as w with mut = 0;
+        let is i64 as f with mut = 0;
+        while (f < t.frag_count) {
+            let is i64 as fo = t.frags[f].off;
+            let is i64 as fl = t.frags[f].len;
+            let is i64 as j with mut = 0;
+            while (j < fl) {
+                o.pktbuf[w + j] = o.src[fo + j];
+                j = j + 1;
+            }
+            w = w + fl;
+            f = f + 1;
+        }
+        let is i64 as j2 with mut = 0;
+        while (j2 < in_page) {
+            o.pktbuf[w + j2] = o.src[start + j2];
+            j2 = j2 + 1;
+        }
+        ptr = &o.pktbuf[0];
+    }
+
+    let is i64 as index = t.packet_index;
+    if (index == 0) {
+        t.head = ptr;
+        t.head_len = total;
+        t.codec = _identify(ptr, total);
+        t.header_packets = _header_packets(t.codec);
+    }
+    let is i64 as was_cont with mut = 0;
+    if (t.frag_count != 0) { was_cont = 1; }
+    t.packet_index = index + 1;
+    t.frag_count = 0;
+    t.frag_len = 0;
+
+    if (index < t.header_packets) {
+        // Keep the OpusTags packet when it was contiguous in the source, so
+        // opus_tags_parse can read it without a copy. A comment header that
+        // spans pages is assembled in pktbuf and is not retained.
+        if (t.codec == OGG_CODEC_OPUS && index == 1 && was_cont == 0) {
+            t.tags = ptr;
+            t.tags_len = total;
+        }
+        return 0;
+    }
+
+    // RFC 7845 Section 3: a zero-octet Opus audio packet is malformed.
+    if (t.codec == OGG_CODEC_OPUS && total == 0) { return errno.I_CORRUPT; }
+
+    let is i64 as key with mut = 0;
+    if (t.codec == OGG_CODEC_OPUS) { key = 1; }
+    let is i64 as r = packet.packet_set(pkt, ptr, total, cast(i32, ti),
+                                        o.page_granule, o.page_granule, 0,
+                                        key);
+    if (r < 0) { return r; }
+    t.packets = t.packets + 1;
+    return 1;
+}
+
+// Read the next page and make it current. Returns 1 with page state set, 0 at
+// a clean end of file, or a negative code. Stream continuity and the
+// continued-packet rules of RFC 7845 Section 3 are applied here, before any
+// segment is consumed.
+fn _open_page(o as *Ogg) as i64 {
+    if (o.pos >= o.len) { return 0; }
+
+    let is OggPage as pg;
+    let is i64 as r with mut = ogg_page_parse(o.src, o.len, o.pos, &pg);
+    if (r < 0) { return r; }
+
+    let is i64 as ti with mut = _find_track(o, pg.serial);
+    let is i64 as fresh with mut = 0;
+    if (ti < 0) {
+        // A logical stream begins with BOS (RFC 3533 Section 4).
+        if ((pg.flags & OGG_FLAG_BOS) == 0) { return errno.I_CORRUPT; }
+        if (o.track_count >= OGG_MAX_TRACKS) { return errno.I_UNSUPPORTED; }
+        ti = o.track_count;
+        _track_init(&o.tracks[ti]);
+        o.tracks[ti].serial = pg.serial;
+        o.tracks[ti].bos_pos = pg.start;
+        o.track_count = o.track_count + 1;
+        fresh = 1;
+    } else {
+        if (o.tracks[ti].eos != 0) { return errno.I_CORRUPT; }
+        if ((pg.flags & OGG_FLAG_BOS) != 0) {
+            // Only the track's own BOS page may set BOS again; a repeated BOS
+            // for a known serial is not a new chain (serials are unique).
+            if (o.tracks[ti].bos_pos != pg.start) { return errno.I_CORRUPT; }
+        }
+    }
+
+    if ((pg.flags & OGG_FLAG_BOS) != 0) {
+        if ((pg.flags & OGG_FLAG_CONT) != 0) { return errno.I_CORRUPT; }
+        if (pg.nsegs == 0) { return errno.I_CORRUPT; }
+        if (cast(i64, o.src[pg.start + OGG_PAGE_HEADER + pg.nsegs - 1]) == 255) {
+            return errno.I_CORRUPT;
+        }
+    }
+
+    let is *OggTrack as t = &o.tracks[ti];
+    if (fresh != 0) {
+        // The BOS page carries the first header packet; make its bytes
+        // available before the packet is walked, as _scan_bos does for the
+        // leading streams.
+        let is i64 as plen with mut = 0;
+        r = _first_packet_len(o, &pg, &plen);
+        if (r < 0) { return r; }
+        if (plen <= 0) { return errno.I_CORRUPT; }
+        t.head = cast(*u8, cast(i64, o.src) + pg.body_off);
+        t.head_len = plen;
+        t.codec = _identify(t.head, plen);
+        t.header_packets = _header_packets(t.codec);
+    }
+
+    // Page sequence: non-consecutive numbers mean packets were lost, so a
+    // packet crossing the boundary cannot be decoded (RFC 7845 Section 3).
+    let is i64 as cont_ok with mut = 1;
+    if (t.seq >= 0 && pg.seq != t.seq) { cont_ok = 0; }
+    t.seq = (pg.seq + 1) & 4294967295;
+
+    if ((pg.flags & OGG_FLAG_CONT) != 0) {
+        if (t.frag_count > 0 && cont_ok != 0) {
+            o.page_discard = 0;
+        } else {
+            // The start of this packet is missing: drop it up to its first
+            // segment that ends it, then resume with fresh packets.
+            t.frag_count = 0;
+            t.frag_len = 0;
+            o.page_discard = 1;
+        }
+    } else {
+        // The previous page promised a continuation that never came.
+        if (t.frag_count > 0) {
+            t.frag_count = 0;
+            t.frag_len = 0;
+        }
+        o.page_discard = 0;
+    }
+
+    o.page_active = 1;
+    o.page_track = ti;
+    o.page_tab = pg.start + OGG_PAGE_HEADER;
+    o.page_body = pg.body_off;
+    o.page_seg = 0;
+    o.page_nsegs = pg.nsegs;
+    o.page_in_pkt = 0;
+    o.page_pkt_start = pg.body_off;
+    o.page_granule = pg.granule;
+    t.granule = pg.granule;
+    if ((pg.flags & OGG_FLAG_EOS) != 0) { t.eos = 1; }
+    o.pos = pg.next;
+    return 1;
+}
+
+// ── Public iteration ────────────────────────────────────────────────
+
+// Next packet: 1 with *pkt filled, 0 at a clean end of source, or a negative
+// code. Packets are returned in physical page order; a packet spanning pages
+// is returned where it completes. Codec header packets are consumed and
+// never returned (one for every stream, plus OpusTags for Opus). The view is
+// valid until the next ogg_next call.
+fn ogg_next(o as *Ogg, pkt as *packet.Packet) as i64 {
+    if (cast(i64, o) == 0 || cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
+
+    while (1) {
+        if (o.page_active == 0) {
+            let is i64 as r = _open_page(o);
+            if (r < 0) { return r; }
+            if (r == 0) { return 0; }
+        }
+
+        while (o.page_seg < o.page_nsegs) {
+            let is i64 as seg_off = o.page_tab + o.page_seg;
+            let is i64 as s = cast(i64, o.src[seg_off]);
+            let is i64 as data_off = o.page_body;
+            o.page_seg = o.page_seg + 1;
+            o.page_body = o.page_body + s;
+
+            if (o.page_discard != 0) {
+                if (s < 255) {
+                    o.page_discard = 0;
+                    o.page_in_pkt = 0;
+                }
+                continue;
+            }
+
+            if (o.page_in_pkt == 0) {
+                o.page_in_pkt = 1;
+                o.page_pkt_start = data_off;
+            }
+
+            if (s < 255) {
+                let is i64 as r = _finish_packet(o, o.page_pkt_start,
+                                                 o.page_body, pkt);
+                o.page_in_pkt = 0;
+                if (r < 0) { return r; }
+                if (r == 1) { return 1; }
+            }
+        }
+
+        // Page exhausted. A trailing lacing of 255 leaves the packet open for
+        // the next page of this stream.
+        if (o.page_in_pkt != 0) {
+            let is i64 as r = _frag_add(o, o.page_pkt_start, o.page_body);
+            if (r < 0) { return r; }
+            o.page_in_pkt = 0;
+        }
+        o.page_discard = 0;
+        o.page_active = 0;
+    }
+    return 0;
+}
+
+// ── Track accessors ─────────────────────────────────────────────────
+
+fn ogg_track_count(o as *Ogg) as i64 {
+    if (cast(i64, o) == 0) { return 0; }
+    return o.track_count;
+}
+
+// Track index for a logical stream serial, or -1 when the serial is unknown.
+// This is the serial-to-track mapping the page walker uses internally.
+fn ogg_track_index(o as *Ogg, serial as i64) as i64 {
+    if (cast(i64, o) == 0) { return 0 - 1; }
+    return _find_track(o, serial);
+}
+
+// Track by 0-based index, or a null pointer when the index is out of range.
+fn ogg_track(o as *Ogg, i as i64) as *OggTrack {
+    if (cast(i64, o) == 0) { return cast(*OggTrack, 0); }
+    if (i < 0 || i >= o.track_count) { return cast(*OggTrack, 0); }
+    return &o.tracks[i];
+}

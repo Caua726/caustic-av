@@ -1,0 +1,75 @@
+// =======================================================
+// caustic-av/audio/opus/celt_state.cst
+// Decoder state for the CELT layer. One instance per Opus decoder. The
+// caller owns the memory: this struct is a fixed-size value with every
+// buffer the decoder needs, so nothing below ever calls an allocator and a
+// corrupt packet cannot make the decoder grow.
+//
+// Layout notes
+//   * coeffs holds the two normalised MDCT spectra interleaved by frame
+//     length N (channel 0 at 0, channel 1 at N), exactly the layout the band
+//     decoder walks. 2 * 960 f64 covers the largest frame.
+//   * norm holds the previous-band folding data, one plane per channel.
+//   * pf_hist is the post-filter history: 1024 past samples plus the current
+//     frame, per channel. It is linearly memmoved down after each frame,
+//     which keeps the comb filter a plain indexed read.
+//   * ola holds the tail of the previous frame's windowed inverse MDCT: 120
+//     samples per channel (CELT_OVERLAP).
+//   * No packet-loss state is carried: PLC is out of scope for this decoder
+//     (celt_decode refuses a loss with I_UNSUPPORTED).
+// =======================================================
+
+use "celt_tables.cst" as tbl;
+
+struct CeltDec {
+    // configuration (set once by the Opus layer)
+    channels        as i64;   // output channels, 1 or 2
+    stream_channels as i64;   // channels coded in the bitstream, 1 or 2
+    start           as i64;   // first coded band: 0, or 17 in hybrid mode
+    end             as i64;   // one past the last coded band, <= 21
+    lm              as i64;   // frame size shift, 0..3
+    disable_inv     as i64;   // 1 when downmixing to mono
+
+    // persistent energy state, log2 domain, [channel][band]
+    old_e           as [42]f64;
+    old_log_e       as [42]f64;
+    old_log_e2      as [42]f64;
+
+    // per-frame working data
+    coeffs          as [1920]f64;   // [2][N] normalised spectra
+    norm            as [1248]f64;   // [2][8*eBands[20]] folding history
+    lowband_scratch as [960]f64;
+    freq            as [960]f64;    // one channel's denormalised spectrum
+    time            as [960]f64;    // one channel's frame output
+
+    // transform / filter state
+    ola             as [240]f64;    // [2][120] overlap tail
+    pf_hist         as [4096]f64;   // [2][2048] post-filter history
+    preemph         as [2]f64;      // de-emphasis memory
+    pf_period       as i64;
+    pf_gain         as f64;
+    pf_tapset       as i64;
+    pf_period_old   as i64;
+    pf_gain_old     as f64;
+    pf_tapset_old   as i64;
+
+    // per-frame allocation decisions
+    pulses          as [21]i64;
+    fine_quant      as [21]i64;
+    fine_priority   as [21]i64;
+    tf_res          as [21]i64;
+    offsets         as [21]i64;
+    cap             as [21]i64;
+    collapse        as [42]i64;     // [channel][band] collapse masks
+    alloc_trim      as i64;         // 0..10, default 5
+    intensity       as i64;         // first intensity-stereo band
+    dual_stereo     as i64;
+    balance         as i64;         // 8th bits handed to quant_all_bands
+    coded_bands     as i64;
+
+    // noise generator for folding/anti-collapse (no bitstream impact)
+    rng             as i64;
+
+    // single allocation of all fixed tables
+    tab             as tbl.CeltTab;
+}

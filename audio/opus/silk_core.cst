@@ -1,0 +1,312 @@
+// =======================================================
+// caustic-av/audio/opus/silk_core.cst
+// Excitation decoding and the LTP + LPC synthesis filters.
+//
+// The excitation follows RFC 6716 sections 4.2.7.8.1 to 4.2.7.8.6: a rate
+// level, one pulse count per 16-sample shell block (with the level-9/10
+// escape for extra LSBs), recursive pulse locations, LSBs, signs, then the
+// offset/LCG reconstruction to Q23.
+//
+// Synthesis follows sections 4.2.7.9.1 and 4.2.7.9.2. Those sections say
+// the result does not need to be bit-exact and describe the filters in
+// floating point, so this file uses f64 with the normalised values the
+// specification uses: output and residual are in [-1, 1], gains are
+// gain_Q16/65536 and LPC coefficients a_Q12/4096. The fixed-point parts
+// that must not drift (NLSF decoding and LPC conversion) are in
+// silk_nlsf.cst.
+//
+// Buffers: residual indices run down to -290 (maximum lag 288 plus two
+// filter taps), hence the 290-sample offset in `res`. The output history
+// is 306 samples (288 + 16 + 2) and the LPC history is 16 samples, both as
+// the specification's rewhitening step requires.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "range.cst" as rc;
+use "silk_bits.cst" as bits;
+use "silk_defs.cst" as defs;
+use "silk_tables.cst" as t;
+use "silk_tables_data.cst" as data;
+
+let is i64 as SILK_RES_OFF with imut = 290;
+
+// Recursive PVQ partition of one 16-sample shell block. `size` is the
+// current partition length and `total` the pulses in it.
+fn _silk_shell(r as *rc.OpusRange, e as *i64, base as i64,
+               size as i64, total as i64) as i64 {
+    if (total == 0) { return errno.I_OK; }
+    if (size < 1) { return errno.I_CORRUPT; }
+    if (size == 1) {
+        if (total > 16) { return errno.I_CORRUPT; }
+        e[base] = total;
+        return errno.I_OK;
+    }
+    if (total < 1 || total > 16) { return errno.I_CORRUPT; }
+
+    let is *u8 as blob with mut = data.SILK_TBL_PULSE_SPLIT16;
+    if (size == 8)      { blob = data.SILK_TBL_PULSE_SPLIT8; }
+    else if (size == 4) { blob = data.SILK_TBL_PULSE_SPLIT4; }
+    else if (size == 2) { blob = data.SILK_TBL_PULSE_SPLIT2; }
+    else if (size != 16) { return errno.I_CORRUPT; }
+
+    // The PDF for pulse count c has c+1 entries. The values before it hold
+    // 2, 3, ..., c entries, so its first element is (c-1)*(c+2)/2.
+    let is i64 as off = ((total - 1) * (total + 2)) / 2;
+    let is i64 as left = bits.silk_sym(r, blob, off, total + 1);
+    if (left < 0) { return left; }
+    if (left > total) { return errno.I_CORRUPT; }
+    let is i64 as right = total - left;
+    let is i64 as half = size / 2;
+
+    let is i64 as st = _silk_shell(r, e, base, half, left);
+    if (st < 0) { return st; }
+    return _silk_shell(r, e, base + half, half, right);
+}
+
+// Rate level, pulse counts, locations, LSBs and signs (sections 4.2.7.8.1
+// through 4.2.7.8.5). Fills p.exc[0 .. blocks*16) with signed magnitudes.
+fn silk_decode_pulses(r as *rc.OpusRange, p as *defs.SilkParams,
+                      frame_len as i64) as i64 {
+    if (frame_len <= 0 || frame_len > defs.SILK_FRAME_SAMPLES) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as blocks = (frame_len + 15) / 16;
+    if (blocks < 1 || blocks > t.SILK_SHELL_BLOCKS_MAX) {
+        return errno.I_BADPARAM;
+    }
+
+    let is *u8 as rate_pdf with mut = data.SILK_TBL_EXC_RATE_INACTIVE;
+    if (p.signal_type == t.SILK_SIG_VOICED) {
+        rate_pdf = data.SILK_TBL_EXC_RATE_VOICED;
+    }
+    let is i64 as rate = bits.silk_sym(r, rate_pdf, 0, t.SILK_EXC_RATE_N);
+    if (rate < 0) { return rate; }
+    if (rate > 8) { return errno.I_CORRUPT; }
+
+    let is [20]i64 as count;
+    let is [20]i64 as lsbs;
+    let is i64 as b with mut = 0;
+    while (b < blocks) {
+        lsbs[b] = 0;
+        let is i64 as c = bits.silk_sym(r, data.SILK_TBL_PULSE_COUNT,
+                                        rate * t.SILK_PULSE_COUNT_N,
+                                        t.SILK_PULSE_COUNT_N);
+        if (c < 0) { return c; }
+        let is i64 as v with mut = c;
+        while (v == 17) {
+            lsbs[b] = lsbs[b] + 1;
+            if (lsbs[b] > 10) { return errno.I_CORRUPT; }
+            let is i64 as lev with mut = 9;
+            if (lsbs[b] == 10) { lev = 10; }
+            v = bits.silk_sym(r, data.SILK_TBL_PULSE_COUNT,
+                              lev * t.SILK_PULSE_COUNT_N,
+                              t.SILK_PULSE_COUNT_N);
+            if (v < 0) { return v; }
+        }
+        if (v < 0 || v > 16) { return errno.I_CORRUPT; }
+        count[b] = v;
+        b = b + 1;
+    }
+
+    // Locations. The block is zeroed first because a zero-pulse partition
+    // codes no split and must leave its samples at zero.
+    let is i64 as i with mut = 0;
+    while (i < blocks * 16) {
+        p.exc[i] = 0;
+        i = i + 1;
+    }
+    b = 0;
+    while (b < blocks) {
+        if (count[b] > 0) {
+            let is i64 as st = _silk_shell(r, &p.exc[0], b * 16, 16, count[b]);
+            if (st < 0) { return st; }
+        }
+        b = b + 1;
+    }
+
+    // LSBs: all of a block's coefficients before the next block, including
+    // the eight extra samples of a 10 ms MB frame (parsed and ignored).
+    b = 0;
+    while (b < blocks) {
+        if (lsbs[b] > 0) {
+            let is i64 as k with mut = 0;
+            while (k < 16) {
+                let is i64 as v = p.exc[b * 16 + k];
+                let is i64 as j with mut = 0;
+                let is i64 as mag with mut = v;
+                while (j < lsbs[b]) {
+                    let is i64 as bit = bits.silk_sym(r, data.SILK_TBL_LSB, 0,
+                                                      t.SILK_LSB_N);
+                    if (bit < 0) { return bit; }
+                    mag = (mag << 1) | bit;
+                    j = j + 1;
+                }
+                p.exc[b * 16 + k] = mag;
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+
+    // Signs. The PDF does not depend on the LSBs: the block's pulse count
+    // before the LSB extension selects it, capped at "6 or more".
+    b = 0;
+    while (b < blocks) {
+        let is i64 as pc = count[b];
+        let is i64 as cap with mut = pc;
+        if (cap > 6) { cap = 6; }
+        let is i64 as sign_off = ((p.signal_type * 2 + p.qoff_high) * 7 + cap) * 2;
+        let is i64 as k with mut = 0;
+        while (k < 16) {
+            let is i64 as v = p.exc[b * 16 + k];
+            if (v != 0) {
+                let is i64 as s = bits.silk_sym(r, data.SILK_TBL_SIGN,
+                                                sign_off, t.SILK_SIGN_N);
+                if (s < 0) { return s; }
+                if (s == 0) { p.exc[b * 16 + k] = 0 - v; }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+
+    return errno.I_OK;
+}
+
+// Add the quantization offset and run the LCG (section 4.2.7.8.6).
+fn silk_build_excitation(p as *defs.SilkParams, frame_len as i64) as void {
+    if (p.signal_type < 0 || p.signal_type > 2) { return; }
+    if (p.qoff_high < 0 || p.qoff_high > 1) { return; }
+    let is i64 as qoff = t.silk_tbl_i(data.SILK_TBL_QOFF,
+                                      p.signal_type * 2 + p.qoff_high);
+
+    let is i64 as seed with mut = p.seed & 0xFFFFFFFF;
+    let is i64 as i with mut = 0;
+    while (i < frame_len) {
+        let is i64 as raw = p.exc[i];
+        let is i64 as e0 = (raw << 8);
+        let is i64 as e1 with mut = e0;
+        if (raw > 0) { e1 = e1 - 20; }
+        else if (raw < 0) { e1 = e1 + 20; }
+        e1 = e1 + qoff;
+
+        seed = (196314165 * seed + 907633515) & 0xFFFFFFFF;
+        if ((seed & 0x80000000) != 0) { e1 = 0 - e1; }
+        seed = (seed + raw) & 0xFFFFFFFF;
+
+        p.exc_q23[i] = e1;
+        i = i + 1;
+    }
+}
+
+fn _clampf(x as f64, lo as f64, hi as f64) as f64 {
+    let is f64 as v with mut = x;
+    if (v < lo) { v = lo; }
+    if (v > hi) { v = hi; }
+    return v;
+}
+
+// One SILK frame through LTP (voiced) and LPC synthesis. `n` is the 5 ms
+// subframe length, `subframes` 2 or 4.
+fn silk_synthesize(ch as *defs.SilkChan, p as *defs.SilkParams,
+                   order as i64, subframes as i64, n as i64,
+                   frame_len as i64, out as *f64) as void {
+    let is [610]f64 as res;    // index i is stored at SILK_RES_OFF + i
+    let is i64 as s with mut = 0;
+
+    while (s < subframes) {
+        let is i64 as j = s * n;
+        let is i64 as which with mut = 1;
+        if (s < 2 && p.interp < 4) { which = 0; }
+        let is *i64 as a = &p.lpc_a[which][0];
+        let is f64 as gain = cast(f64, p.gain_q16[s]) / 65536.0;
+
+        if (p.voiced != 0) {
+            let is i64 as out_end with mut = 0;
+            let is f64 as scale with mut = cast(f64, p.ltp_scale) / 16384.0;
+            if (s >= 2 && p.interp < 4) {
+                out_end = 2 * n;
+                scale = 1.0;
+            }
+
+            if (s == 0 || (s == 2 && p.interp < 4)) {
+                let is i64 as i with mut = j - p.pitch[s] - 2;
+                while (i < out_end) {
+                    let is f64 as pred with mut = 0.0;
+                    let is i64 as k with mut = 0;
+                    while (k < order) {
+                        pred = pred + ch.out_hist[defs.SILK_OUT_HISTORY + i - k - 1]
+                               * (cast(f64, a[k]) / 4096.0);
+                        k = k + 1;
+                    }
+                    let is f64 as v = _clampf(
+                        ch.out_hist[defs.SILK_OUT_HISTORY + i] - pred, 0.0 - 1.0, 1.0);
+                    res[SILK_RES_OFF + i] = (scale / gain) * v;
+                    i = i + 1;
+                }
+                i = out_end;
+                while (i < j) {
+                    let is f64 as pred with mut = 0.0;
+                    let is i64 as k with mut = 0;
+                    while (k < order) {
+                        pred = pred + ch.lpc_hist[defs.SILK_LPC_HISTORY + i - k - 1]
+                               * (cast(f64, a[k]) / 4096.0);
+                        k = k + 1;
+                    }
+                    res[SILK_RES_OFF + i] =
+                        (ch.lpc_hist[defs.SILK_LPC_HISTORY + i] - pred) / gain;
+                    i = i + 1;
+                }
+            }
+
+            let is i64 as i2 with mut = j;
+            while (i2 < j + n) {
+                let is f64 as sum with mut = cast(f64, p.exc_q23[i2]) / 8388608.0;
+                let is i64 as k with mut = 0;
+                while (k < t.SILK_LTP_ORDER) {
+                    sum = sum + res[SILK_RES_OFF + i2 - p.pitch[s] + 2 - k]
+                          * (cast(f64, p.ltp_taps[s][k]) / 128.0);
+                    k = k + 1;
+                }
+                res[SILK_RES_OFF + i2] = sum;
+                i2 = i2 + 1;
+            }
+        } else {
+            let is i64 as i3 with mut = j;
+            while (i3 < j + n) {
+                res[SILK_RES_OFF + i3] = cast(f64, p.exc_q23[i3]) / 8388608.0;
+                i3 = i3 + 1;
+            }
+        }
+
+        let is i64 as i4 with mut = j;
+        while (i4 < j + n) {
+            let is f64 as sum with mut = gain * res[SILK_RES_OFF + i4];
+            let is i64 as k with mut = 0;
+            while (k < order) {
+                sum = sum + ch.lpc_hist[defs.SILK_LPC_HISTORY + i4 - k - 1]
+                      * (cast(f64, a[k]) / 4096.0);
+                k = k + 1;
+            }
+            ch.lpc_hist[defs.SILK_LPC_HISTORY + i4] = sum;
+            let is f64 as o = _clampf(sum, 0.0 - 1.0, 1.0);
+            ch.out_hist[defs.SILK_OUT_HISTORY + i4] = o;
+            out[i4] = o;
+            i4 = i4 + 1;
+        }
+
+        s = s + 1;
+    }
+
+    // Keep the last 306 outputs and 16 unclamped LPC samples.
+    let is i64 as i5 with mut = 0;
+    while (i5 < defs.SILK_OUT_HISTORY) {
+        ch.out_hist[i5] = ch.out_hist[frame_len + i5];
+        i5 = i5 + 1;
+    }
+    i5 = 0;
+    while (i5 < defs.SILK_LPC_HISTORY) {
+        ch.lpc_hist[i5] = ch.lpc_hist[frame_len + i5];
+        i5 = i5 + 1;
+    }
+}
