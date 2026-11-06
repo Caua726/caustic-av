@@ -156,19 +156,19 @@ fn _silk_parse_frame(r as *rc.OpusRange, p as *defs.SilkParams,
 
     // Frame type jointly codes signal type and quantization offset type.
     if (active != 0) {
-        let is i64 as type = bits.silk_sym(r, data.SILK_TBL_FRAME_ACTIVE, 0,
+        let is i64 as ftype = bits.silk_sym(r, data.SILK_TBL_FRAME_ACTIVE, 0,
                                            t.SILK_FRAME_TYPE_N);
-        if (type < 0) { return type; }
-        if (type < 2 || type > 5) { return errno.I_CORRUPT; }
-        p.signal_type = type >> 1;
-        p.qoff_high = type & 1;
+        if (ftype < 0) { return ftype; }
+        if (ftype < 2 || ftype > 5) { return errno.I_CORRUPT; }
+        p.signal_type = ftype >> 1;
+        p.qoff_high = ftype & 1;
     } else {
-        let is i64 as type = bits.silk_sym(r, data.SILK_TBL_FRAME_INACTIVE, 0,
+        let is i64 as ftype = bits.silk_sym(r, data.SILK_TBL_FRAME_INACTIVE, 0,
                                            t.SILK_FRAME_TYPE_N);
-        if (type < 0) { return type; }
-        if (type > 1) { return errno.I_CORRUPT; }
+        if (ftype < 0) { return ftype; }
+        if (ftype > 1) { return errno.I_CORRUPT; }
         p.signal_type = t.SILK_SIG_INACTIVE;
-        p.qoff_high = type;
+        p.qoff_high = ftype;
     }
     p.voiced = 0;
     if (p.signal_type == t.SILK_SIG_VOICED) { p.voiced = 1; }
