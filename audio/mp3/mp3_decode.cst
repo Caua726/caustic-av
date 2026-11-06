@@ -92,7 +92,9 @@ fn _abs64(a as i64) as i64 {
 // ── initialisation ─────────────────────────────────────────────────
 
 fn _init_pan(m as *Mp3Decode) as void {
-    // ISO 2.4.3.4 Table 3-B.9 intensity positions 0..6: kl, kr.
+    // MPEG-1 (ID==1) intensity positions 0..6: with r = tan(pos*pi/12),
+    // kl = r/(1+r) and kr = 1/(1+r), the formula in 4.3.11.2. These are
+    // the seven legal is_pos pairs (7 means "not intensity coded").
     m.pan[0] = 0.0;            m.pan[1] = 1.0;
     m.pan[2] = 0.21132487;     m.pan[3] = 0.78867513;
     m.pan[4] = 0.36602540;     m.pan[5] = 0.63397460;
@@ -775,7 +777,13 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
             if (w < 0 || pos + w > 576) { return errno.I_CORRUPT; }
             let is i64 as use_int with mut = 0;
             if (ins != 0 && sfb > max_band) { use_int = 1; }
-            let is i64 as ispos = m.scfl[1 * 22 + sfb];
+            // Band 21 is the tail above the last transmitted scalefactor
+            // and carries no is_pos of its own. FFmpeg reuses the previous
+            // band's position (k = (i == 21) ? 20 : i); minimp3 inherits it
+            // unless the band below carries data, then uses its default.
+            // See mp3_decode.md for the divergence.
+            let is i64 as ispos with mut = m.scfl[1 * 22 + sfb];
+            if (sfb == 21) { ispos = m.scfl[1 * 22 + 20]; }
             if (use_int != 0 && _illegal_pos(ispos, mpeg1) == 0) {
                 let is f64 as kl with mut = 0.0;
                 let is f64 as kr with mut = 0.0;
@@ -847,7 +855,11 @@ fn _stereo(m as *Mp3Decode, f as *base.Mp3Frame, gr as i64, chans as i64,
             let is i64 as nz with mut = nz0;
             if (win == 1) { nz = nz1; }
             else if (win == 2) { nz = nz2; }
-            let is i64 as ispos = m.scfs[1 * 40 + sfb * 3 + win];
+            // Short band 12 is the tail above the last transmitted short
+            // scalefactor; FFmpeg reuses the previous band's position in
+            // the same window (the last short band shares band 11's k).
+            let is i64 as ispos with mut = m.scfs[1 * 40 + sfb * 3 + win];
+            if (sfb == 12) { ispos = m.scfs[1 * 40 + 11 * 3 + win]; }
             let is i64 as use_int with mut = 0;
             if (ins != 0 && sfb > nz) { use_int = 1; }
             if (use_int != 0 && _illegal_pos(ispos, mpeg1) == 0) {
