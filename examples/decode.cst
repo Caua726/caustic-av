@@ -1,0 +1,986 @@
+// =======================================================
+// caustic-av/examples/decode.cst
+//   decode [--md5] [--pcm <file>] [--threads N] <input>
+//
+// Reads one .webm/.ogg/.opus/.mp3 file, lets the hub demux and decode it, prints
+// the track list on stderr, and writes the payload on stdout:
+//
+//   video  one lowercase MD5 per displayed frame, computed over the visible
+//          I420 planes tightly packed (Y, then U, then V). This is the layout
+//          libvpx's test/md5_helper.h and FFmpeg's rawvideo encoder hash, so
+//          the values are directly comparable with the reference decoders.
+//   audio  interleaved S16LE PCM. With --pcm the samples go to that file;
+//          without it they go to stdout when the input is audio-only. A file
+//          with a video track needs --pcm to keep the two streams apart.
+//
+// The example owns every buffer. The input file is read whole (the library
+// opens no files), the decoders are heap values, and the VP9 work block,
+// pixel pool and optional worker block are sized from the hub's documented
+// contracts and released before exit. Nothing is copied out of the decoder
+// except the PCM delay buffer used for the Ogg Opus final-granule trim.
+//
+// Status: WRITTEN, NOT VERIFIED. See examples/decode.md for the assumptions
+// (stage 8 MP3, stage 9 threads) and the reference commands not yet run.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/mem.cst" only bins, core as mem;
+use "../caustic_av.cst" as av;
+use "md5.cst" as md5;
+
+// The largest audio block any decoder here produces: 120 ms of stereo at
+// 48 kHz, the same bound decode.DECODE_PCM_VALUES uses. Kept local so the
+// example can hold one block while it waits for the next packet.
+let is i64 as PCM_BYTES with imut = 23040;
+
+// demux.DEMUX_MAX_TRACKS.
+let is i64 as MAX_TRACKS with imut = 64;
+
+// VP9 pool buffers (vp9.VP9_POOL_BUFFERS).
+let is i64 as VP9_BUFFERS with imut = 9;
+
+// Per-video-track caller memory. The decoder owns views into these blocks; we
+// keep the pointers so they can be freed after decode_close has dropped the
+// views.
+struct Vp9Mem {
+    work as *u8;
+    work_cap as i64;
+    bufs as [9]*u8;
+    caps as [9]i64;
+    count as i64;
+    thr as *u8;
+    thr_cap as i64;
+    workers as i64;
+}
+
+// One run. Everything that is allocated is tracked here so the single defer
+// in _run releases it on every exit path.
+struct Session {
+    heap as mem.Bins;
+    heap_ready as i64;
+
+    data as *u8;
+    data_len as i64;
+
+    demux as av.demux.Demux;
+
+    decs as [64]*av.decode.Decoder;
+    dec_state as [64]i64;     // 0 unseen, 1 open, 2 unsupported, 3 failed
+    vmem as [64]*Vp9Mem;
+
+    pcm_path as *u8;
+    pcm_fd as i64;
+    pcm_owned as i64;
+
+    sink_track as i64;
+    sink_rate as i64;
+    sink_channels as i64;
+    sink_pre_skip as i64;
+    sink_ogg_opus as i64;
+    sink_last_pts as i64;
+    sink_last_pts_valid as i64;
+    sink_total as i64;
+    sink_written as i64;
+    sink_pending_count as i64;
+    sink_pending_channels as i64;
+    sink_pending_rate as i64;
+    sink_pending_valid as i64;
+    sink_pending as [11520]i16;
+
+    known_tracks as i64;
+    video_tracks as i64;
+    audio_tracks as i64;
+    has_video as i64;
+
+    threads as i64;
+    decoded_tracks as i64;
+    video_frames as [64]i64;
+    audio_samples as [64]i64;
+}
+
+// ── Diagnostics ─────────────────────────────────────────────────────
+
+fn _err_status(what as *u8, code as i64) as void {
+    io.write_str(io.STDERR, "decode: ");
+    io.write_str(io.STDERR, what);
+    io.write_str(io.STDERR, ": ");
+    io.write_str(io.STDERR, av.av_error_name(code));
+    io.write_str(io.STDERR, " (");
+    io.write_int(io.STDERR, code);
+    io.write_str(io.STDERR, ")\n");
+}
+
+fn _err_track(s as *Session, ti as i64, what as *u8, code as i64) as void {
+    io.write_str(io.STDERR, "decode: track ");
+    io.write_int(io.STDERR, ti);
+    io.write_str(io.STDERR, " ");
+    let is *av.codec.Track as t = av.av_track(&s.demux, ti);
+    if (cast(i64, t) != 0) {
+        io.write_str(io.STDERR, av.av_codec_name(t.codec));
+        io.write_str(io.STDERR, " ");
+    }
+    io.write_str(io.STDERR, what);
+    io.write_str(io.STDERR, ": ");
+    io.write_str(io.STDERR, av.av_error_name(code));
+    io.write_str(io.STDERR, " (");
+    io.write_int(io.STDERR, code);
+    io.write_str(io.STDERR, ")\n");
+}
+
+fn _usage(fd as i64) as void {
+    io.write_str(fd, "usage: decode [--md5] [--pcm <file>] [--threads N] <input>\n");
+    io.write_str(fd, "  input       .webm/.mkv, .ogg, .opus or .mp3; detected by content\n");
+    io.write_str(fd, "  --md5       print the I420 MD5 of every displayed video frame (default)\n");
+    io.write_str(fd, "  --pcm FILE  write decoded interleaved S16LE PCM to FILE\n");
+    io.write_str(fd, "  --threads N VP9 tile threads, 1..16 (default 1); stage 9 API\n");
+}
+
+fn _container_name(kind as i64) as *u8 {
+    if (kind == av.demux.DEMUX_MATROSKA) { return "matroska/webm"; }
+    if (kind == av.demux.DEMUX_OGG)      { return "ogg"; }
+    if (kind == av.demux.DEMUX_MP3)      { return "mp3"; }
+    return "none";
+}
+
+fn _print_track(s as *Session, ti as i64, t as *av.codec.Track) as void {
+    io.write_str(io.STDERR, "track ");
+    io.write_int(io.STDERR, ti);
+    io.write_str(io.STDERR, ": ");
+    io.write_str(io.STDERR, av.av_kind_name(t.kind));
+    io.write_str(io.STDERR, " ");
+    io.write_str(io.STDERR, av.av_codec_name(t.codec));
+
+    if (t.codec_id_len > 0 && cast(i64, t.codec_id) != 0) {
+        io.write_str(io.STDERR, " codec_id=");
+        io.write_all_fd(io.STDERR, t.codec_id, t.codec_id_len);
+    }
+    if (t.width > 0 && t.height > 0) {
+        io.write_str(io.STDERR, " ");
+        io.write_int(io.STDERR, t.width);
+        io.write_str(io.STDERR, "x");
+        io.write_int(io.STDERR, t.height);
+    }
+    if (t.rate > 0) {
+        io.write_str(io.STDERR, " ");
+        io.write_int(io.STDERR, t.rate);
+        io.write_str(io.STDERR, " Hz");
+    }
+    if (t.channels > 0) {
+        io.write_str(io.STDERR, " ");
+        io.write_int(io.STDERR, t.channels);
+        io.write_str(io.STDERR, " ch");
+    }
+    if (t.pre_skip > 0) {
+        io.write_str(io.STDERR, " pre_skip=");
+        io.write_int(io.STDERR, t.pre_skip);
+    }
+    if (t.timebase_num > 0 && t.timebase_den > 0) {
+        io.write_str(io.STDERR, " timebase=");
+        io.write_int(io.STDERR, t.timebase_num);
+        io.write_str(io.STDERR, "/");
+        io.write_int(io.STDERR, t.timebase_den);
+    }
+    io.write_str(io.STDERR, "\n");
+}
+
+// Publish tracks the demuxer has discovered since the last call. Ogg can add a
+// serial mid-stream; the others are fixed at open. Returns a negative code for
+// a combination this example cannot route.
+fn _sync_tracks(s as *Session) as i64 {
+    let is i64 as n = av.av_track_count(&s.demux);
+    while (s.known_tracks < n) {
+        let is i64 as ti = s.known_tracks;
+        let is *av.codec.Track as t = av.av_track(&s.demux, ti);
+        if (cast(i64, t) == 0) { return av.errno.I_CORRUPT; }
+        _print_track(s, ti, t);
+
+        if (t.kind == av.codec.TRACK_VIDEO) {
+            s.video_tracks = s.video_tracks + 1;
+            if (s.sink_track >= 0 && s.pcm_owned == 0) {
+                io.write_str(io.STDERR,
+                    "decode: a video track appeared after PCM output started; "
+                    "use --pcm\n");
+                return av.errno.I_UNSUPPORTED;
+            }
+            s.has_video = 1;
+        } else if (t.kind == av.codec.TRACK_AUDIO) {
+            s.audio_tracks = s.audio_tracks + 1;
+            if (s.sink_track >= 0) {
+                io.write_str(io.STDERR,
+                    "decode: a second audio track appeared; the PCM sink "
+                    "carries one track\n");
+                return av.errno.I_UNSUPPORTED;
+            }
+        }
+        s.known_tracks = s.known_tracks + 1;
+    }
+    return av.errno.I_OK;
+}
+
+// ── VP9 caller memory ───────────────────────────────────────────────
+
+fn _vp9_mem_free(s as *Session, vm as *Vp9Mem) as void {
+    if (cast(i64, vm) == 0) { return; }
+    if (cast(i64, vm.work) != 0) { mem.bins.bins_free(&s.heap, vm.work); }
+    if (cast(i64, vm.thr) != 0)  { mem.bins.bins_free(&s.heap, vm.thr); }
+    let is i64 as i with mut = 0;
+    while (i < vm.count) {
+        if (cast(i64, vm.bufs[i]) != 0) {
+            mem.bins.bins_free(&s.heap, vm.bufs[i]);
+        }
+        i = i + 1;
+    }
+    vm.work = cast(*u8, 0);
+    vm.work_cap = 0;
+    vm.thr = cast(*u8, 0);
+    vm.thr_cap = 0;
+    vm.count = 0;
+    vm.workers = 0;
+}
+
+// Bind the persistent work block, nine pixel buffers and, when requested, the
+// stage 9 worker block. All sizes come from the hub, never from packet data.
+fn _vp9_mem_open(s as *Session, ti as i64,
+                 t as *av.codec.Track) as i64 {
+    let is *av.decode.Decoder as dec = s.decs[ti];
+    let is *Vp9Mem as vm = s.vmem[ti];
+    if (cast(i64, dec) == 0 || cast(i64, vm) == 0) {
+        return av.errno.I_BADPARAM;
+    }
+    if (t.width <= 0 || t.height <= 0) {
+        io.write_str(io.STDERR,
+            "decode: VP9 track has no dimensions in the container\n");
+        return av.errno.I_DIMS;
+    }
+
+    let is i64 as need = av.decode.decode_vp9_work_size(t.width, t.height);
+    if (need <= 0) { return need; }
+    let is *u8 as work = mem.bins.bins_alloc(&s.heap, need);
+    if (cast(i64, work) == 0) { return av.errno.I_OOM; }
+    let is i64 as r = av.decode.decode_vp9_bind(dec, work, need);
+    if (r < 0) {
+        mem.bins.bins_free(&s.heap, work);
+        return r;
+    }
+    vm.work = work;
+    vm.work_cap = need;
+
+    let is i64 as fsz = av.decode.decode_vp9_frame_size(t.width, t.height);
+    if (fsz <= 0) { return fsz; }
+    let is i64 as i with mut = 0;
+    while (i < VP9_BUFFERS) {
+        let is *u8 as buf = mem.bins.bins_alloc(&s.heap, fsz);
+        if (cast(i64, buf) == 0) { return av.errno.I_OOM; }
+        let is i64 as ar = av.decode.decode_vp9_add_buffer(dec, buf, fsz);
+        if (ar < 0) {
+            mem.bins.bins_free(&s.heap, buf);
+            return ar;
+        }
+        vm.bufs[i] = buf;
+        vm.caps[i] = fsz;
+        vm.count = i + 1;
+        i = i + 1;
+    }
+
+    if (s.threads > 1) {
+        let is i64 as tsz = av.decode.decode_vp9_threads_work_size(
+            t.width, t.height, s.threads);
+        if (tsz < 0) { return tsz; }
+        if (tsz > 0) {
+            let is *u8 as thr = mem.bins.bins_alloc(&s.heap, tsz);
+            if (cast(i64, thr) == 0) { return av.errno.I_OOM; }
+            let is i64 as tr = av.decode.decode_vp9_bind_threads(
+                dec, thr, tsz, s.threads);
+            if (tr < 0) {
+                mem.bins.bins_free(&s.heap, thr);
+                return tr;
+            }
+            vm.thr = thr;
+            vm.thr_cap = tsz;
+            vm.workers = s.threads;
+        }
+    }
+    return av.errno.I_OK;
+}
+
+// Grow one caller block after receive returned I_NOMEM. Returns 1 when a block
+// was replaced (the packet must be decoded again), 0 when the decoder reported
+// no shortfall, or a negative code. Only blocks no reference slot names are
+// replaced, so no live pixels are overwritten.
+fn _vp9_grow(s as *Session, ti as i64) as i64 {
+    let is *av.decode.Decoder as dec = s.decs[ti];
+    let is *Vp9Mem as vm = s.vmem[ti];
+    if (cast(i64, dec) == 0 || cast(i64, vm) == 0) {
+        return av.errno.I_BADPARAM;
+    }
+
+    let is i64 as wneed = av.decode.decode_vp9_work_need(dec);
+    if (wneed < 0) { return wneed; }
+    if (wneed > 0) {
+        let is i64 as cap with mut = wneed;
+        if (cap < vm.work_cap) { cap = vm.work_cap; }
+        let is *u8 as p = mem.bins.bins_alloc(&s.heap, cap);
+        if (cast(i64, p) == 0) { return av.errno.I_OOM; }
+        let is i64 as r = av.decode.decode_vp9_bind(dec, p, cap);
+        if (r < 0) {
+            mem.bins.bins_free(&s.heap, p);
+            return r;
+        }
+        if (cast(i64, vm.work) != 0) { mem.bins.bins_free(&s.heap, vm.work); }
+        vm.work = p;
+        vm.work_cap = cap;
+        return 1;
+    }
+
+    let is i64 as fneed = av.decode.decode_vp9_frame_need(dec);
+    if (fneed < 0) { return fneed; }
+    if (fneed <= 0) { return 0; }
+
+    let is i64 as idx = av.decode.decode_vp9_free_buffer(dec);
+    if (idx < 0) { return av.errno.I_NOMEM; }
+    if (idx >= vm.count) { return av.errno.I_CORRUPT; }
+
+    let is i64 as cap with mut = fneed;
+    if (cap < vm.caps[idx]) { cap = vm.caps[idx]; }
+    let is *u8 as p = mem.bins.bins_alloc(&s.heap, cap);
+    if (cast(i64, p) == 0) { return av.errno.I_OOM; }
+    let is i64 as r = av.decode.decode_vp9_replace_buffer(dec, idx, p, cap);
+    if (r < 0) {
+        mem.bins.bins_free(&s.heap, p);
+        return r;
+    }
+    if (cast(i64, vm.bufs[idx]) != 0) {
+        mem.bins.bins_free(&s.heap, vm.bufs[idx]);
+    }
+    vm.bufs[idx] = p;
+    vm.caps[idx] = cap;
+    return 1;
+}
+
+// ── Output ──────────────────────────────────────────────────────────
+
+// Feed the visible I420 planes, row by row, without the coded stride padding:
+// libvpx's MD5 helper hashes d_w bytes per luma row and (d_w+1)/2 per chroma
+// row; FFmpeg's rawvideo encoder reaches the same bytes with align=1.
+fn _md5_i420(h as *md5.Md5, f as *av.frame.Frame) as i64 {
+    if (f.width <= 0 || f.height <= 0) { return av.errno.I_CORRUPT; }
+    if (cast(i64, f.y) == 0 || cast(i64, f.u) == 0 || cast(i64, f.v) == 0) {
+        return av.errno.I_CORRUPT;
+    }
+    let is i64 as cw = (f.width + 1) / 2;
+    let is i64 as ch = (f.height + 1) / 2;
+    if (f.stride_y < f.width || f.stride_u < cw || f.stride_v < cw) {
+        return av.errno.I_CORRUPT;
+    }
+
+    let is i64 as y with mut = 0;
+    while (y < f.height) {
+        md5.md5_update(h, f.y + y * f.stride_y, f.width);
+        y = y + 1;
+    }
+    y = 0;
+    while (y < ch) {
+        md5.md5_update(h, f.u + y * f.stride_u, cw);
+        md5.md5_update(h, f.v + y * f.stride_v, cw);
+        y = y + 1;
+    }
+    return av.errno.I_OK;
+}
+
+fn _emit_video(s as *Session, ti as i64, out as *av.decode.Output) as i64 {
+    let is md5.Md5 as h;
+    md5.md5_init(&h);
+    let is i64 as r = _md5_i420(&h, &out.video);
+    if (r < 0) { return r; }
+
+    let is [16]u8 as digest;
+    let is [33]u8 as hex;
+    md5.md5_final(&h, &digest[0]);
+    md5.md5_hex(&digest[0], &hex[0]);
+
+    let is i64 as w with mut = io.write_all_fd(io.STDOUT, &hex[0], 32);
+    if (w != 32) { return av.errno.I_EOF; }
+    w = io.write_all_fd(io.STDOUT, "\n", 1);
+    if (w != 1) { return av.errno.I_EOF; }
+
+    s.video_frames[ti] = s.video_frames[ti] + 1;
+    return av.errno.I_OK;
+}
+
+fn _sink_flush(s as *Session, count as i64) as i64 {
+    if (count <= 0) { return av.errno.I_OK; }
+    if (s.pcm_fd < 0) { return av.errno.I_BADPARAM; }
+    let is i64 as bytes = count * s.sink_pending_channels * 2;
+    let is i64 as w = io.write_all_fd(
+        s.pcm_fd, cast(*u8, &s.sink_pending[0]), bytes);
+    if (w != bytes) { return av.errno.I_EOF; }
+    s.sink_written = s.sink_written + count;
+    return av.errno.I_OK;
+}
+
+// Copy the block into the one-block delay buffer. The previous block is
+// written first; the final block waits for _sink_finish so an Ogg Opus end
+// trim can shorten it without seeking in the output file.
+fn _emit_audio(s as *Session, ti as i64, out as *av.decode.Output) as i64 {
+    let is i64 as count = out.audio.count;
+    if (count < 0) { return av.errno.I_CORRUPT; }
+    if (count == 0) { return av.errno.I_OK; }
+    s.audio_samples[ti] = s.audio_samples[ti] + count;
+
+    if (s.sink_track != ti) { return av.errno.I_OK; }
+
+    if (out.audio.rate != s.sink_rate
+        || out.audio.channels != s.sink_channels) {
+        io.write_str(io.STDERR,
+            "decode: audio format changed inside one track\n");
+        return av.errno.I_UNSUPPORTED;
+    }
+    let is i64 as bytes = av.samples.samples_size(
+        av.samples.SAMPLE_FMT_S16, out.audio.channels, count);
+    if (bytes < 0) { return bytes; }
+    if (bytes > PCM_BYTES) {
+        io.write_str(io.STDERR, "decode: audio block is too large to delay\n");
+        return av.errno.I_DIMS;
+    }
+    if (cast(i64, out.audio.data) == 0) { return av.errno.I_CORRUPT; }
+
+    if (s.sink_pending_valid != 0) {
+        let is i64 as r = _sink_flush(s, s.sink_pending_count);
+        if (r < 0) { return r; }
+    }
+    mem.memcpy(cast(*u8, &s.sink_pending[0]), out.audio.data, bytes);
+    s.sink_pending_count = count;
+    s.sink_pending_channels = out.audio.channels;
+    s.sink_pending_rate = out.audio.rate;
+    s.sink_pending_valid = 1;
+    s.sink_total = s.sink_total + count;
+    return av.errno.I_OK;
+}
+
+// Open the one PCM sink. A file with --pcm gets its own descriptor; an
+// audio-only file may write to stdout. A file with video needs --pcm so the
+// MD5 lines and the samples do not share a stream.
+fn _sink_start(s as *Session, ti as i64, t as *av.codec.Track,
+               dec as *av.decode.Decoder) as i64 {
+    if (s.sink_track >= 0) { return av.errno.I_BADPARAM; }
+
+    let is i64 as want with mut = 0;
+    if (cast(i64, s.pcm_path) != 0) { want = 1; }
+    if (s.has_video == 0) { want = 1; }
+    if (want != 0 && s.audio_tracks > 1) {
+        io.write_str(io.STDERR,
+            "decode: more than one audio track; the PCM sink carries one\n");
+        return av.errno.I_UNSUPPORTED;
+    }
+    if (want == 0) { return av.errno.I_OK; }   // summary only: video present
+
+    if (cast(i64, s.pcm_path) != 0) {
+        let is i64 as fd = io._open_write(s.pcm_path);
+        if (fd < 0) {
+            io.write_str(io.STDERR, "decode: cannot open --pcm output: ");
+            io.write_str(io.STDERR, s.pcm_path);
+            io.write_str(io.STDERR, "\n");
+            return av.errno.I_BADPARAM;
+        }
+        s.pcm_fd = fd;
+        s.pcm_owned = 1;
+    } else {
+        s.pcm_fd = io.STDOUT;
+        s.pcm_owned = 0;
+    }
+
+    s.sink_track = ti;
+    s.sink_rate = av.decode.decode_rate(dec);
+    s.sink_channels = av.decode.decode_channels(dec);
+    s.sink_pre_skip = av.decode.decode_pre_skip(dec);
+    s.sink_ogg_opus = 0;
+    if (av.decode.decode_codec(dec) == av.codec.CODEC_OPUS
+        && t.timebase_num == 1 && t.timebase_den == 48000) {
+        s.sink_ogg_opus = 1;
+    }
+    s.sink_last_pts = 0;
+    s.sink_last_pts_valid = 0;
+    s.sink_total = 0;
+    s.sink_written = 0;
+    s.sink_pending_valid = 0;
+    s.sink_pending_count = 0;
+    s.sink_pending_channels = s.sink_channels;
+    s.sink_pending_rate = s.sink_rate;
+    return av.errno.I_OK;
+}
+
+// RFC 7845 4.4: the final page granule minus pre-skip is the PCM sample
+// position to keep. The discarded tail cannot exceed the last packet, so it
+// fits in the one delayed block. A granule larger than the decoded total is a
+// stream that started above zero (RFC 7845 4.5); then there is nothing to
+// trim and every decoded sample is kept.
+fn _sink_finish(s as *Session) as i64 {
+    if (s.sink_track < 0 || s.sink_pending_valid == 0) {
+        return av.errno.I_OK;
+    }
+    let is i64 as count = s.sink_pending_count;
+    let is i64 as keep with mut = count;
+
+    if (s.sink_ogg_opus != 0 && s.sink_last_pts_valid != 0
+        && s.sink_last_pts >= 0) {
+        let is i64 as target = s.sink_last_pts - s.sink_pre_skip;
+        if (target < 0) {
+            io.write_str(io.STDERR,
+                "decode: final Ogg Opus granule is before the pre-skip\n");
+            return av.errno.I_CORRUPT;
+        }
+        let is i64 as excess = s.sink_total - target;
+        if (excess > 0) {
+            if (excess > count) {
+                io.write_str(io.STDERR,
+                    "decode: Ogg Opus end trim spans more than the final "
+                    "packet\n");
+                return av.errno.I_UNSUPPORTED;
+            }
+            keep = count - excess;
+        }
+    }
+
+    let is i64 as r = _sink_flush(s, keep);
+    if (r < 0) { return r; }
+    s.sink_pending_valid = 0;
+    return av.errno.I_OK;
+}
+
+// ── Decoder setup and packet loop ───────────────────────────────────
+
+fn _free_decoder(s as *Session, ti as i64) as void {
+    let is *av.decode.Decoder as dec = s.decs[ti];
+    if (cast(i64, dec) != 0) {
+        av.decode.decode_close(dec);
+        if (cast(i64, s.vmem[ti]) != 0) {
+            _vp9_mem_free(s, s.vmem[ti]);
+            mem.bins.bins_free(&s.heap, cast(*u8, s.vmem[ti]));
+        }
+        mem.bins.bins_free(&s.heap, cast(*u8, dec));
+        s.decs[ti] = cast(*av.decode.Decoder, 0);
+        s.vmem[ti] = cast(*Vp9Mem, 0);
+    }
+}
+
+// Open a decoder the first time a packet names its track. Unsupported tracks
+// stay in the list but are not decoded; a malformed codec private block or an
+// initialisation failure is fatal.
+fn _ensure_decoder(s as *Session, ti as i64) as i64 {
+    if (s.dec_state[ti] != 0) { return av.errno.I_OK; }
+
+    let is *av.codec.Track as t = av.av_track(&s.demux, ti);
+    if (cast(i64, t) == 0) { return av.errno.I_CORRUPT; }
+
+    if (t.kind != av.codec.TRACK_VIDEO && t.kind != av.codec.TRACK_AUDIO) {
+        io.write_str(io.STDERR, "decode: track ");
+        io.write_int(io.STDERR, ti);
+        io.write_str(io.STDERR, " is not audio or video; skipped\n");
+        s.dec_state[ti] = 2;
+        return av.errno.I_OK;
+    }
+
+    let is *av.decode.Decoder as dec = cast(*av.decode.Decoder,
+        mem.bins.bins_alloc(&s.heap, sizeof(av.decode.Decoder)));
+    if (cast(i64, dec) == 0) { return av.errno.I_OOM; }
+    mem.memzero(cast(*u8, dec), sizeof(av.decode.Decoder));
+    s.decs[ti] = dec;
+
+    let is i64 as r with mut = av.av_decode_open(dec, t);
+    if (r < 0) {
+        if (r == av.errno.I_UNSUPPORTED) {
+            io.write_str(io.STDERR, "decode: track ");
+            io.write_int(io.STDERR, ti);
+            io.write_str(io.STDERR, " (");
+            io.write_str(io.STDERR, av.av_codec_name(t.codec));
+            io.write_str(io.STDERR, ") is not decodable by this build\n");
+            _free_decoder(s, ti);
+            s.dec_state[ti] = 2;
+            return av.errno.I_OK;
+        }
+        _err_track(s, ti, "decoder open", r);
+        s.dec_state[ti] = 3;
+        return r;
+    }
+
+    s.dec_state[ti] = 1;
+
+    if (t.kind == av.codec.TRACK_VIDEO) {
+        let is *Vp9Mem as vm = cast(*Vp9Mem,
+            mem.bins.bins_alloc(&s.heap, sizeof(Vp9Mem)));
+        if (cast(i64, vm) == 0) { return av.errno.I_OOM; }
+        mem.memzero(cast(*u8, vm), sizeof(Vp9Mem));
+        s.vmem[ti] = vm;
+        r = _vp9_mem_open(s, ti, t);
+        if (r < 0) {
+            _err_track(s, ti, "VP9 memory setup", r);
+            s.dec_state[ti] = 3;
+            return r;
+        }
+    } else {
+        r = _sink_start(s, ti, t, dec);
+        if (r < 0) {
+            s.dec_state[ti] = 3;
+            return r;
+        }
+    }
+
+    s.decoded_tracks = s.decoded_tracks + 1;
+    return av.errno.I_OK;
+}
+
+// Send one packet and drain it. A VP9 I_NOMEM is recoverable: the hub exposes
+// the missing size, the block is replaced between packets, and the same packet
+// is sent again. The retry is bounded so a decoder that keeps asking for a
+// larger block cannot spin.
+fn _decode_packet(s as *Session, ti as i64,
+                  pkt as *av.packet.Packet) as i64 {
+    let is *av.decode.Decoder as dec = s.decs[ti];
+    if (cast(i64, dec) == 0) { return av.errno.I_BADPARAM; }
+
+    let is i64 as retries with mut = 0;
+    let is i64 as packet_done with mut = 0;
+    while (packet_done == 0) {
+        let is i64 as sr = av.av_decode_send(dec, pkt);
+        if (sr < 0) {
+            _err_track(s, ti, "decode send", sr);
+            return sr;
+        }
+
+        let is i64 as resend with mut = 0;
+        let is i64 as drained with mut = 0;
+        while (drained == 0) {
+            let is av.decode.Output as out;
+            let is i64 as r = av.av_decode_receive(dec, &out);
+            if (r == 0) {
+                drained = 1;
+            } else if (r < 0) {
+                if (s.dec_state[ti] == 1
+                    && av.decode.decode_kind(dec) == av.codec.TRACK_VIDEO
+                    && r == av.errno.I_NOMEM) {
+                    let is i64 as g = _vp9_grow(s, ti);
+                    if (g < 0) {
+                        _err_track(s, ti, "VP9 buffer growth", g);
+                        return g;
+                    }
+                    if (g == 0) {
+                        _err_track(s, ti, "VP9 buffer", r);
+                        return r;
+                    }
+                    retries = retries + 1;
+                    if (retries > 32) {
+                        _err_track(s, ti, "VP9 buffer growth", av.errno.I_DIMS);
+                        return av.errno.I_DIMS;
+                    }
+                    resend = 1;
+                    drained = 1;
+                } else {
+                    _err_track(s, ti, "decode", r);
+                    return r;
+                }
+            } else {
+                let is i64 as er with mut = av.errno.I_OK;
+                if (out.kind == av.decode.OUTPUT_VIDEO) {
+                    er = _emit_video(s, ti, &out);
+                } else if (out.kind == av.decode.OUTPUT_AUDIO) {
+                    er = _emit_audio(s, ti, &out);
+                } else {
+                    er = av.errno.I_CORRUPT;
+                }
+                if (er < 0) {
+                    _err_track(s, ti, "output", er);
+                    return er;
+                }
+            }
+        }
+
+        if (resend == 0) { packet_done = 1; }
+    }
+    return av.errno.I_OK;
+}
+
+fn _print_summary(s as *Session) as void {
+    let is i64 as i with mut = 0;
+    while (i < s.known_tracks) {
+        let is *av.codec.Track as t = av.av_track(&s.demux, i);
+        if (cast(i64, t) != 0 && s.dec_state[i] == 1) {
+            io.write_str(io.STDERR, "decoded track ");
+            io.write_int(io.STDERR, i);
+            io.write_str(io.STDERR, ": ");
+            io.write_str(io.STDERR, av.av_codec_name(t.codec));
+            if (t.kind == av.codec.TRACK_VIDEO) {
+                io.write_str(io.STDERR, " ");
+                io.write_int(io.STDERR, s.video_frames[i]);
+                io.write_str(io.STDERR, " frames");
+            } else {
+                io.write_str(io.STDERR, " ");
+                io.write_int(io.STDERR, s.audio_samples[i]);
+                io.write_str(io.STDERR, " samples/ch");
+                if (t.rate > 0) {
+                    io.write_str(io.STDERR, " at ");
+                    io.write_int(io.STDERR, t.rate);
+                    io.write_str(io.STDERR, " Hz");
+                }
+            }
+            io.write_str(io.STDERR, "\n");
+        }
+        i = i + 1;
+    }
+    if (s.sink_track >= 0) {
+        io.write_str(io.STDERR, "pcm: ");
+        io.write_int(io.STDERR, s.sink_written);
+        io.write_str(io.STDERR, " samples/ch written, ");
+        io.write_int(io.STDERR, s.sink_total);
+        io.write_str(io.STDERR, " decoded");
+        if (s.sink_ogg_opus != 0) {
+            io.write_str(io.STDERR, " (Ogg Opus final-granule trim checked)");
+        }
+        io.write_str(io.STDERR, "\n");
+    }
+}
+
+// ── Whole-run setup and teardown ────────────────────────────────────
+
+fn _session_free(s as *Session) as void {
+    let is i64 as i with mut = 0;
+    while (i < MAX_TRACKS) {
+        if (cast(i64, s.decs[i]) != 0) {
+            av.decode.decode_close(s.decs[i]);
+            if (cast(i64, s.vmem[i]) != 0) {
+                _vp9_mem_free(s, s.vmem[i]);
+                mem.bins.bins_free(&s.heap, cast(*u8, s.vmem[i]));
+                s.vmem[i] = cast(*Vp9Mem, 0);
+            }
+            mem.bins.bins_free(&s.heap, cast(*u8, s.decs[i]));
+            s.decs[i] = cast(*av.decode.Decoder, 0);
+        } else if (cast(i64, s.vmem[i]) != 0) {
+            _vp9_mem_free(s, s.vmem[i]);
+            mem.bins.bins_free(&s.heap, cast(*u8, s.vmem[i]));
+            s.vmem[i] = cast(*Vp9Mem, 0);
+        }
+        i = i + 1;
+    }
+
+    if (s.pcm_owned != 0 && s.pcm_fd >= 0) {
+        io._close_fd(s.pcm_fd);
+        s.pcm_fd = 0 - 1;
+        s.pcm_owned = 0;
+    }
+    if (s.heap_ready != 0) {
+        if (cast(i64, s.data) != 0) {
+            mem.bins.bins_free(&s.heap, s.data);
+            s.data = cast(*u8, 0);
+        }
+        mem.bins.bins_destroy(&s.heap);
+        s.heap_ready = 0;
+    }
+}
+
+fn _run(path as *u8, pcm_path as *u8, threads as i64) as i32 {
+    let is Session as s;
+    mem.memzero(cast(*u8, &s), sizeof(Session));
+    defer _session_free(&s);
+
+    s.heap = mem.bins.bins_new(65536);
+    s.heap_ready = 1;
+    s.pcm_fd = 0 - 1;
+    s.pcm_path = pcm_path;
+    s.sink_track = 0 - 1;
+    s.threads = threads;
+
+    let is i64 as sz = io.file_size(path);
+    if (sz < 0) {
+        io.write_str(io.STDERR, "decode: cannot stat input: ");
+        io.write_str(io.STDERR, path);
+        io.write_str(io.STDERR, "\n");
+        return 1;
+    }
+    if (sz == 0) {
+        io.write_str(io.STDERR, "decode: input is empty\n");
+        return 1;
+    }
+    // The input is one allocation. Keep it inside the positive i64 range the
+    // allocator's size arithmetic assumes.
+    if (sz > 4611686018427387904) {
+        io.write_str(io.STDERR, "decode: input is too large\n");
+        return 1;
+    }
+
+    s.data = mem.bins.bins_alloc(&s.heap, sz);
+    if (cast(i64, s.data) == 0) {
+        io.write_str(io.STDERR, "decode: out of memory for the input\n");
+        return 1;
+    }
+    s.data_len = sz;
+
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) {
+        io.write_str(io.STDERR, "decode: cannot open input: ");
+        io.write_str(io.STDERR, path);
+        io.write_str(io.STDERR, "\n");
+        return 1;
+    }
+    let is i64 as got = io.read_exact(fd, s.data, sz);
+    io._close_fd(fd);
+    if (got != sz) {
+        io.write_str(io.STDERR, "decode: short read on input\n");
+        return 1;
+    }
+
+    let is i64 as r with mut = av.av_open(&s.demux, s.data, s.data_len);
+    if (r < 0) {
+        _err_status("demux open", r);
+        return 1;
+    }
+
+    io.write_str(io.STDERR, "container: ");
+    io.write_str(io.STDERR, _container_name(av.av_kind(&s.demux)));
+    io.write_str(io.STDERR, "\n");
+
+    r = _sync_tracks(&s);
+    if (r < 0) { return 1; }
+    if (s.known_tracks == 0) {
+        io.write_str(io.STDERR, "decode: container has no tracks\n");
+        return 1;
+    }
+
+    let is av.packet.Packet as pkt;
+    while (1) {
+        r = av.av_next(&s.demux, &pkt);
+        if (r == 0) { break; }
+        if (r < 0) {
+            _err_status("demux", r);
+            return 1;
+        }
+
+        r = _sync_tracks(&s);
+        if (r < 0) { return 1; }
+
+        let is i64 as ti = cast(i64, pkt.track);
+        if (ti < 0 || ti >= MAX_TRACKS) {
+            _err_status("packet track", av.errno.I_CORRUPT);
+            return 1;
+        }
+
+        r = _ensure_decoder(&s, ti);
+        if (r < 0) { return 1; }
+        if (s.dec_state[ti] == 2) { continue; }
+
+        if (s.sink_track == ti && s.sink_ogg_opus != 0) {
+            s.sink_last_pts = pkt.pts;
+            s.sink_last_pts_valid = 1;
+        }
+
+        r = _decode_packet(&s, ti, &pkt);
+        if (r < 0) { return 1; }
+    }
+
+    r = _sink_finish(&s);
+    if (r < 0) { return 1; }
+
+    if (cast(i64, s.pcm_path) != 0 && s.sink_track < 0) {
+        io.write_str(io.STDERR,
+            "decode: --pcm was given but no audio track was decoded\n");
+        return 1;
+    }
+    if (s.decoded_tracks == 0) {
+        io.write_str(io.STDERR, "decode: no track in this file is decodable\n");
+        return 1;
+    }
+
+    _print_summary(&s);
+    return 0;
+}
+
+// ── Command line ────────────────────────────────────────────────────
+
+fn _streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (cast(i64, a[i]) != 0) {
+        if (cast(i64, a[i]) != cast(i64, b[i])) { return 0; }
+        i = i + 1;
+    }
+    if (cast(i64, b[i]) != 0) { return 0; }
+    return 1;
+}
+
+fn _parse_int(s as *u8, out as *i64) as i64 {
+    if (cast(i64, s[0]) == 0) { return 0 - 1; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (cast(i64, s[i]) != 0) {
+        let is i64 as d = cast(i64, s[i]) - 48;
+        if (d < 0 || d > 9) { return 0 - 1; }
+        if (v > 1000000) { return 0 - 1; }
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    *out = v;
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+
+    let is *u8 as path with mut = cast(*u8, 0);
+    let is *u8 as pcm with mut = cast(*u8, 0);
+    let is i64 as threads with mut = 1;
+
+    let is i64 as ai with mut = 1;
+    while (ai < env.argc()) {
+        let is *u8 as a = env.argv(ai);
+        if (_streq(a, "--help") == 1 || _streq(a, "-h") == 1) {
+            _usage(io.STDOUT);
+            return 0;
+        }
+        if (_streq(a, "--md5") == 1) {
+            ai = ai + 1;
+        } else if (_streq(a, "--pcm") == 1) {
+            if (ai + 1 >= env.argc()) {
+                _usage(io.STDERR);
+                return 2;
+            }
+            pcm = env.argv(ai + 1);
+            ai = ai + 2;
+        } else if (_streq(a, "--threads") == 1) {
+            if (ai + 1 >= env.argc()) {
+                _usage(io.STDERR);
+                return 2;
+            }
+            let is i64 as n with mut = 0;
+            if (_parse_int(env.argv(ai + 1), &n) < 0) {
+                _usage(io.STDERR);
+                return 2;
+            }
+            if (n < 1 || n > 16) {
+                io.write_str(io.STDERR,
+                    "decode: --threads must be between 1 and 16\n");
+                return 2;
+            }
+            threads = n;
+            ai = ai + 2;
+        } else {
+            if (cast(i64, a[0]) == 45) {
+                io.write_str(io.STDERR, "decode: unknown option: ");
+                io.write_str(io.STDERR, a);
+                io.write_str(io.STDERR, "\n");
+                _usage(io.STDERR);
+                return 2;
+            }
+            if (cast(i64, path) != 0) {
+                io.write_str(io.STDERR, "decode: exactly one input is allowed\n");
+                _usage(io.STDERR);
+                return 2;
+            }
+            path = a;
+            ai = ai + 1;
+        }
+    }
+
+    if (cast(i64, path) == 0) {
+        _usage(io.STDERR);
+        return 2;
+    }
+    return _run(path, pcm, threads);
+}
