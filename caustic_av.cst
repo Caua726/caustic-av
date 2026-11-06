@@ -1,0 +1,91 @@
+// =======================================================
+// caustic-av/caustic_av.cst
+// The hub: one import that names the demuxer, the decoder dispatch and the
+// shared codec/track vocabulary, plus the shortest path through them.
+//
+//   av_sniff(src, len)                 container kind by content
+//   av_open(d, src, len)               bind a demuxer
+//   av_next(d, pkt)                    next packet
+//   av_track_count(d) / av_track(d,i)  published track list
+//   av_decode_open(dec, track)         open the decoder for one track
+//   av_decode_send(dec, pkt)           arm a packet
+//   av_decode_receive(dec, out)        one video frame or PCM block
+//
+// Every wrapper returns the underlying function's i64 unchanged: 0 or a
+// positive item count for success, a negative core/errno code for failure.
+// Nothing is translated, wrapped or turned into a boolean, so a caller can
+// branch on the exact reason exactly as with the lower-level modules, and
+// errno.err_name / av_error_name print it.
+//
+// The library opens no file. av_open takes the whole file as a borrowed byte
+// range; the caller reads it. Packets and decoded frames borrow from that
+// range or from caller-supplied decoder memory, as demux.md and decode.md
+// describe.
+// =======================================================
+
+use "core/errno.cst" as errno;
+use "core/codec.cst" as codec;
+use "core/packet.cst" as packet;
+use "demux.cst" as demux;
+use "decode.cst" as decode;
+
+// Container kind from the leading bytes. See demux.demux_sniff for the table.
+fn av_sniff(src as *u8, len as i64) as i64 {
+    return demux.demux_sniff(src, len);
+}
+
+// Bind a demuxer to src[0..len) and publish the initial track list.
+fn av_open(d as *demux.Demux, src as *u8, len as i64) as i64 {
+    return demux.demux_open(d, src, len);
+}
+
+// Next packet: 1 with pkt filled, 0 at the end, negative on error.
+fn av_next(d as *demux.Demux, pkt as *packet.Packet) as i64 {
+    return demux.demux_next(d, pkt);
+}
+
+fn av_track_count(d as *demux.Demux) as i64 {
+    return demux.demux_track_count(d);
+}
+
+fn av_track(d as *demux.Demux, i as i64) as *codec.Track {
+    return demux.demux_track(d, i);
+}
+
+fn av_kind(d as *demux.Demux) as i64 {
+    return demux.demux_kind(d);
+}
+
+// Open the decoder for a published track. The track supplies the codec id,
+// codec private, pre-skip, codec delay and timebase.
+fn av_decode_open(dec as *decode.Decoder, t as *codec.Track) as i64 {
+    return decode.decode_open(dec, t);
+}
+
+// Codec-only open for a caller with raw metadata; Opus still needs its
+// OpusHead bytes.
+fn av_decode_open_codec(dec as *decode.Decoder, codec_id as i64,
+                        priv as *u8, priv_len as i64) as i64 {
+    return decode.decode_open_codec(dec, codec_id, priv, priv_len);
+}
+
+fn av_decode_send(dec as *decode.Decoder, pkt as *packet.Packet) as i64 {
+    return decode.decode_send(dec, pkt);
+}
+
+fn av_decode_receive(dec as *decode.Decoder, out as *decode.Output) as i64 {
+    return decode.decode_receive(dec, out);
+}
+
+fn av_codec_name(codec_id as i64) as *u8 {
+    return codec.codec_name(codec_id);
+}
+
+fn av_kind_name(kind as i64) as *u8 {
+    return codec.kind_name(kind);
+}
+
+// Human-readable name for a status code, from core/errno.
+fn av_error_name(status as i64) as *u8 {
+    return errno.err_name(status);
+}
