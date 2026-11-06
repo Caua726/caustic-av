@@ -42,16 +42,20 @@ fn silk_sym(r as *rc.OpusRange, blob as *u8, off as i64, n as i64) as i64 {
 }
 
 // One symbol from a uniform PDF of n entries, without a stored table.
+// A uniform symbol is coded as n equal parts of 256 (silk_uniformN_iCDF), not
+// with a total of n: the probabilities match but the range coder's rounding
+// does not, so a total of n drifts out of sync.
 fn silk_uniform(r as *rc.OpusRange, n as i64) as i64 {
-    if (n <= 0 || n > 65536) { return errno.I_BADPARAM; }
-    let is i64 as v = rc.opus_range_decode(r, n);
+    if (n <= 0 || n > 256 || (256 % n) != 0) { return errno.I_BADPARAM; }
+    let is i64 as w = 256 / n;
+    let is i64 as v = rc.opus_range_decode(r, 256);
     if (v < 0) { return v; }
-    let is i64 as u = rc.opus_range_update(r, v, v + 1, n);
+    let is i64 as sym = v / w;
+    let is i64 as u = rc.opus_range_update(r, sym * w, (sym + 1) * w, 256);
     if (u < 0) { return u; }
-    return v;
+    return sym;
 }
 
-// One binary symbol with p(0) = 1/2, the VAD and LBRR header bits.
 fn silk_bit(r as *rc.OpusRange) as i64 {
     return rc.opus_range_bit_logp(r, 1);
 }
