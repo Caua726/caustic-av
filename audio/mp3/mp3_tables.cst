@@ -59,6 +59,11 @@ let is i64 as MP3_GRANULE_LINES      with imut = 576;
 let is i64 as MP3_SHORT_GRANULE_LINES with imut = 192;
 let is i64 as MP3_SFB_LONG_COUNT     with imut = 22;
 let is i64 as MP3_SFB_SHORT_COUNT    with imut = 13;
+// The published tables carry 21 long and 12 short scalefactor bands; the
+// last width in each row above is the remaining spectrum, which has no
+// transmitted scalefactor.
+let is i64 as MP3_SFB_LONG_SCALEFAC_COUNT  with imut = 21;
+let is i64 as MP3_SFB_SHORT_SCALEFAC_COUNT with imut = 12;
 let is i64 as MP3_PRETAB_COUNT       with imut = 22;
 let is i64 as MP3_ALIAS_COUNT        with imut = 8;
 let is i64 as MP3_SYNTH_WINDOW_COUNT with imut = 512;

@@ -92,9 +92,15 @@ struct Mp3SideInfo {
 // A borrowed frame. main_data_offset is absolute and points at the first
 // byte of this frame's main data; main_data_len is the number of bytes
 // physically present in this frame after the side information.
-// reservoir_offset/reservoir_len describe the whole range the decoder may
-// read, including main_data_begin bytes from earlier frames. The range is
-// [reservoir_offset, reservoir_offset + reservoir_len).
+//
+// The bit reservoir is a logical stream, not a contiguous slice: the main
+// data of earlier frames is separated by their headers and side
+// information. reservoir_back is how many bytes of the caller's saved
+// previous main data this frame needs (the last reservoir_back bytes of
+// that stream), and reservoir_len is the total logical bytes available,
+// reservoir_back + main_data_len. main_data_begin in side is the same
+// count. The caller keeps the previous bytes; this frame supplies
+// main_data_offset/main_data_len.
 struct Mp3Frame {
     header           as Mp3Header;
     side             as Mp3SideInfo;
@@ -105,8 +111,8 @@ struct Mp3Frame {
     side_info_len    as i64;
     main_data_offset as i64;   // absolute
     main_data_len    as i64;
-    reservoir_offset as i64;   // absolute
-    reservoir_len    as i64;
+    reservoir_back   as i64;   // bytes needed from the caller's reservoir
+    reservoir_len    as i64;   // logical bytes available = back + current
 }
 
 // Parser state. The caller owns it; mp3_open clears it and nothing here
@@ -119,7 +125,7 @@ struct Mp3 {
     audio_start   as i64;   // first byte after ID3v2; junk may precede frame 0
     audio_end     as i64;   // end of audio, ID3v1 excluded
     first_frame   as i64;
-    main_data_base as i64;  // first frame's side-info end; reservoir floor
+    main_data_total as i64; // main-data bytes in all preceding frames
     frame_index   as i64;
     id3v2_bytes   as i64;
     id3v1_present as i64;
@@ -244,7 +250,7 @@ fn _mp3_clear(m as *Mp3) as void {
     m.audio_start = 0;
     m.audio_end = 0;
     m.first_frame = 0;
-    m.main_data_base = 0;
+    m.main_data_total = 0;
     m.frame_index = 0;
     m.id3v2_bytes = 0;
     m.id3v1_present = 0;
@@ -737,7 +743,7 @@ fn mp3_open(m as *Mp3, src as *u8, len as i64) as i64 {
     m.audio_end = audio_end;
     m.first_frame = first;
     m.pos = first;
-    m.main_data_base = first + h.side_info_end;
+    m.main_data_total = 0;
     m.id3v2_bytes = tag_bytes;
     m.id3v1_present = id3v1;
 
@@ -778,11 +784,12 @@ fn mp3_next(m as *Mp3, frame as *Mp3Frame) as i64 {
     // main_data_begin counts bytes; the standard's bound is in bits
     // (4088/2040 for the 9/8-bit field, and 7680 minus the frame bits).
     if (side.main_data_begin * 8 > mdb_max) { return errno.I_CORRUPT; }
+    // The backpointer indexes the logical main-data stream of earlier
+    // frames, not raw file offsets. The first frame has no earlier main
+    // data, so it must have main_data_begin 0.
+    if (side.main_data_begin > m.main_data_total) { return errno.I_CORRUPT; }
 
     let is i64 as side_end = m.pos + h.side_info_end;
-    let is i64 as reservoir = side_end - side.main_data_begin;
-    if (reservoir < m.main_data_base) { return errno.I_CORRUPT; }
-
     let is i64 as main_len = (m.pos + h.frame_len) - side_end;
     let is i64 as reservoir_len = side.main_data_begin + main_len;
 
@@ -808,11 +815,12 @@ fn mp3_next(m as *Mp3, frame as *Mp3Frame) as i64 {
     f.side_info_len = h.side_info_len;
     f.main_data_offset = side_end;
     f.main_data_len = main_len;
-    f.reservoir_offset = reservoir;
+    f.reservoir_back = side.main_data_begin;
     f.reservoir_len = reservoir_len;
 
     *frame = f;
     m.pos = m.pos + h.frame_len;
     m.frame_index = m.frame_index + 1;
+    m.main_data_total = m.main_data_total + main_len;
     return 1;
 }

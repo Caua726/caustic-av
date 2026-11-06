@@ -35,9 +35,10 @@ frame's side information; `mp3_next` does.
 information, checks the reservoir bound, and advances by the frame length.
 It does not scan past a broken frame: a sync at `m.pos` whose header is
 invalid returns the header error, and a frame whose declared length passes
-`audio_end` returns `I_EOF`. A caller that wants to resynchronise after an
-error may advance `m.pos` itself, but the parser does not silently skip a
-corrupt frame in the middle of a stream.
+`audio_end` returns `I_EOF`. The parser does not silently skip a corrupt
+frame in the middle of a stream: the caller should reopen from a new byte
+boundary rather than editing `m.pos`, because `main_data_total` would no
+longer describe the frames actually returned.
 
 Errors used here:
 
@@ -116,13 +117,25 @@ table-layer decisions, not stream-parsing decisions.
 
 ## Reservoir
 
-`Mp3Frame` reports:
+The bit reservoir is a **logical** stream: the main data of earlier frames
+is separated by their headers and side information, so a single absolute
+byte offset cannot name its start. `Mp3Frame` reports:
 
-* `main_data_offset` — first byte after this frame's side information.
+* `main_data_offset` — absolute first byte of this frame's main data
+  (after the side information).
 * `main_data_len` — bytes physically in this frame after the side
   information.
-* `reservoir_offset = main_data_offset - main_data_begin`.
-* `reservoir_len = main_data_begin + main_data_len`.
+* `reservoir_back` — how many bytes to take from the caller's saved
+  previous main-data stream (the last `reservoir_back` bytes of it); this
+  equals `side.main_data_begin`.
+* `reservoir_len = reservoir_back + main_data_len` — total logical bytes
+  available for this frame.
+
+`Mp3.main_data_total` is the cumulative main data of all frames already
+returned; the parser uses it to reject a backpointer that reaches before
+the start of the stream. Consequently the first frame must have
+`main_data_begin == 0`; a stream that starts in the middle of a reservoir
+is rejected rather than reading bytes before the supplied buffer.
 
 The parser checks the documented bound
 
@@ -133,16 +146,13 @@ main_data_begin * 8 <= max_mdb_bits
 
 `main_data_begin` counts bytes; the standard states `mdb_limit` in bits
 (4088 for MPEG-1's 9-bit field, 2040 for MPEG-2/2.5's 8-bit field), hence
-the factor of eight on the left.
+the factor of eight on the left. The sum of all `part2_3_length` values in
+a frame may not exceed `reservoir_len * 8`.
 
-and also requires `reservoir_offset >= main_data_base`, the first frame's
-side-info end. Consequently the first frame must have `main_data_begin == 0`;
-a stream that starts in the middle of a reservoir is rejected rather than
-reading bytes before the supplied buffer. The sum of all
-`part2_3_length` values in a frame may not exceed `reservoir_len * 8`.
-
-The caller owns the reservoir bytes. The parser only describes the range;
-stage 8b copies or indexes it, and handles the previous-frame history.
+The caller owns the reservoir bytes and its history buffer. Stage 8b
+copies or indexes `reservoir_back` bytes from that history plus the current
+frame's `main_data_offset/main_data_len`; the parser does not allocate a
+reservoir.
 
 ## ID3
 
@@ -195,6 +205,9 @@ No value is copied from a decoder implementation.
   that carry scalefactors; each row here has a final entry equal to
   `576 - sum(long widths)` or `192 - sum(short widths)`, the region above
   the last scalefactor band, which the specification says has factor 1.0.
+  `MP3_SFB_LONG_SCALEFAC_COUNT` (21) and
+  `MP3_SFB_SHORT_SCALEFAC_COUNT` (12) give the number of bands that
+  actually carry scalefactors.
 * Pretab: Table 23 (21 bands) plus a zero for the tail band.
 * Alias coefficients: Table 60, scaled by 1e9 so the printed decimals are
   exact. `mp3_alias_c` returns the f64 form.
