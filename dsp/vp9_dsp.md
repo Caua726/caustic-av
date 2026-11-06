@@ -38,11 +38,12 @@ and CPU without a kernel. Nothing in `dsp/` duplicates it, so there is exactly
 one definition of each process.
 
 The hooks are placed after the caller's validation and add no public
-interface: no function signature in `video/vp9/` changed, no struct gained a
-field, and the only internal change is that `predict.cst` now builds its
+interface: no exported function signature in `video/vp9/` changed and no
+struct gained a field. The internal changes are that `predict.cst` builds its
 `aboveRow`/`leftCol` arrays as `u8` (they hold samples and the 127/129
-substitutes, so their values are unchanged) so the kernels can take them
-directly.
+substitutes, so their values are unchanged) and that its private `pred_*`
+helpers take those arrays as `*u8` instead of `*i32`, so the kernels can take
+the buffers directly.
 
 ### Ownership, lifetime and races
 
@@ -65,9 +66,10 @@ directly.
 
 ## Feature detection
 
-`vp9_cpu_probe_x86_64` is a `with naked` function: the body is asm only, CPUID
-is the one instruction the assembler has a mnemonic for and the rest is test
-and branch, so no compiler value is live across it.
+`vp9_cpu_probe_x86_64` is a `with naked` function: the body is asm only, the
+CPUID instruction itself is emitted as `.byte 15, 162` because caustic-as has
+no mnemonic for it (the compiler's own probe emits the same bytes), and the
+rest is test and branch, so no compiler value is live across it.
 
 | Bit | Source | Gates |
 |---|---|---|
@@ -88,8 +90,9 @@ Targets: the x86_64 module is imported only under
 is guarded by `abi.VP9_X86_SYSV`, an `imut` global that folds to 1 exactly on
 x86_64 System V, so on every other target the branch is dead and the name of
 the module that was not loaded is never resolved. The install pass itself
-aborts the build with `__compile_error` if it is reached with
-`VP9_X86_SYSV == 0`, which catches a direct import of `dsp/x86_64/`. The
+aborts the build with `__compile_error` if it is called with
+`VP9_X86_SYSV == 0`; a bare import of `dsp/x86_64/` does not execute the
+body, so what the check catches is a *call* reached on a foreign target. The
 kernels read the System V argument registers (rdi, rsi, rdx, rcx, r8, r9) and
 use only caller-saved registers, so a Windows x86_64 build keeps the scalar
 path. AArch64 installs nothing (there is no NEON kernel).
@@ -223,11 +226,12 @@ above each line):
 - `stride` is a byte stride and must be at least the block width; the kernels
   advance the row pointer by it and never read or write outside
   `[row, row + size)` for each of the `size` rows.
-- The intra kernels may read up to 32 bytes of the above row starting at
-  `above[0]` (two 16-byte loads for 32x32; one for every other size, including
-  4x4 and 8x8 where only `size` bytes are used). `predict.cst` builds that row
-  in a 65-entry buffer and passes a pointer one past its first entry, so the
-  read stays inside the buffer for every size.
+- The intra kernels read at most 32 bytes of the above row from `above[0]`:
+  V 4x4 and 8x8 use a dword/qword general-register load, V 16x16 and TM up to
+  16x16 use one 16-byte load, and V 32x32 and TM 32x32 use two. H reads only
+  `left[0..size-1]`. `predict.cst` builds the row in a 65-entry buffer and
+  passes a pointer one past its first entry (aboveRow[0]), so the read stays
+  inside the buffer for every size.
 - The residual kernel reads `n0*n0` i32 coefficients from `dq` and exactly
   `n0` bytes of each destination row.
 - The compound kernel reads and writes exactly `w` bytes per row for `h` rows
@@ -270,16 +274,24 @@ arrays.
    execution.
 3. **AVX2 OS support.** The AVX/AVX2 bits are raw CPUID bits; the XCR0 test
    is absent. No kernel depends on it yet.
-4. **Wide loads on small blocks.** Every intra kernel loads 16 bytes at a
-   time, so a 4x4 or 8x8 prediction reads above-row bytes beyond the block
-   width; those lanes are computed and discarded (the store is `movss` or
-   `movsd`). libvpx and FFmpeg keep the same kind of headroom around their
-   above arrays; here it is `predict.cst`'s 65-entry buffer, argued by the
-   geometry above but not checked by any test in this phase.
-5. **Reference agreement.** libvpx and FFmpeg substitute the edge arrays and
-   index the left column in their own (inverted) order before calling their
-   kernels; the kernels here take the spec's order (leftCol[i] is row i, as
-   `predict.cst` builds it). The equivalence is argued, not compared.
+4. **Wide loads on small blocks.** TM loads 16 bytes of the above row even
+   for 4x4 and 8x8, so it reads above-row bytes beyond the block width; those
+   lanes are computed and discarded (the store is `movss` or `movsd`). V 4x4
+   and 8x8 read the row with a dword/qword general-register load and H reads
+   only `left` bytes, so neither over-reads. For 4x4 and 8x8 the 16-byte TM
+   load starts at aboveRow[0] and the top-left byte aboveRow[-1] is read too;
+   both are inside `predict.cst`'s 65-entry buffer. For 4x4 the load also
+   covers aboveRow[8..15], which the caller does not initialise; those bytes
+   only feed the half of the result the `movss` store discards. libvpx and
+   FFmpeg keep the same kind of headroom around their above arrays; argued by
+   the geometry above but not checked by any test in this phase.
+5. **Reference agreement.** libvpx fills `left_col[i]` from row i and its
+   predictors read `left[i]`, the same top-down order as the spec and as
+   `predict.cst`; only FFmpeg fills its left buffer bottom-up
+   (`left[bs-1-i]` is row i) and its predictors read `left[bs-1-y]`. Both
+   reference decoders substitute the 127/129 edge values before the kernel
+   call, as `predict.cst` does. The output equivalence is argued, not
+   compared.
 
 ## Pending work
 
@@ -292,6 +304,54 @@ arrays.
    the scalar loop it replaces. Nothing has been measured, so the table is
    size-agnostic on purpose.
 5. AArch64 NEON: nothing written, nothing installed, scalar everywhere.
+
+## Pending review notes
+
+Findings from the stage 9 SIMD review. Items 1-5 were documentation errors and
+are corrected in the sections named; items 6-10 are code observations left as
+preconditions or future cleanups. None affects a valid stream's output.
+
+1. **The private `pred_*` signatures did change.** "Dispatch" used to say no
+   function signature changed. The exported `pred_intra` signature and every
+   struct are unchanged, but the helpers `pred_v`, `pred_h`, `pred_dc`,
+   `pred_d45`, `pred_d63`, `pred_d117`, `pred_d135`, `pred_d153`, `pred_d207`
+   and `pred_tm` in `predict.cst` now take `*u8` edge arrays instead of
+   `*i32`, and `abuf`/`lbuf` are `[65]u8`/`[32]u8`. Corrected in "Dispatch".
+2. **Left-column order in the references.** Only FFmpeg inverts it. libvpx
+   fills `left_col[i]` from row i and reads `left[i]`, the same top-down order
+   as ours; FFmpeg fills `l[bs-1-i]` from row i and reads `left[bs-1-y]`.
+   Corrected in UNCONFIRMED 5.
+3. **`__compile_error` catches a call, not an import.** The guard is inside
+   `vp9_dsp_init_x86_64`; importing `dsp/x86_64/` without calling anything
+   never executes the body. Corrected in "Feature detection".
+4. **"Every intra kernel loads 16 bytes" was too broad.** V 4x4 and 8x8 use a
+   dword/qword GPR load, H reads only `left` bytes, V 16x16 and TM up to 16x16
+   use one 16-byte load, and V 32x32 and TM 32x32 use two. Corrected in
+   UNCONFIRMED 4 and the buffer bullet.
+5. **TM's small-size over-read is in bounds.** For 4x4 and 8x8 the 16-byte
+   load starts at aboveRow[0], and aboveRow[-1] is read too; both lie inside
+   the 65-entry `abuf`. For 4x4 the bytes past aboveRow[7] are uninitialised
+   stack that only feeds discarded lanes. This is a buffer-geometry argument
+   from the sources; recorded in UNCONFIRMED 4.
+6. **Silent return on an unexpected size.** V and H fall through their compare
+   chain to `ret` for any size not in {4, 8, 16, 32}, leaving the block
+   unwritten. TM only rejects sizes outside 4..32 and would store 16 bytes for
+   the in-between values (5, 9..15, 17..31). `pred_intra` validates `tx_sz`,
+   so all of these are preconditions; the kernels do not trap on a violation.
+7. **No leaf 1 existence check.** The probe calls leaf 1 without comparing the
+   highest basic leaf (r8d) against 1; only the leaf 7 call checks
+   `r8d >= 7`. Every x86_64 CPU has leaf 1, so the check was omitted.
+8. **`w == 0` in the compound kernel.** `w == 0` is a multiple of 16, so it
+   passes the hook's stated precondition; the column loop would then run once
+   and read/write 16 bytes. VP9 inter block widths are 4..64, so it is
+   unreachable, but the ABI precondition does not say `w > 0`.
+9. **`vp9_dsp_features()` is unused.** Nothing in the decoder calls it yet; it
+   is exported for diagnostics only. `features` is written before the SSE2
+   test, so it can be nonzero while every slot is null.
+10. **The table is fetched before the mode test.** `predict.cst` calls
+    `vp9_dsp_table()` for every intra block, including DC and the directional
+    modes that have no kernel. After the first install it is one atomic load;
+    moving it inside the V/H/TM branches would skip it on the other modes.
 
 ## Verification (all NOT RUN)
 
