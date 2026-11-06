@@ -1698,7 +1698,7 @@ fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
                     let is *u8 as dst = cast(*u8, cast(i64, pl)
                                              + py * stride + px);
                     st = ip.inter_predict_taps(&f, plane,
-                        cast(*ip.InterRefPlane, &rp[0]), count,
+                        &rp[0], count,
                         px, py, 4, 4, block_idx,
                         cast(*i32, &mi.bmv[0][0][0]),
                         cast(*i64, &taps[0]), dst, stride, b.scratch);
@@ -1711,7 +1711,7 @@ fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
             let is *u8 as dst = cast(*u8, cast(i64, pl)
                                      + base_y * stride + base_x);
             st = ip.inter_predict_taps(&f, plane,
-                cast(*ip.InterRefPlane, &rp[0]), count,
+                &rp[0], count,
                 base_x, base_y, pw, ph, 0,
                 cast(*i32, &mi.bmv[0][0][0]),
                 cast(*i64, &taps[0]), dst, stride, b.scratch);

@@ -108,7 +108,9 @@ call. `refresh_frame_flags == 0` publishes nothing and leaves the buffer
 free. A frame may reference the very slot it later refreshes; publish is
 after the tiles, so the old pixels are only replaced once prediction is
 finished. `vp9_refs_buffer_in_use(map, id)` tells the caller when a buffer
-may be reused or freed.
+may be reused or freed. An output view of a frame that was not published
+(`show_frame == 1` with `refresh_frame_flags == 0`) stays valid only until
+the next decode call or until its buffer is replaced.
 
 `coded_w = round64(MiCols*8) + 64`, likewise for height; the 64-sample band
 on the right and bottom is what 6.4.21's overhanging edge blocks write.
