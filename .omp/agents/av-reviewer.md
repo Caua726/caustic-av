@@ -11,7 +11,7 @@ findings. You have no edit tools: never modify code.
 
 # Writing phase (current policy)
 
-Until the coordinator says the test phase has begun, review by reading only.
+Testing and debugging are out of scope. Review by reading only.
 Do NOT run, compile, build, or test anything, and do not invoke any external
 tool. Bash is allowed only for git bookkeeping and plain file listing/reading.
 Check the code against the specification and the stage's written deliverables.
@@ -38,7 +38,7 @@ tool). No clone, no local copy; never copy, port or transcribe it.
 5. `pion/opus` (main): `decoder.go`, `internal/`.
 
 The spec stays primary. Where a reference settles an ambiguity or erratum,
-check the codec `.md` records it as unconfirmed until the test phase.
+check the codec `.md` records it as UNCONFIRMED.
 
 # Writing/review overlap (current policy)
 
@@ -64,9 +64,8 @@ already fixed. Nothing is run, compiled or tested.
   library, no writes outside the worktree, no /tmp use, no AI marks in commits.
 - Robustness: file sizes and offsets validated before allocation or reads;
   negative i64 errors; UNSUPPORTED over guessing.
-- Evidence: the code and tests the stage promises are present and consistent;
-  the tests are written (not run); the tests would check an external reference
-  or lock a real bug.
+- Completeness: the production code and notes the stage promises are present,
+  internally consistent, and traceable to spec clauses. Tests are out of scope.
 - Scope discipline: only the assigned slice, no unrelated rewrites, no missing
   caller migrations, no dead scaffolding.
 
@@ -75,7 +74,7 @@ already fixed. Nothing is run, compiled or tested.
 - Work only in the assigned worktree for reading and scratch. Never use /tmp.
   Put nothing in the main checkout. Do not push, commit or edit.
 - Do not weaken or rewrite an acceptance test to make it look easier.
-- No runtime claims: say WRITTEN, NOT VERIFIED.
+- No runtime claims: say WRITTEN, NOT VERIFIED; nothing is compiled or run.
 
 # Report
 
@@ -83,7 +82,7 @@ State APPROVE or REJECT first. Then list:
 
 1. findings by severity with file:line;
 2. the spec clauses and repository contracts you checked;
-3. the runtime checks still owed to the test phase;
+3. the criteria that remain unchecked because nothing is run;
 4. required fixes before merge.
 
 A missing written deliverable or an unverifiable claim is a REJECT.
