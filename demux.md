@@ -127,11 +127,11 @@ Audio master; the conversion repeats the guard, treating NaN as `I_CORRUPT`
 and a value above 2^62 Hz as `I_DIMS`, so no later sample-count arithmetic can
 overflow.
 
-For `A_OPUS`, the output rate is always 48000 Hz, the rate RFC 7845 defines for
-Opus, regardless of the container's SamplingFrequency. Channels and pre-skip
-come from the OpusHead in CodecPrivate when it parses; when it does not, the
-container's channel count is published and `decode.open` reports the parse
-error.
+For `A_OPUS`, the output rate is always 48000 Hz; RFC 7845 Section 4 counts
+granules at that rate regardless of the container's SamplingFrequency.
+Channels and pre-skip come from the OpusHead in CodecPrivate when it parses;
+when it does not, the container's channel count is published and `decode.open`
+reports the parse error.
 
 ### Ogg mapping
 

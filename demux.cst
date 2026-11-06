@@ -242,8 +242,8 @@ fn _fill_mk_track(dt as *codec.Track, t as *matroska.MkTrack) as i64 {
     dt.timebase_den = 1000000000;
 
     if (dt.codec == codec.CODEC_OPUS) {
-        // Opus output is fixed at 48 kHz for every mapping (RFC 7845
-        // Section 5.1.1). The OpusHead in CodecPrivate is the authority for
+        // Opus output is always 48 kHz; RFC 7845 Section 4 counts granules
+        // at that rate. The OpusHead in CodecPrivate is the authority for
         // channels and pre-skip; a malformed one is left for decode.open to
         // report, with the container's own channel count as the fallback.
         dt.rate = 48000;
