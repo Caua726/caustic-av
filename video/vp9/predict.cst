@@ -403,8 +403,8 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
     // u8, because every entry is a sample or one of the 127/129 substitutes,
     // and because the accelerated intra kernels take these two arrays
     // directly (dsp/vp9_dsp_abi.cst). The arrays are sized for the 32x32 case
-    // (aboveRow[-1..63] is 65 entries), and a kernel loads at most 32 bytes
-    // starting at `ab` -- the 2*size region the scalar predictors read.
+    // (aboveRow[-1..63] is 65 entries), and a kernel reads at most 32 bytes
+    // of aboveRow[0..2*size-1] -- the same region the scalar predictors read.
     let is [65]u8 as abuf;
     let is [32]u8 as lbuf;
     let is [1024]i32 as pred;
@@ -450,7 +450,13 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
         k = k + 1;
     }
 
+    // `ab` is aboveRow[-1], the pointer pred_above() takes (it adds the one
+    // sample offset itself). The kernel ABI takes aboveRow[0] instead
+    // (dsp/vp9_dsp_abi.cst), so the kernel calls pass `abk`, one byte further
+    // into the same buffer; `abk[-1]` is aboveRow[-1], which TM reads as the
+    // top-left sample. `lb` is leftCol[0] for both.
     let is *u8 as ab = cast(*u8, &abuf);
+    let is *u8 as abk = cast(*u8, &abuf[1]);
     let is *u8 as lb = cast(*u8, &lbuf);
     let is *i32 as pr = cast(*i32, &pred);
 
@@ -464,13 +470,13 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
     let is *u8 as at = cast(*u8, cast(i64, plane) + (y * stride + x));
     if (mode == rt.MODE_V) {
         let is *u8 as kv = dt.pred_v;
-        if (cast(i64, kv) != 0) { call(kv, at, stride, ab, lb, size); return errno.I_OK; }
+        if (cast(i64, kv) != 0) { call(kv, at, stride, abk, lb, size); return errno.I_OK; }
     } else if (mode == rt.MODE_H) {
         let is *u8 as kh = dt.pred_h;
-        if (cast(i64, kh) != 0) { call(kh, at, stride, ab, lb, size); return errno.I_OK; }
+        if (cast(i64, kh) != 0) { call(kh, at, stride, abk, lb, size); return errno.I_OK; }
     } else if (mode == rt.MODE_TM) {
         let is *u8 as kt = dt.pred_tm;
-        if (cast(i64, kt) != 0) { call(kt, at, stride, ab, lb, size); return errno.I_OK; }
+        if (cast(i64, kt) != 0) { call(kt, at, stride, abk, lb, size); return errno.I_OK; }
     }
 
     if (mode == rt.MODE_V) {
