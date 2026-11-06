@@ -6,9 +6,9 @@
 // Importing this file also makes the imported aliases reachable through it,
 // as std/os.cst does: with `use "caustic_av.cst" as av;` a caller can write
 // av.demux.Demux, av.decode.Decoder, av.decode.Output, av.codec.CODEC_VP9,
-// av.codec.Track and av.errno.I_OK as well as the av_* wrappers below. The
-// wrappers are only a convenience; the modules keep their own names and
-// negative-i64 errors.
+// av.codec.Track, av.packet.Packet, av.frame.Frame, av.samples.Samples and
+// av.errno.I_OK as well as the av_* wrappers below. The wrappers are only a
+// convenience; the modules keep their own names and negative-i64 errors.
 //
 //   av_sniff(src, len)                 container kind by content
 //   av_open(d, src, len)               bind a demuxer
@@ -33,6 +33,8 @@
 use "core/errno.cst" as errno;
 use "core/codec.cst" as codec;
 use "core/packet.cst" as packet;
+use "core/frame.cst" as frame;
+use "core/samples.cst" as samples;
 use "demux.cst" as demux;
 use "decode.cst" as decode;
 
