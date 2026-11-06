@@ -359,8 +359,28 @@ fn _ref_format_ok(st as *t.Vp9State, h as *Vp9Header, idx as i64) as i64 {
     return 1;
 }
 
-// frame_size_with_refs (section 6.2.5). Only a frame published by
-// vp9_state_publish may be referenced.
+// Every reference an inter frame selects must already be published and must
+// agree with the current frame in format (sections 7.2 and 8.2). Checking all
+// three here, and not only the slot that found_ref happens to pick, keeps an
+// unpublished slot from reaching the tile decoder, which may only read
+// st.ref_* for slots vp9_state_publish has filled. FFmpeg rejects the frame as
+// soon as any refidx is unavailable; libvpx checks every frame_refs[i] format
+// in setup_frame_size_with_refs.
+fn _refs_ok(st as *t.Vp9State, h as *Vp9Header) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < 3) {
+        let is i64 as idx = h.ref_frame_idx[i];
+        if (idx < 0 || idx >= 8) { return errno.I_CORRUPT; }
+        if (st.ref_valid[idx] == 0) { return errno.I_CORRUPT; }
+        if (_ref_format_ok(st, h, idx) == 0) { return errno.I_CORRUPT; }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// frame_size_with_refs (section 6.2.5). The caller validated every
+// ref_frame_idx with _refs_ok, so only slots published by vp9_state_publish
+// are read here.
 fn _frame_size_with_refs(st as *t.Vp9State, b as *bits.BitsMsb,
                          h as *Vp9Header) as i64 {
     let is i64 as found with mut = 0;
@@ -370,9 +390,6 @@ fn _frame_size_with_refs(st as *t.Vp9State, b as *bits.BitsMsb,
         if (f < 0) { return f; }
         if (f == 1) {
             let is i64 as idx = h.ref_frame_idx[i];
-            if (idx < 0 || idx >= 8) { return errno.I_CORRUPT; }
-            if (st.ref_valid[idx] == 0) { return errno.I_CORRUPT; }
-            if (_ref_format_ok(st, h, idx) == 0) { return errno.I_CORRUPT; }
             h.width = st.ref_width[idx];
             h.height = st.ref_height[idx];
             found = 1;
@@ -687,6 +704,9 @@ fn _uncompressed(st as *t.Vp9State, b as *bits.BitsMsb,
     if (show_existing == 1) {
         let is i64 as idx = bits.bits_msb_read(b, 3);
         if (idx < 0) { return idx; }
+        // The shown frame was published only after it was decoded, so its
+        // geometry and format are already known good. This header codes no
+        // color config, so only availability can be checked here.
         if (st.ref_valid[idx] == 0) { return errno.I_CORRUPT; }
         h.frame_to_show_map_idx = idx;
         h.frame_type = st.last_frame_type;
@@ -779,7 +799,9 @@ fn _uncompressed(st as *t.Vp9State, b as *bits.BitsMsb,
                 i = i + 1;
             }
 
-            let is i64 as r with mut = _frame_size_with_refs(st, b, h);
+            let is i64 as r with mut = _refs_ok(st, h);
+            if (r < 0) { return r; }
+            r = _frame_size_with_refs(st, b, h);
             if (r < 0) { return r; }
             let is i64 as hp = bits.bits_msb_bit(b);
             if (hp < 0) { return hp; }
