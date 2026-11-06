@@ -11,7 +11,8 @@
 > FFmpeg-difference or fps check has been executed. Codec notes mark every
 > unresolved reading as UNCONFIRMED. The VP9 probability and residual table
 > blobs and the MP3 analytic window/DCT blobs are still pending. The hub and
-> the decode example are written; the example review is still running.
+> the decode example are written, reviewed and merged; nothing has been
+> compiled or run.
 
 ## What it is
 
@@ -281,8 +282,8 @@ input is audio-only. `--threads` is the optional VP9 tile-worker count, 1..16
 with the calling thread included; the default is the sequential path.
 `examples/md5.cst` implements RFC 1321 for the frame hashes. The example has no
 track selection, no seeking and no image output, and it does not trim MP3
-LAME/VBRI gapless delay or padding. It is written; its read-only review is
-still running, and nothing has been compiled or run.
+LAME/VBRI gapless delay or padding. It is written, reviewed and merged;
+nothing has been compiled or run.
 
 ## Dependencies
 
@@ -318,8 +319,7 @@ The decode path was written in this order; stages 8 and 9 are merged into
 7. **Hub and example** — `core/codec.cst`, `demux.cst`, `decode.cst` and
    `caustic_av.cst` for sniffing, track publication, decoder dispatch and the
    output record; `examples/decode.cst` and `examples/md5.cst` with the
-   `caustic-mk build decode` target. Written; the example review is still
-   running.
+   `caustic-mk build decode` target. Written, reviewed and merged.
 
 Future work, deliberately separate from the written decode path:
 
@@ -338,8 +338,7 @@ This is a writing-phase library. **WRITTEN, NOT VERIFIED**: nothing has been
 compiled or run, so no statement here is a test result. The hub
 (`caustic_av.cst`, `demux.cst`, `decode.cst`, `core/codec.cst`), the decode
 example (`examples/decode.cst`, `examples/md5.cst`) and the
-`caustic-mk build decode` target are written; the example's read-only review
-is still running.
+`caustic-mk build decode` target are written, reviewed and merged.
 
 - No decoded frame has been compared with libvpx's MD5 or with a
   `trace_headers` dump; no container has been checked with `ffprobe`.
