@@ -1643,10 +1643,11 @@ fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
                                                     cast(*i64, &taps[0]));
     if (st < 0) { return st; }
 
-    let is i64 as count with mut = 1;
-    if (mi.ref_frame[1] > it.NONE) { count = 2; }
+    let is i64 as is_comp with mut = 0;
+    if (mi.ref_frame[1] > it.NONE) { is_comp = 1; }
 
-    let is [2]ip.InterRefPlane as rp;
+    // Second prediction of a compound block; at most one 64x64 block.
+    let is [4096]u8 as pred1buf;
 
     let is i64 as plane with mut = 0;
     while (plane < 3) {
@@ -1654,11 +1655,13 @@ fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
         let is i64 as suby with mut = 0;
         if (plane > 0) { subx = b.sub_x; suby = b.sub_y; }
 
-        let is i64 as rl with mut = 0;
-        while (rl < count) {
-            st = _ref_plane(b, mi.ref_frame[rl], plane, &rp[rl]);
+        let is ip.InterRefPlane as rp0;
+        st = _ref_plane(b, mi.ref_frame[0], plane, &rp0);
+        if (st < 0) { return st; }
+        let is ip.InterRefPlane as rp1;
+        if (is_comp == 1) {
+            st = _ref_plane(b, mi.ref_frame[1], plane, &rp1);
             if (st < 0) { return st; }
-            rl = rl + 1;
         }
 
         let is i64 as pw with mut = 0;
@@ -1697,12 +1700,33 @@ fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
                     let is i64 as py = base_y + by * 4;
                     let is *u8 as dst = cast(*u8, cast(i64, pl)
                                              + py * stride + px);
-                    st = ip.inter_predict_taps(&f, plane,
-                        &rp[0], count,
+                    st = ip.inter_predict_taps(&f, plane, &rp0, 1,
                         px, py, 4, 4, block_idx,
                         cast(*i32, &mi.bmv[0][0][0]),
                         cast(*i64, &taps[0]), dst, stride, b.scratch);
                     if (st < 0) { return st; }
+                    if (is_comp == 1) {
+                        st = ip.inter_predict_taps(&f, plane, &rp1, 1,
+                            px, py, 4, 4, block_idx,
+                            cast(*i32, &mi.bmv[1][0][0]),
+                            cast(*i64, &taps[0]),
+                            cast(*u8, &pred1buf[0]), 4, b.scratch);
+                        if (st < 0) { return st; }
+                        let is i64 as rr with mut = 0;
+                        while (rr < 4) {
+                            let is i64 as cc with mut = 0;
+                            while (cc < 4) {
+                                let is i64 as a = cast(i64,
+                                    dst[rr * stride + cc]);
+                                let is i64 as b2 = cast(i64,
+                                    pred1buf[rr * 4 + cc]);
+                                dst[rr * stride + cc] =
+                                    cast(u8, (a + b2 + 1) >> 1);
+                                cc = cc + 1;
+                            }
+                            rr = rr + 1;
+                        }
+                    }
                     bx = bx + 1;
                 }
                 by = by + 1;
@@ -1710,12 +1734,30 @@ fn _inter_predict_plane(b as *Vp9Blk, r as i64, c as i64, bs as i64,
         } else {
             let is *u8 as dst = cast(*u8, cast(i64, pl)
                                      + base_y * stride + base_x);
-            st = ip.inter_predict_taps(&f, plane,
-                &rp[0], count,
+            st = ip.inter_predict_taps(&f, plane, &rp0, 1,
                 base_x, base_y, pw, ph, 0,
                 cast(*i32, &mi.bmv[0][0][0]),
                 cast(*i64, &taps[0]), dst, stride, b.scratch);
             if (st < 0) { return st; }
+            if (is_comp == 1) {
+                st = ip.inter_predict_taps(&f, plane, &rp1, 1,
+                    base_x, base_y, pw, ph, 0,
+                    cast(*i32, &mi.bmv[1][0][0]),
+                    cast(*i64, &taps[0]),
+                    cast(*u8, &pred1buf[0]), pw, b.scratch);
+                if (st < 0) { return st; }
+                let is i64 as rr with mut = 0;
+                while (rr < ph) {
+                    let is i64 as cc with mut = 0;
+                    while (cc < pw) {
+                        let is i64 as a = cast(i64, dst[rr * stride + cc]);
+                        let is i64 as b2 = cast(i64, pred1buf[rr * pw + cc]);
+                        dst[rr * stride + cc] = cast(u8, (a + b2 + 1) >> 1);
+                        cc = cc + 1;
+                    }
+                    rr = rr + 1;
+                }
+            }
         }
         plane = plane + 1;
     }
