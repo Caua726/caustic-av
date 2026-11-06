@@ -1,0 +1,366 @@
+# MP3 (MPEG-1/2/2.5 Layer III)
+
+Status: **stage 8a, WRITTEN, NOT VERIFIED.** Nothing in this directory has
+been compiled or run. Stage 8a parses streams and supplies the table layer;
+PCM synthesis is stage 8b.
+
+## What stage 8a holds
+
+| File | Contents |
+|---|---|
+| `mp3.cst` | ID3v2/v1 skipping, frame-header parsing, side information, reservoir bounds, Xing/Info/VBRI metadata, `mp3_open` and `mp3_next`. |
+| `mp3_tables.cst` | Constants, blob readers, bitrate/sample-rate/sfb/pretab lookups, alias coefficients, the D[512] synthesis window, Huffman table loading. |
+| `mp3_tables_data.cst` | The table values, as comma-separated string blobs. |
+| `../../tools/gen_mp3_tables.py` | Unrun generator that reads the public bitstream description and writes `mp3_tables_data.cst`; it validates dimensions, contiguity and Huffman prefix freedom. |
+
+The parser borrows the caller's buffer. It never allocates, never opens a
+file, and returns negative `i64` errors. `Mp3Frame` holds absolute offsets
+and lengths into the input, not pointers; the view is valid only while the
+input is.
+
+## API
+
+```text
+mp3_open(m, src, len)      0 or negative
+mp3_next(m, frame)         1 = frame, 0 = end of audio, negative = error
+mp3_header_parse(src, avail, &h)        0 or negative
+mp3_side_info_parse(src, len, ver, nch, &s)  0 or negative
+```
+
+`mp3_open` clears `m` on entry, skips consecutive ID3v2 tags, excludes a
+trailing ID3v1 tag, scans leading junk for the first complete Layer III
+frame, and reads the first frame's VBR tag. It does not decode the first
+frame's side information; `mp3_next` does.
+
+`mp3_next` returns the frame at `m.pos`, validates the header and side
+information, checks the reservoir bound, and advances by the frame length.
+It does not scan past a broken frame: a sync at `m.pos` whose header is
+invalid returns the header error, and a frame whose declared length passes
+`audio_end` returns `I_EOF`. The parser does not silently skip a corrupt
+frame in the middle of a stream: the caller should reopen from a new byte
+boundary rather than editing `m.pos`, because `main_data_total` would no
+longer describe the frames actually returned.
+
+Errors used here:
+
+* `I_EOF` — fewer bytes than a tag, header or declared frame.
+* `I_BADMAGIC` — no Layer III sync in the leading-junk scan, or no sync at
+  `m.pos`.
+* `I_UNSUPPORTED` — Layer I/II, free-format bitrate index 0, an unknown ID3
+  major version, or an unknown VBRI version.
+* `I_CORRUPT` — reserved version/layer/sample-rate/bitrate, a frame too short
+  for its side information, a reserved `block_type` 0 with
+  `window_switching_flag` set, `big_values > 288`, an implausible
+  `main_data_begin`, malformed ID3 size bytes, a truncated Xing/VBRI/LAME
+  field, or `part2_3_length` totals larger than the reservoir window.
+* `I_BADPARAM` / `I_DIMS` — null pointers, negative length, or a length past
+  `core/bits`' `BITS_MAX_BYTES`.
+
+## Header (ISO/IEC 11172-3 / 13818-3)
+
+The 32-bit header is parsed most-significant bit first:
+
+| Bits | Field | Handling |
+|---|---|---|
+| 11 | sync | must be all ones |
+| 2 | version | 3 MPEG-1, 2 MPEG-2, 0 MPEG-2.5, 1 reserved (`I_CORRUPT`) |
+| 2 | layer | 01 Layer III; 10/11 `I_UNSUPPORTED`; 00 `I_CORRUPT` |
+| 1 | protection | 1 = no CRC; 0 = 16-bit CRC after the header |
+| 4 | bitrate index | 0 free (`I_UNSUPPORTED`), 15 forbidden, 1..14 per Table 8 |
+| 2 | sample rate | Table 9; 3 reserved |
+| 1 | padding | adds one byte to the frame |
+| 1 | private | exposed |
+| 2 | mode | stereo, joint, dual, mono |
+| 2 | mode extension | exposed; in Layer III bits mean intensity/MS stereo |
+| 1 | copyright | exposed |
+| 1 | original/copy | exposed |
+| 2 | emphasis | exposed; 2 is reserved but accepted |
+
+Frame length is the standard integer expression:
+
+```text
+frame_len = floor(144 * bitrate_kbps * 1000 / sample_rate) + padding   MPEG-1
+frame_len = floor( 72 * bitrate_kbps * 1000 / sample_rate) + padding   MPEG-2/2.5
+```
+
+which is `samples_per_frame / 8 * bitrate / sample_rate` plus padding. The
+16-bit CRC, when present, is inside that length; `crc_len` is 2 and
+`side_info_offset` is 6 instead of 4.
+
+Layer III side-information length (Table 13): MPEG-1 mono 17, stereo 32;
+MPEG-2/2.5 mono 9, stereo 17.
+
+## Side information
+
+`mp3_side_info_parse` consumes exactly the Table 13 byte count and rejects
+any leftover or short bits. Fields:
+
+* `main_data_begin`: 9 bits MPEG-1, 8 bits MPEG-2/2.5.
+* `private_bits`: 5/3 MPEG-1 mono/stereo, 1/2 MPEG-2/2.5 mono/stereo.
+* `scfsi[ch][band]`: MPEG-1 only; four bands per channel.
+* For each granule (2 MPEG-1, 1 MPEG-2/2.5) and channel:
+  `part2_3_length` 12, `big_values` 9 (rejected above 288),
+  `global_gain` 8, `scalefac_compress` 4 (MPEG-1) or 9 (MPEG-2/2.5),
+  `window_switching_flag` 1, then either
+  `block_type` 2 / `mixed_block_flag` 1 / two `table_select` 5 each /
+  three `subblock_gain` 3 each, or three `table_select` 5 each /
+  `region0_count` 4 / `region1_count` 3. MPEG-1 adds `preflag` 1.
+  MPEG-2/2.5 does not transmit `preflag`; stage 8b must derive it as
+  `preflag = (scalefac_compress >= 500)` in the non-intensity branch (the
+  400..499 and <400 branches clear it; the intensity branch clears it).
+  `scalefac_scale` and `count1table_select` are always present.
+
+When `window_switching_flag` is set, the standard supplies
+`region0_count = 7` (`8` for block_type 2 without mixed block). The
+parser also stores `region1_count = 63` as its **sentinel for "all
+remaining bands"**; 63 is not a specification band count and exceeds the
+3-bit field's range. Stage 8b must treat it that way. `block_type` 0 with
+the flag set is rejected because the value is reserved.
+
+The raw `scalefac_compress` is exposed. Stage 8b expands it with the
+MPEG-1 slen table or the MPEG-2/2.5 four-partition procedure; those are
+table-layer decisions, not stream-parsing decisions.
+
+## Reservoir
+
+The bit reservoir is a **logical** stream: the main data of earlier frames
+is separated by their headers and side information, so a single absolute
+byte offset cannot name its start. `Mp3Frame` reports:
+
+* `main_data_offset` — absolute first byte of this frame's main data
+  (after the side information).
+* `main_data_len` — bytes physically in this frame after the side
+  information.
+* `reservoir_back` — how many bytes to take from the caller's saved
+  previous main-data stream (the last `reservoir_back` bytes of it); this
+  equals `side.main_data_begin`.
+* `reservoir_len = reservoir_back + main_data_len` — total logical bytes
+  available for this frame.
+
+`Mp3.main_data_total` is the cumulative main data of all frames already
+returned; the parser uses it to reject a backpointer that reaches before
+the start of the stream. Consequently the first frame must have
+`main_data_begin == 0`; a stream that starts in the middle of a reservoir
+is rejected rather than reading bytes before the supplied buffer.
+
+The parser checks the documented bound
+
+```text
+max_mdb_bits = max(0, min(4088 or 2040, 7680 - frame_len * 8))
+main_data_begin * 8 <= max_mdb_bits
+```
+
+`main_data_begin` counts bytes; the standard states `mdb_limit` in bits
+(4088 for MPEG-1's 9-bit field, 2040 for MPEG-2/2.5's 8-bit field), hence
+the factor of eight on the left. The sum of all `part2_3_length` values in
+a frame may not exceed `reservoir_len * 8`.
+
+The caller owns the reservoir bytes and its history buffer. Stage 8b
+copies or indexes `reservoir_back` bytes from that history plus the current
+frame's `main_data_offset/main_data_len`; the parser does not allocate a
+reservoir. The history must hold at least 511 bytes (255 for MPEG-2/2.5),
+the largest value the backpointer field can carry and the bound the
+7680-bit buffer permits.
+
+## ID3
+
+* **ID3v2.2/2.3/2.4** at the start: 10-byte header, `"ID3"`, major 2..4,
+  revision != 0xFF, four syncsafe size bytes (each high bit clear), and a
+  10-byte footer when v2.4 flag 0x10 is set. The extended header and padding
+  are inside the size field, so no separate extended-header parse is needed.
+  Consecutive tags are skipped. Unknown major versions are
+  `I_UNSUPPORTED`; truncated tags are `I_EOF`; bad size bytes `I_CORRUPT`.
+* **ID3v1** at the end: if the last 128 bytes begin `"TAG"`, `audio_end`
+  is moved back by 128. The tag contents are not parsed.
+* Leading junk before the first frame is scanned one byte at a time. A
+  candidate is accepted only when its header parses and its complete frame
+  fits before `audio_end`.
+
+## Xing/Info and VBRI
+
+Only the **first** frame is inspected; the metadata is not used to skip or
+trim audio.
+
+* Xing/Info is read at the first frame's `side_info_end`, i.e. after the
+  header, the optional CRC and the side information. The four-byte tag is
+  `"Xing"` (VBR) or `"Info"` (nominally CBR). The 32-bit flags select, in
+  order, frames (4 bytes), bytes (4), TOC (100) and quality (4). The raw
+  flag word is `xing_flags`; the TOC is copied to `Mp3.toc`;
+  `frame_count`, `vbr_bytes`, `xing_quality` and `toc_present` expose the
+  rest. `is_vbr` is 1 for `"Xing"` and 0 for `"Info"`.
+* A LAME extension is recognised when the nine-byte encoder string starts
+  with `"LAME"`, `"Lavf"` or `"Lavc"`. The 24-bit delay/padding word is at
+  offset 21 in that extension: delay = `v >> 12`, padding = `v & 0xFFF`.
+  `encoder_delay`, `encoder_padding`, `lame_present` and `encoder_kind`
+  expose it. Audio is not trimmed.
+* VBRI is checked at frame start + 36, is accepted when its version is 1,
+  and exposes `vbri_delay`, `vbri_quality`, `vbr_bytes` and `frame_count`.
+  A Xing/Info tag takes precedence when both are present. A VBRI whose 18
+  fixed bytes do not fit is silently ignored, not reported, because the
+  parser only looks for the magic when the whole header is present.
+  `has_xing` is 1 for both `"Xing"` and `"Info"`; `is_vbr` distinguishes
+  them. `has_vbri` is 1 only when a VBRI header was parsed, and
+  `xing_flags` is 0 unless Xing/Info was found.
+
+A truncated Xing field or a truncated LAME delay/padding field is
+`I_CORRUPT`; a truncated VBRI is the exception noted above. `frame_count`
+is 0 when the tag did not carry it; it is not estimated by scanning.
+
+## Tables
+
+All values come from the public Layer III bitstream description in
+`.work/docs/mp3_bitstream.txt` (Tables 8, 9, 23, 24-41, 42-59 and 60).
+No value is copied from a decoder implementation.
+
+* Bitrate and sample-rate tables: Table 8/9. Index 0 and 15 are stored as 0
+  so the parser decides free/forbidden; MPEG-2.5 has its own row with
+  indices 9..15 stored as 0 (forbidden by Table 8).
+* Scalefactor bands: widths from Tables 42-59 in the order 44.1, 48, 32,
+  22.05, 24, 16, 11.025, 12, 8 kHz. The published tables list the bands
+  that carry scalefactors; each row here has a final entry equal to
+  `576 - sum(long widths)` or `192 - sum(short widths)`, the region above
+  the last scalefactor band, which the specification says has factor 1.0.
+  `MP3_SFB_LONG_SCALEFAC_COUNT` (21) and
+  `MP3_SFB_SHORT_SCALEFAC_COUNT` (12) give the number of bands that
+  actually carry scalefactors.
+* Pretab: Table 23 (21 bands) plus a zero for the tail band.
+* Alias coefficients: Table 60, scaled by 1e9 so the printed decimals are
+  exact. `mp3_alias_c` returns the f64 form.
+* Synthesis window: the 512 printed `D[i]` values, scaled by 1e9.
+  `mp3_synth_window` and `mp3_synth_window_load` expose f64 forms.
+* Huffman: tables 0-31. Table 0 is the all-zero table and has no codewords.
+  Tables 4 and 14 have no codewords in the standard; selecting them is
+  `I_UNSUPPORTED`. Tables 1, 2, 3, 5-13 and 15 are individual; tables
+  16-23 share one codeword table and 24-31 share another. `mp3_huff_load`
+  builds `code[x*16+y]`/`len[x*16+y]`, rejects duplicates, lengths above
+  19 and codewords that do not fit their length. `mp3_huff_linbits` holds
+  the linbits from the Table 40/41 headings.
+* Count1 sets A and B (Tables 24/25): `mp3_count1_load` fills
+  `code[symbol]`/`len[symbol]` for the four-bit symbol
+  `(v<<3)|(w<<2)|(x<<1)|y`, checks the 16 entries and their prefix
+  freedom.
+* Scalefactor partition sizes: `mp3_slen1`/`mp3_slen2` are Table 16;
+  `mp3_lsf_nsf` is the six-context, three-block-case, four-partition
+  MPEG-2/2.5 table from the procedure after Table 16. Context order is
+  fixed: 0 = `<400`, 1 = `400..499`, 2 = `500..511`, 3 = intensity
+  `<180`, 4 = intensity `180..243`, 5 = intensity `244..255`; block case
+  0 = long, 1 = short not mixed, 2 = short mixed.
+
+`mp3_tables_data.cst` can be reproduced (value-identically, not
+comment-identically) by `tools/gen_mp3_tables.py --spec ... -o ...`. The
+generator is committed but has not been run in this phase; it validates
+sfb contiguity and totals, the 512 D values, the alias count, and Huffman
+dimensions and prefix freedom. The bitrate rows, sample-rate row, MPEG-1
+slen and MPEG-2/2.5 LSF array are transcribed in the generator rather than
+parsed from the text; the large tables are parsed.
+
+## Pending blobs
+
+These are analytic, not printed in the documentation, and are **not**
+written yet:
+
+* `MP3_WINDOW_LONG` — 36 normal long-block window values.
+* `MP3_WINDOW_START` — 36 start-block values.
+* `MP3_WINDOW_STOP` — 36 stop-block values.
+* `MP3_WINDOW_SHORT` — 12 short-block values.
+* `MP3_DCT_TWIDDLE` — the DCT/IMDCT twiddles stage 8b chooses.
+
+`MP3_WINDOW_TABLES_GENERATED` is 0 and `mp3_window_tables_ready()` returns
+0. Stage 8b does not consume these blobs: it builds the four windows and
+the IMDCT/synthesis matrices analytically at init (`mp3_synth.cst`) from
+the window definitions in the specification. The blobs stay placeholders
+for a future table-driven path; the parser does not need them.
+
+## Pending review notes
+
+Recorded verbatim from the stage 8a read-only review. These are LOW /
+non-blocking; none requires a code fix round, but stage 8b must read notes
+5, 6 and 12 before using the side information and table layer.
+
+1. `audio/mp3/mp3_tables.cst:324-331` — `mp3_huff_table_valid`'s comment says it returns 0 for table 0, but the code returns 1 for table 0 (correct: table 0 is a valid all-zero table; 4/14 → 0). Comment/behaviour mismatch only.
+2. `audio/mp3/mp3_tables.cst:433-439` — `mp3_count1_table_count`'s comment describes the two tables but never states that it returns 16 for `table` 0/1 (and 0 otherwise). Unused so far.
+3. `audio/mp3/mp3_tables.cst:380-382` (and the same claim at `:453`) — "Both output arrays are cleared first, so a failed load leaves no half-table behind" is false for a failure inside the token loop: entries already parsed stay in `code`/`len`. Same overstatement at `:133-134` ("rejected before out is touched"): a short blob is detected after `out[0..k)` has been written. No safety consequence; callers treat the error as fatal.
+4. `audio/mp3/mp3_tables.cst:7-9` — "a malformed blob is reported as `I_CORRUPT` instead of producing a value" holds for `_mp3_blob_i64`/`mp3_huff_load`/`mp3_count1_load`; the scalar accessors (`mp3_bitrate_kbps`, `mp3_pretab`, `mp3_huff_linbits`, …) swallow the error and return 0.
+5. `audio/mp3/mp3.md:112-113` + `audio/mp3/mp3.cst:476-481` — the standard assigns `region0_count = 7/8` for switched blocks, but **not** `region1_count = 63`; the doc only says region2 is unused. 63 is this parser's sentinel and 8b must treat it as "all remaining", not as a band count (note it also exceeds the 3-bit field range). The comment "the specification assigns these values" is inaccurate for the 63.
+6. `audio/mp3/mp3.md:106-108` + `audio/mp3/mp3.cst:78,502-504` — the parser leaves `preflag` 0 for MPEG-2/2.5 (`else { preflag = 0; }`); the md sentence "MPEG-2/2.5 … derives it from scalefac_compress" reads as if the parser derived it. The struct comment says "MPEG-2 derives it", so the split is discoverable, but the md should say explicitly that 8b must derive `preflag = (scalefac_compress >= 500)` in the non-intensity branch. No data loss: raw `scalefac_compress` and mode/mode_extension are exposed.
+7. `audio/mp3/mp3.md:196` — "A recognised tag that is cut short is `I_CORRUPT`" is not true for VBRI: `_mp3_parse_vbri`'s `off + 18 > end` guard (`mp3.cst:632`) is unreachable from `_mp3_parse_vbr` (`mp3.cst:663-670`), which only looks for "VBRI" when all 18 fixed bytes fit; a truncated VBRI is silently ignored. True for Xing fields and LAME (`mp3.cst:587-628`).
+8. `audio/mp3/mp3.cst:531-535` — `_mp3_id3v2_skip` validates neither `src`/`out_next`/`out_bytes` for null nor `start < 0` (private helper; the only caller passes valid values). Every read is bounded once those preconditions hold.
+9. `audio/mp3/mp3_tables_data.cst:20` — "Table 0 has one dummy entry": there is no `MP3_HUFF_0` blob (Table 26 is skipped, correctly); the "dummy entry" is the document's row.
+10. `audio/mp3/mp3.md:236-239` vs `tools/gen_mp3_tables.py:34-...`/`HEADER` — regeneration is value-identical but not comment-identical (different banner, no per-section comments, and `MP3_HUFF_0` is not emitted). Four blobs (both bitrate rows, sample rate, slen, LSF) are transcribed in the generator rather than parsed from the text; the file-table row at `mp3.md:24` ("reads the public bitstream description") slightly overstates this.
+11. `audio/mp3/mp3.cst:15` / `mp3.md` "A frame view (Mp3Frame) points into the input" — `Mp3Frame` holds absolute offsets and lengths, no pointer; the "borrow" wording is conceptual only.
+12. `audio/mp3/mp3_tables.cst:522-526` — the six `mp3_lsf_nsf` contexts are not enumerated in order (only "three by scalefac_compress range, three by the intensity side"). The blob order is the document's procedure order (0 = `<400`, 1 = `400..499`, 2 = `500..511`, 3 = intensity `<180`, 4 = `180..243`, 5 = `244..255`); 8b must use exactly that, so a one-line enumeration would remove a silent-wrong-scalefactor hazard.
+13. `audio/mp3/mp3.cst:576-578,134` — `has_xing` is set for both "Xing" and "Info"; the name plus the md's `is_vbr` bullet invites 8b to read `has_xing` as "Xing (VBR)" only. `has_vbri`/`has_xing`/`xing_flags` are otherwise undocumented in the md.
+14. `audio/mp3/mp3_tables.cst:280-300` — `mp3_bitrate_kbps`, `mp3_samples_per_frame`, `mp3_granule_count`, `mp3_side_info_len` do not validate `version` (unlike `mp3_sample_rate`/`mp3_version_ok`); they can only be reached with a validated version in-tree.
+
+## What stage 8b adds
+
+Main-data parsing (scalefactors with scfsi, MPEG-2 partition expansion),
+Huffman decoding of `big_values`/count1 with linbits and signs, region
+bounds from `region0_count`/`region1_count`, requantisation, reordering for
+short blocks, joint-stereo processing, alias reduction, IMDCT and the
+polyphase synthesis filterbank. Stage 8b also owns the reservoir buffer and
+frame-to-PCM output.
+
+Gapless trimming is not part of either stage. The parser exposes the
+LAME/VBRI delay and padding (`encoder_delay`, `encoder_padding`,
+`vbri_delay`) and the Layer III decoder returns every decoded frame;
+dropping delay/padding samples belongs to the layer that owns the stream
+(the caller of `mp3_next`/`mp3_decode_frame`), which alone knows the first
+and last frame of a track. `mp3_decode.md` states the same policy.
+
+## Reference reading
+
+These were read only to understand behaviour; no code was copied, ported or
+transcribed:
+
+* `lieff/minimp3`, `minimp3.h` — frame search, header tests, side-info and
+  reservoir shape.
+* `FFmpeg/FFmpeg`, `libavcodec/mpegaudiodec_template.c` — Layer III decode
+  order and side-info use.
+* `FFmpeg/FFmpeg`, `libavcodec/mpegaudiodata.c` — common table layout.
+* `FFmpeg/FFmpeg`, `libavcodec/mpegaudiodec_common.c` — sfb and Huffman table
+  dimensions, used only to cross-check the numbers read from the public
+  text.
+* `FFmpeg/FFmpeg`, `libavformat/mp3dec.c` — Xing/Info and VBRI field order
+  and LAME delay/padding position.
+
+## UNCONFIRMED
+
+These are reference-derived or interpretation choices, not confirmed by a
+conformance run:
+
+* **UNCONFIRMED** — the Xing/Info field order and flag bits are not in the
+  supplied ISO text; the implementation follows the common Xing layout
+  (frames, bytes, TOC, quality in flag-bit order) and the FFmpeg demuxer's
+  reading.
+* **UNCONFIRMED** — whether a Xing/Info tag moves by the two CRC bytes. This
+  parser places it at `side_info_end`, including the CRC; some demuxers use
+  a side-info-only offset table and therefore differ on protected frames.
+* **UNCONFIRMED** — the VBRI fixed offset 36 and its 18-byte
+  version/delay/quality/bytes/frames layout. VBRI is not specified in the
+  supplied ISO text; the implementation follows the published Fraunhofer
+  layout used by the FFmpeg demuxer.
+* **UNCONFIRMED** — the LAME delay/padding word at offset 21 in the
+  nine-byte encoder extension. The LAME tag is not in the supplied ISO
+  text; the implementation follows the common LAME layout.
+* **UNCONFIRMED** — the final sfb row entry. The supplied text lists only
+  the scalefactor bands; the tail entry here is derived from the fixed
+  totals 576/192 and the statement that lines above the last band have
+  factor 1.0. It matches the widths in the independent reference.
+* **UNCONFIRMED** — tables 4 and 14 are treated as unsupported because the
+  supplied tables print no codewords for them. A stream that selects one is
+  rejected rather than guessed at.
+* **UNCONFIRMED** — `emphasis == 2` is reserved by the table but accepted
+  and exposed, because rejecting a whole stream over an emphasis value is a
+  policy choice not required by the syntax.
+
+## Verification
+
+Nothing here is verified. The checks the original criteria require — an MD5
+of decoded PCM against a reference, `ffprobe` metadata, `trace_headers`
+field comparison, `opus_compare` (not applicable to MP3), an FFmpeg
+difference run, and an fps/throughput measurement — have **NOT RUN**.
+
+Review item 15 (not a code note): the max-absolute-PCM-difference criterion
+(alignment, sample count, tolerance) is not written here; it belongs to
+stage 8b's synthesis/test section and is still open.

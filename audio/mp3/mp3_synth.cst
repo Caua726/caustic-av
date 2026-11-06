@@ -1,0 +1,471 @@
+// =======================================================
+// caustic-av/audio/mp3/mp3_synth.cst
+// Layer III reconstruction kernels: reordering, alias reduction, the
+// 36/12-point IMDCT, windowing and overlap-add, frequency inversion and the
+// 32-band polyphase synthesis filterbank that produces interleaved s16 PCM.
+//
+// This file owns no bitstream syntax. mp3_decode.cst hands it the 576
+// requantized spectral values of one granule/channel in Huffman order and
+// gets back 576 PCM frames.
+//
+// Numeric conventions
+// -------------------
+// Everything is f64 in the natural units of ISO/IEC 11172-3 2.4.3.4:
+//   * requantized spectral values are real; the caller already applied
+//     is^(4/3) and all gains;
+//   * IMDCT uses the analytical expression with N = 36 or N = 12 and no
+//     extra 2/n factor, exactly as printed;
+//   * the window coefficients and the synthesis matrix N[i][k] are computed
+//     at init with std/math from their spec definitions;
+//   * the polyphase window D is read from mp3_tables.cst
+//     (mp3_synth_window), the dimensionless Table 3-B.3 values.
+//
+// The requantization formula is the complete scaling: 2.4.3.4 says that
+// "all necessary scaling factors are contained within this formula", that
+// the constant 210 is "a system constant", and that the synthesis
+// filterbank is implemented "according to the formulas below", with PCM
+// output in [-1, 1]. The IMDCT expression and the unnormalised 32-point
+// matrix are therefore both used as printed and the chain needs no global
+// gain: MP3_IMDCT_SCALE is 1. The final natural sample is multiplied by
+// 32768 to obtain s16.
+//
+// State
+// -----
+// All state lives in Mp3Synth, which the caller owns and which must survive
+// from frame to frame: the two 1024-value polyphase histories and the
+// per-subband 18-value MDCT overlap. mp3_decode.cst embeds one Mp3Synth in
+// Mp3Decode. Nothing here allocates.
+//
+// Aliasing reduction uses the eight spec coefficients from
+// mp3_tables.cst (mp3_alias_c); Cs and Ca are derived at init. Reordering
+// and alias reduction are done in place in the caller's 576-value block.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/math.cst" as fm;
+use "mp3_tables.cst" as tbl;
+
+let is f64 as MP3_PI with imut = 3.141592653589793;
+// The one explicit global scale of the reconstruction chain. The printed
+// requantization, IMDCT and synthesis matrix already span full scale
+// (2.4.3.4), so it is unity; it stays named as the single place a PCM
+// comparison would adjust.
+let is f64 as MP3_IMDCT_SCALE with imut = 1.0;
+
+// Per-channel 18-value overlap per subband: [ch][32][18] flattened.
+let is i64 as MP3_SYN_OVERLAP with imut = 1152;
+// Per-channel 1024-value polyphase history: [ch][1024].
+let is i64 as MP3_SYN_QMF with imut = 2048;
+
+struct Mp3Synth {
+    overlap as [1152]f64;      // [ch*576 + subband*18 + t]
+    qmf as [2048]f64;          // [ch*1024 + i]
+    imdct36 as [648]f64;       // [i*18 + k]
+    imdct12 as [72]f64;        // [i*6 + k]
+    win_normal as [36]f64;
+    win_start as [36]f64;
+    win_stop as [36]f64;
+    win_short as [12]f64;
+    synth_m as [2048]f64;      // N[i][k], [i*32 + k]
+    dwin as [512]f64;          // Table 3-B.3 D[i]
+    alias_cs as [8]f64;
+    alias_ca as [8]f64;
+    initialized as i64;
+}
+
+fn _zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+// Build the analytic windows, IMDCT cos matrices, synthesis matrix, Table
+// 3-B.3 window and alias reduction constants. Called once per decoder.
+fn syn_init(s as *Mp3Synth) as i64 {
+    _zero(cast(*u8, s), sizeof(Mp3Synth));
+    let is i64 as i with mut = 0;
+    let is i64 as k with mut = 0;
+    let is f64 as x with mut = 0.0;
+
+    // Long windows, ISO 2.4.3.4 / the four window shapes.
+    i = 0;
+    while (i < 36) {
+        x = fm.sin(MP3_PI * (cast(f64, i) + 0.5) / 36.0);
+        s.win_normal[i] = x;
+        // start: normal for 0..17, 1 for 18..23, short rising 24..29,
+        // zero for 30..35.
+        if (i < 18) {
+            s.win_start[i] = x;
+        } else if (i < 24) {
+            s.win_start[i] = 1.0;
+        } else if (i < 30) {
+            s.win_start[i] = fm.sin(MP3_PI * (cast(f64, i - 18) + 0.5) / 12.0);
+        } else {
+            s.win_start[i] = 0.0;
+        }
+        // stop: zero for 0..5, short falling 6..11, 1 for 12..17,
+        // normal for 18..35.
+        if (i < 6) {
+            s.win_stop[i] = 0.0;
+        } else if (i < 12) {
+            s.win_stop[i] = fm.sin(MP3_PI * (cast(f64, i - 6) + 0.5) / 12.0);
+        } else if (i < 18) {
+            s.win_stop[i] = 1.0;
+        } else {
+            s.win_stop[i] = x;
+        }
+        i = i + 1;
+    }
+
+    // Short window, 12 values.
+    i = 0;
+    while (i < 12) {
+        s.win_short[i] = fm.sin(MP3_PI * (cast(f64, i) + 0.5) / 12.0);
+        i = i + 1;
+    }
+
+    // IMDCT matrices. The analytical expression of 2.4.3.4:
+    //   x[i] = sum_k X[k] cos(pi/(2n) * (2i + 1 + n/2) * (2k + 1)).
+    i = 0;
+    while (i < 36) {
+        k = 0;
+        while (k < 18) {
+            s.imdct36[i * 18 + k] = fm.cos(MP3_PI / 72.0
+                * (2.0 * cast(f64, i) + 19.0) * (2.0 * cast(f64, k) + 1.0));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 12) {
+        k = 0;
+        while (k < 6) {
+            s.imdct12[i * 6 + k] = fm.cos(MP3_PI / 24.0
+                * (2.0 * cast(f64, i) + 7.0) * (2.0 * cast(f64, k) + 1.0));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    // Synthesis matrix N[i][k] = cos((16+i)(2k+1) pi/64), i=0..63.
+    i = 0;
+    while (i < 64) {
+        k = 0;
+        while (k < 32) {
+            s.synth_m[i * 32 + k] = fm.cos(MP3_PI / 64.0
+                * (16.0 + cast(f64, i)) * (2.0 * cast(f64, k) + 1.0));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    // Synthesis window D[0..511] from Table 3-B.3, read through
+    // mp3_synth_window from the committed blob in mp3_tables_data.cst. A
+    // malformed blob would read as zeros because the scalar accessor
+    // swallows its error (stage 8a review note 4); the blob is committed
+    // data, not a pending fill, so init does not reload it as a whole.
+    i = 0;
+    while (i < 512) {
+        s.dwin[i] = tbl.mp3_synth_window(i);
+        i = i + 1;
+    }
+
+    // Alias reduction: c[i] from Table 3-B.9; Cs = 1/sqrt(1+c^2),
+    // Ca = c/sqrt(1+c^2).
+    i = 0;
+    while (i < 8) {
+        let is f64 as c = tbl.mp3_alias_c(i);
+        let is f64 as d = 1.0 / fm.sqrt(1.0 + c * c);
+        s.alias_cs[i] = d;
+        s.alias_ca[i] = c * d;
+        i = i + 1;
+    }
+
+    s.initialized = 1;
+    return errno.I_OK;
+}
+
+// Clear only the inter-frame history; the computed tables stay.
+fn syn_reset(s as *Mp3Synth) as void {
+    _zero(cast(*u8, &s.overlap), MP3_SYN_OVERLAP * 8);
+    _zero(cast(*u8, &s.qmf), MP3_SYN_QMF * 8);
+}
+
+// Reorder one short-block granule in place from Huffman order
+// [sfb][window][line] to [subband][window][line] order, as 2.4.3.4
+// requires. long_lines is 0 for a pure short block, or the number of
+// spectral lines covered by the long lower part of a mixed block.
+fn _reorder_short(spec as *f64, row as i64, long_lines as i64,
+                  short_start as i64) as i64 {
+    let is [576]f64 as tmp;
+    let is i64 as src with mut = long_lines;
+    let is i64 as sfb with mut = short_start;
+    while (sfb < 13) {
+        let is i64 as len = tbl.mp3_sfb_short_width(row, sfb);
+        if (len < 0) { return errno.I_CORRUPT; }
+        if (src + 3 * len > 576) { return errno.I_CORRUPT; }
+        let is i64 as i with mut = 0;
+        while (i < len) {
+            tmp[3 * i + 0] = spec[src + i];
+            tmp[3 * i + 1] = spec[src + len + i];
+            tmp[3 * i + 2] = spec[src + 2 * len + i];
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 3 * len) {
+            spec[src + i] = tmp[i];
+            i = i + 1;
+        }
+        src = src + 3 * len;
+        sfb = sfb + 1;
+    }
+    if (src != 576) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+// 2.4.3.4 alias reduction for the first alias_bands subbands. The caller
+// passes 32 for a long block, 0 for a pure short block, and 2 or 4 for the
+// long lower part of a mixed block.
+fn _antialias(s as *Mp3Synth, spec as *f64, alias_bands as i64) as i64 {
+    if (alias_bands > 32) { return errno.I_CORRUPT; }
+    let is i64 as sb with mut = 1;
+    while (sb < alias_bands) {
+        let is i64 as i with mut = 0;
+        while (i < 8) {
+            let is f64 as u = spec[18 * sb + i];
+            let is f64 as d = spec[18 * sb - 1 - i];
+            let is f64 as cs = s.alias_cs[i];
+            let is f64 as ca = s.alias_ca[i];
+            spec[18 * sb + i] = u * cs + d * ca;
+            spec[18 * sb - 1 - i] = d * cs - u * ca;
+            i = i + 1;
+        }
+        sb = sb + 1;
+    }
+    return errno.I_OK;
+}
+
+// IMDCT of 18 input values at in[base..base+17] into out[0..35].
+fn _imdct36(s as *Mp3Synth, in_ as *f64, base as i64, out as *f64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 36) {
+        let is f64 as acc with mut = 0.0;
+        let is i64 as k with mut = 0;
+        while (k < 18) {
+            acc = acc + in_[base + k] * s.imdct36[i * 18 + k];
+            k = k + 1;
+        }
+        out[i] = acc;
+        i = i + 1;
+    }
+}
+
+// IMDCT of 6 input values at in[base + 3*k] (k=0..5) into out[0..11].
+fn _imdct12(s as *Mp3Synth, in_ as *f64, base as i64, out as *f64) as void {
+    let is i64 as i with mut = 0;
+    while (i < 12) {
+        let is f64 as acc with mut = 0.0;
+        let is i64 as k with mut = 0;
+        while (k < 6) {
+            acc = acc + in_[base + 3 * k] * s.imdct12[i * 6 + k];
+            k = k + 1;
+        }
+        out[i] = acc;
+        i = i + 1;
+    }
+}
+
+// One granule/channel from spectral values to the 18x32 subband block.
+// spec is 576 values in Huffman order; subband receives 576 values indexed
+// [subband*18 + t]. row is the scalefactor-band table row. block_type is
+// 0/1/2/3, mixed is 0/1, n_long is the number of long subbands in a mixed
+// block, alias_bands is the number of subbands alias reduction covers.
+fn syn_reconstruct(s as *Mp3Synth, spec as *f64, ch as i64, row as i64,
+                   block_type as i64, mixed as i64, n_long as i64,
+                   alias_bands as i64, subband as *f64) as i64 {
+    if (ch < 0 || ch > 1) { return errno.I_BADPARAM; }
+    if (s.initialized == 0) { return errno.I_BADPARAM; }
+    if (block_type < 0 || block_type > 3) { return errno.I_CORRUPT; }
+    if (block_type == 0 && mixed != 0) { return errno.I_CORRUPT; }
+
+    let is i64 as long_lines with mut = 0;
+    if (mixed != 0) { long_lines = n_long * 18; }
+    if (long_lines < 0 || long_lines > 576) { return errno.I_CORRUPT; }
+
+    if (block_type == 2) {
+        let is i64 as short_start with mut = 0;
+        if (mixed != 0) { short_start = 3; }
+        let is i64 as st = _reorder_short(spec, row, long_lines, short_start);
+        if (st < 0) { return st; }
+    }
+
+    let is i64 as st2 = _antialias(s, spec, alias_bands);
+    if (st2 < 0) { return st2; }
+
+    // Which subbands use the long transform: all for block_type != 2, the
+    // lower n_long for a mixed block, none for a pure short block.
+    let is i64 as long_bands with mut = 0;
+    if (block_type == 2) { long_bands = n_long; }
+    else { long_bands = 32; }
+    if (long_bands < 0 || long_bands > 32) { return errno.I_CORRUPT; }
+
+    let is [36]f64 as block;
+    let is [24]f64 as p;
+    let is [12]f64 as o;
+    let is i64 as sb with mut = 0;
+    while (sb < 32) {
+        let is i64 as use_long with mut = 0;
+        if (block_type != 2) { use_long = 1; }
+        else if (sb < long_bands) { use_long = 1; }
+
+        let is i64 as i with mut = 0;
+        while (i < 36) { block[i] = 0.0; i = i + 1; }
+        i = 0;
+        while (i < 24) { p[i] = 0.0; i = i + 1; }
+
+        if (use_long == 1) {
+            _imdct36(s, spec, sb * 18, cast(*f64, &block));
+            let is i64 as wi with mut = 0;
+            if (mixed != 0 && sb < long_bands) { wi = 0; }
+            else if (block_type == 1) { wi = 1; }
+            else if (block_type == 3) { wi = 2; }
+            else { wi = 0; }
+            i = 0;
+            while (i < 36) {
+                let is f64 as w with mut = s.win_normal[i];
+                if (wi == 1) { w = s.win_start[i]; }
+                else if (wi == 2) { w = s.win_stop[i]; }
+                block[i] = block[i] * w * MP3_IMDCT_SCALE;
+                i = i + 1;
+            }
+        } else {
+            let is i64 as win with mut = 0;
+            while (win < 3) {
+                _imdct12(s, spec, sb * 18 + win, cast(*f64, &o));
+                i = 0;
+                while (i < 12) {
+                    p[6 * win + i] = p[6 * win + i] + o[i] * s.win_short[i];
+                    i = i + 1;
+                }
+                win = win + 1;
+            }
+            // 6 zeros on both ends give the 36-value block of 2.4.3.4.
+            i = 0;
+            while (i < 24) {
+                block[6 + i] = p[i] * MP3_IMDCT_SCALE;
+                i = i + 1;
+            }
+        }
+
+        // Overlap-add with the previous granule's second half.
+        i = 0;
+        while (i < 18) {
+            let is i64 as oi = ch * 576 + sb * 18 + i;
+            let is f64 as ov = s.overlap[oi];
+            subband[sb * 18 + i] = block[i] + ov;
+            s.overlap[oi] = block[18 + i];
+            i = i + 1;
+        }
+        sb = sb + 1;
+    }
+
+    // Frequency inversion: every odd time sample of every odd subband.
+    sb = 1;
+    while (sb < 32) {
+        let is i64 as t with mut = 1;
+        while (t < 18) {
+            subband[sb * 18 + t] = 0.0 - subband[sb * 18 + t];
+            t = t + 2;
+        }
+        sb = sb + 2;
+    }
+    return errno.I_OK;
+}
+
+fn _round_s16(v as f64) as i64 {
+    if (v >= 32767.0) { return 32767; }
+    if (v <= 0.0 - 32768.0) { return 0 - 32768; }
+    let is f64 as r with mut = v + 0.5;
+    if (v < 0.0) { r = v - 0.5; }
+    return cast(i64, r);
+}
+
+// One 32-band synthesis step: 32 subband samples in, 32 PCM samples out.
+// qmf points at this channel's 1024-value history; out receives 32 natural
+// samples (about -1..+1).
+fn _syn_slot(s as *Mp3Synth, qmf as *f64, s_in as *f64, out as *f64) as void {
+    let is [512]f64 as u;
+    let is i64 as i with mut = 1023;
+    while (i >= 64) {
+        qmf[i] = qmf[i - 64];
+        i = i - 1;
+    }
+
+    // Matrixing: V[i] = sum_k N[i][k] S[k].
+    i = 0;
+    while (i < 64) {
+        let is f64 as acc with mut = 0.0;
+        let is i64 as k with mut = 0;
+        while (k < 32) {
+            acc = acc + s.synth_m[i * 32 + k] * s_in[k];
+            k = k + 1;
+        }
+        qmf[i] = acc;
+        i = i + 1;
+    }
+
+    // Build U by omitting every second 64-value block's middle.
+    i = 0;
+    while (i < 8) {
+        let is i64 as j with mut = 0;
+        while (j < 32) {
+            u[i * 64 + j] = qmf[i * 128 + j];
+            u[i * 64 + 32 + j] = qmf[i * 128 + 96 + j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Window and sum 16 terms.
+    let is i64 as j2 with mut = 0;
+    while (j2 < 32) {
+        let is f64 as acc with mut = 0.0;
+        let is i64 as m with mut = 0;
+        while (m < 16) {
+            let is i64 as idx = j2 + 32 * m;
+            acc = acc + u[idx] * s.dwin[idx];
+            m = m + 1;
+        }
+        out[j2] = acc;
+        j2 = j2 + 1;
+    }
+}
+
+// Synthesize 576 PCM frames for one channel from the subband block. PCM is
+// interleaved little-endian s16: frame n, channel ch is written at
+// (frame_start + n) * channels * 2 + ch * 2.
+fn syn_synthesize(s as *Mp3Synth, subband as *f64, ch as i64,
+                  pcm as *u8, frame_start as i64, channels as i64) as void {
+    let is [32]f64 as s_in;
+    let is [32]f64 as out;
+    let is i64 as t with mut = 0;
+    while (t < 18) {
+        let is i64 as k with mut = 0;
+        while (k < 32) {
+            s_in[k] = subband[k * 18 + t];
+            k = k + 1;
+        }
+        _syn_slot(s, cast(*f64, &s.qmf[ch * 1024]), cast(*f64, &s_in),
+                  cast(*f64, &out));
+        let is i64 as j with mut = 0;
+        while (j < 32) {
+            let is i64 as frame = frame_start + t * 32 + j;
+            let is i64 as v = _round_s16(out[j] * 32768.0);
+            let is i64 as off = frame * channels * 2 + ch * 2;
+            let is i64 as bitsv = v & 65535;
+            pcm[off] = cast(u8, bitsv & 255);
+            pcm[off + 1] = cast(u8, (bitsv >> 8) & 255);
+            j = j + 1;
+        }
+        t = t + 1;
+    }
+}

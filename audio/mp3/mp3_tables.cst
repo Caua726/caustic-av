@@ -1,0 +1,548 @@
+// =======================================================
+// caustic-av/audio/mp3/mp3_tables.cst
+// Fixed tables and table accessors for MPEG-1/2/2.5 Layer III.
+//
+// The values live in mp3_tables_data.cst as comma-separated blobs and are
+// read on demand, the same way video/vp9/inter_tables.cst keeps its filters.
+// Nothing here parses a bitstream or allocates: every accessor is a pure
+// lookup over a constant. The blob loaders report a malformed blob as
+// I_CORRUPT; the scalar accessors return 0 when the blob cannot be read.
+//
+// Provenance of every table is the public documentation in
+// .work/docs (mp3_bitstream.txt unless noted):
+//
+//   MP3_BITRATE_MPEG1 / MPEG2 / MPEG25      Table 8, the three Layer III
+//                                           columns.
+//   MP3_SAMPLE_RATE                         Table 9, all three MPEG rows.
+//   MP3_SFB_LONG / MP3_SFB_SHORT            Tables 42-59, widths. The
+//                                           published tables stop at the
+//                                           last scalefactor band; the
+//                                           final entry of each row is the
+//                                           remaining line count to 576
+//                                           (long) or 192 (short), which
+//                                           the documentation describes as
+//                                           the part above the highest
+//                                           scalefactor band.
+//   MP3_PRETAB                              Table 23, padded with the
+//                                           tail band's zero.
+//   MP3_ALIAS_C_NANO                        Table 60, coefficients scaled
+//                                           by 1e9 so the printed decimals
+//                                           are kept exactly.
+//   MP3_SYNTH_WINDOW_NANO                   polyphase synthesis window D,
+//                                           512 printed values scaled by
+//                                           1e9.
+//   MP3_HUFF_*                              Tables 26-41, codeword and
+//                                           length in x,y order.
+//   MP3_HUFF_LINBITS                        Tables 40 and 41 headings.
+//   MP3_COUNT1_A / MP3_COUNT1_B             Tables 24 and 25.
+//   MP3_SLEN_MPEG1                          Table 16.
+//   MP3_LSF_NSF                             the procedure after Table 16.
+//
+// IMDCT windows and the DCT twiddles are NOT in this module. They are
+// analytic, not printed, so their blobs are left pending for stage 8b,
+// which supplies them from the specification's formulas. See mp3.md.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "mp3_tables_data.cst" as data;
+
+// ── limits and constants ────────────────────────────────────────────
+
+// Version identifiers used throughout the module. These are not the two
+// header bits; the header's Version field is decoded to this order, which
+// also orders the nine sample-rate/scalefactor-band rows:
+// MPEG-1 (44.1/48/32), MPEG-2 (22.05/24/16), MPEG-2.5 (11.025/12/8).
+let is i64 as MP3_VER_1  with imut = 0;
+let is i64 as MP3_VER_2  with imut = 1;
+let is i64 as MP3_VER_25 with imut = 2;
+
+let is i64 as MP3_MAX_CHANNELS       with imut = 2;
+let is i64 as MP3_MAX_GRANULES       with imut = 2;
+let is i64 as MP3_GRANULE_LINES      with imut = 576;
+let is i64 as MP3_SHORT_GRANULE_LINES with imut = 192;
+let is i64 as MP3_SFB_LONG_COUNT     with imut = 22;
+let is i64 as MP3_SFB_SHORT_COUNT    with imut = 13;
+// The published tables carry 21 long and 12 short scalefactor bands; the
+// last width in each row above is the remaining spectrum, which has no
+// transmitted scalefactor.
+let is i64 as MP3_SFB_LONG_SCALEFAC_COUNT  with imut = 21;
+let is i64 as MP3_SFB_SHORT_SCALEFAC_COUNT with imut = 12;
+let is i64 as MP3_PRETAB_COUNT       with imut = 22;
+let is i64 as MP3_ALIAS_COUNT        with imut = 8;
+let is i64 as MP3_SYNTH_WINDOW_COUNT with imut = 512;
+let is i64 as MP3_HUFF_TABLES        with imut = 32;
+let is i64 as MP3_HUFF_SYMBOLS       with imut = 256;
+let is i64 as MP3_HUFF_MAX_CODE_BITS with imut = 19;
+
+// Count1 tables A and B (document Tables 24/25), indexed by the four-bit
+// symbol (v<<3)|(w<<2)|(x<<1)|y.
+let is i64 as MP3_COUNT1_COUNT       with imut = 16;
+// MPEG-2/2.5 LSF scalefactor partitions: six contexts x three block cases
+// (long, short not mixed, short mixed) x four partitions.
+let is i64 as MP3_LSF_CONTEXTS       with imut = 6;
+let is i64 as MP3_LSF_BLOCK_CASES    with imut = 3;
+let is i64 as MP3_LSF_PARTITIONS     with imut = 4;
+
+// Reservoir: ISO/IEC 11172-3 fixes Layer III at 7680 bits. main_data_begin
+// counts bytes, but the standard states its bound in bits: 4088 bits (the
+// 9-bit field's 511 bytes) for MPEG-1 and 2040 bits (255 bytes) for
+// MPEG-2/2.5. mp3_next compares main_data_begin * 8 against these.
+let is i64 as MP3_RESERVOIR_BITS     with imut = 7680;
+let is i64 as MP3_MAX_MDB_MPEG1      with imut = 4088;
+let is i64 as MP3_MAX_MDB_MPEG2      with imut = 2040;
+
+let is i64 as MP3_MODE_STEREO        with imut = 0;
+let is i64 as MP3_MODE_JOINT         with imut = 1;
+let is i64 as MP3_MODE_DUAL          with imut = 2;
+let is i64 as MP3_MODE_MONO          with imut = 3;
+
+// ── blob reader ─────────────────────────────────────────────────────
+
+// One signed decimal token. Commas separate entries; no whitespace is
+// expected. Returns I_EOF at the NUL that ends a string literal, or
+// I_CORRUPT for a token without digits. *pos advances past the token (and
+// past a following comma), but not past the NUL.
+fn _mp3_blob_token(s as *u8, pos as *i64, out as *i64) as i64 {
+    if (cast(i64, s) == 0 || cast(i64, pos) == 0 || cast(i64, out) == 0) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as i with mut = *pos;
+    while (cast(i64, s[i]) == 44) { i = i + 1; }          // ','
+    if (cast(i64, s[i]) == 0) { return errno.I_EOF; }
+
+    let is i64 as sign with mut = 1;
+    if (cast(i64, s[i]) == 45) { sign = 0 - 1; i = i + 1; } // '-'
+    let is i64 as v with mut = 0;
+    let is i64 as digits with mut = 0;
+    while (cast(i64, s[i]) >= 48 && cast(i64, s[i]) <= 57) {
+        let is i64 as d = cast(i64, s[i]) - 48;
+        // Every blob value is far below this; the guard only keeps a
+        // damaged literal from wrapping.
+        if (v > 100000000000000) { return errno.I_CORRUPT; }
+        v = v * 10 + d;
+        i = i + 1;
+        digits = digits + 1;
+    }
+    if (digits == 0) { return errno.I_CORRUPT; }
+    if (cast(i64, s[i]) == 44) { i = i + 1; }
+    *pos = i;
+    *out = sign * v;
+    return errno.I_OK;
+}
+
+// Read count entries starting at entry first from a blob. Short blobs and a
+// negative first/count are rejected; entries already written are not rolled
+// back when a later token is short.
+fn _mp3_blob_i64(s as *u8, first as i64, count as i64, out as *i64) as i64 {
+    if (cast(i64, s) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (first < 0 || count < 0) { return errno.I_BADPARAM; }
+    let is i64 as pos with mut = 0;
+    let is i64 as v with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < first) {
+        let is i64 as r = _mp3_blob_token(s, &pos, &v);
+        if (r < 0) { return errno.I_CORRUPT; }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < count) {
+        let is i64 as r = _mp3_blob_token(s, &pos, &v);
+        if (r < 0) { return errno.I_CORRUPT; }
+        out[k] = v;
+        k = k + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── frame constants ─────────────────────────────────────────────────
+
+fn mp3_version_ok(version as i64) as i64 {
+    if (version < MP3_VER_1 || version > MP3_VER_25) { return 0; }
+    return 1;
+}
+
+fn mp3_is_mpeg1(version as i64) as i64 {
+    if (version == MP3_VER_1) { return 1; }
+    return 0;
+}
+
+// Number of granules in a frame: two for MPEG-1, one for MPEG-2/2.5.
+fn mp3_granule_count(version as i64) as i64 {
+    if (version == MP3_VER_1) { return 2; }
+    return 1;
+}
+
+// Samples produced by one frame at this version (not by one granule).
+fn mp3_samples_per_frame(version as i64) as i64 {
+    if (version == MP3_VER_1) { return 1152; }
+    return 576;
+}
+
+// Layer III side-information length in bytes (Table 13).
+fn mp3_side_info_len(version as i64, mono as i64) as i64 {
+    if (version == MP3_VER_1) {
+        if (mono != 0) { return 17; }
+        return 32;
+    }
+    if (mono != 0) { return 9; }
+    return 17;
+}
+
+// ── bitrate and sample rate ─────────────────────────────────────────
+
+// Bitrate in kbit/s for a bitrate_index. Index 0 (free) and 15 (forbidden)
+// both return 0; index 9..15 also return 0 for MPEG-2.5, where Table 8 marks
+// them forbidden. The caller decides which error that is.
+fn mp3_bitrate_kbps(version as i64, index as i64) as i64 {
+    if (index < 0 || index > 15) { return 0; }
+    let is *u8 as b with mut = data.MP3_BITRATE_MPEG1;
+    if (version == MP3_VER_2) { b = data.MP3_BITRATE_MPEG2; }
+    if (version == MP3_VER_25) { b = data.MP3_BITRATE_MPEG25; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(b, index, 1, &v) < 0) { return 0; }
+    return v;
+}
+
+// Sampling rate in Hz. Index 3 is reserved and returns 0.
+fn mp3_sample_rate(version as i64, index as i64) as i64 {
+    if (version < MP3_VER_1 || version > MP3_VER_25) { return 0; }
+    if (index < 0 || index > 3) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SAMPLE_RATE, version * 4 + index, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+// ── scalefactor band geometry ───────────────────────────────────────
+
+// Row in the nine-row sfb tables: MPEG-1 rows 0..2, MPEG-2 rows 3..5,
+// MPEG-2.5 rows 6..8, each in sampling_frequency index order (0 = 44.1,
+// 22.05 and 11.025 respectively).
+fn mp3_sfb_row(version as i64, sample_rate_index as i64) as i64 {
+    if (version < MP3_VER_1 || version > MP3_VER_25) { return 0 - 1; }
+    if (sample_rate_index < 0 || sample_rate_index > 2) { return 0 - 1; }
+    return version * 3 + sample_rate_index;
+}
+
+// Width in frequency lines of one long scalefactor band. The last band
+// (index 21) is the remaining lines above the last published band.
+fn mp3_sfb_long_width(row as i64, sfb as i64) as i64 {
+    if (row < 0 || row > 8) { return 0; }
+    if (sfb < 0 || sfb >= MP3_SFB_LONG_COUNT) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SFB_LONG, row * MP3_SFB_LONG_COUNT + sfb, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+fn mp3_sfb_short_width(row as i64, sfb as i64) as i64 {
+    if (row < 0 || row > 8) { return 0; }
+    if (sfb < 0 || sfb >= MP3_SFB_SHORT_COUNT) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SFB_SHORT, row * MP3_SFB_SHORT_COUNT + sfb, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+// First frequency line of a band, as the cumulative sum of the widths.
+fn mp3_sfb_long_offset(row as i64, sfb as i64) as i64 {
+    if (sfb < 0 || sfb > MP3_SFB_LONG_COUNT) { return 0 - 1; }
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < sfb) {
+        sum = sum + mp3_sfb_long_width(row, i);
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn mp3_sfb_short_offset(row as i64, sfb as i64) as i64 {
+    if (sfb < 0 || sfb > MP3_SFB_SHORT_COUNT) { return 0 - 1; }
+    let is i64 as sum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < sfb) {
+        sum = sum + mp3_sfb_short_width(row, i);
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn mp3_pretab(sfb as i64) as i64 {
+    if (sfb < 0 || sfb >= MP3_PRETAB_COUNT) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_PRETAB, sfb, 1, &v) < 0) { return 0; }
+    return v;
+}
+
+// ── alias reduction and synthesis window ────────────────────────────
+
+// Table 60 coefficients, scaled by 1e9. The f64 form is the printed value.
+fn mp3_alias_c_nano(i as i64) as i64 {
+    if (i < 0 || i >= MP3_ALIAS_COUNT) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_ALIAS_C_NANO, i, 1, &v) < 0) { return 0; }
+    return v;
+}
+
+fn mp3_alias_c(i as i64) as f64 {
+    return cast(f64, mp3_alias_c_nano(i)) * 0.000000001;
+}
+
+// One polyphase synthesis window coefficient D[i], as printed in the
+// specification, scaled by 1e9.
+fn mp3_synth_window_nano(i as i64) as i64 {
+    if (i < 0 || i >= MP3_SYNTH_WINDOW_COUNT) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SYNTH_WINDOW_NANO, i, 1, &v) < 0) { return 0; }
+    return v;
+}
+
+fn mp3_synth_window(i as i64) as f64 {
+    return cast(f64, mp3_synth_window_nano(i)) * 0.000000001;
+}
+
+// Load all 512 coefficients into out[0..511]. The caller owns the storage;
+// a partial or malformed blob returns I_CORRUPT.
+fn mp3_synth_window_load(out as *f64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    let is [512]i64 as tmp;
+    let is i64 as r = _mp3_blob_i64(data.MP3_SYNTH_WINDOW_NANO, 0,
+                                    MP3_SYNTH_WINDOW_COUNT, &tmp[0]);
+    if (r < 0) { return r; }
+    let is i64 as i with mut = 0;
+    while (i < MP3_SYNTH_WINDOW_COUNT) {
+        out[i] = cast(f64, tmp[i]) * 0.000000001;
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── Huffman tables ──────────────────────────────────────────────────
+
+// 1 for table 0 (the valid "all zero" table, which carries no codewords)
+// and for every table whose codewords are defined; 0 for the unused numbers
+// 4 and 14 and for an out-of-range index.
+fn mp3_huff_table_valid(table as i64) as i64 {
+    if (table < 0 || table >= MP3_HUFF_TABLES) { return 0; }
+    if (table == 0) { return 1; }
+    if (table == 4 || table == 14) { return 0; }
+    return 1;
+}
+
+// Number of codeword entries the standard prints for each table. A blob
+// with fewer entries is truncated, not a usable table.
+fn _mp3_huff_count(table as i64) as i64 {
+    if (table == 1) { return 4; }
+    if (table == 2 || table == 3) { return 9; }
+    if (table == 5 || table == 6) { return 16; }
+    if (table >= 7 && table <= 9) { return 36; }
+    if (table >= 10 && table <= 12) { return 64; }
+    if (table == 13 || table == 15) { return 256; }
+    if (table >= 16 && table <= 31) { return 256; }
+    return 0;
+}
+
+fn _mp3_huff_blob(table as i64) as *u8 {
+    if (table == 1)  { return data.MP3_HUFF_1; }
+    if (table == 2)  { return data.MP3_HUFF_2; }
+    if (table == 3)  { return data.MP3_HUFF_3; }
+    if (table == 5)  { return data.MP3_HUFF_5; }
+    if (table == 6)  { return data.MP3_HUFF_6; }
+    if (table == 7)  { return data.MP3_HUFF_7; }
+    if (table == 8)  { return data.MP3_HUFF_8; }
+    if (table == 9)  { return data.MP3_HUFF_9; }
+    if (table == 10) { return data.MP3_HUFF_10; }
+    if (table == 11) { return data.MP3_HUFF_11; }
+    if (table == 12) { return data.MP3_HUFF_12; }
+    if (table == 13) { return data.MP3_HUFF_13; }
+    if (table == 15) { return data.MP3_HUFF_15; }
+    if (table >= 16 && table <= 23) { return data.MP3_HUFF_16_23; }
+    if (table >= 24 && table <= 31) { return data.MP3_HUFF_24_31; }
+    return cast(*u8, 0);
+}
+
+// linbits for one table (Tables 40 and 41). Tables 4 and 14 have no
+// codewords and return 0.
+fn mp3_huff_linbits(table as i64) as i64 {
+    if (table < 0 || table >= MP3_HUFF_TABLES) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_HUFF_LINBITS, table, 1, &v) < 0) { return 0; }
+    return v;
+}
+
+// Build the 256-entry lookup of one Huffman table. code[x*16+y] gets the
+// codeword's integer value, len[x*16+y] its bit length. An unused symbol has
+// len 0; table 0 is entirely unused in this sense and the decoder emits
+// pairs of zero for it without reading bits.
+//
+// The blobs list entries in x-major, y-minor order. Duplicate symbols, an
+// out-of-range x/y, a length above 19 or a codeword wider than its length
+// is I_CORRUPT. Both output arrays are cleared before parsing; a failure
+// after parsing starts may leave the entries read so far, and callers must
+// treat the error as fatal.
+fn mp3_huff_load(table as i64, code as *i64, len as *i64) as i64 {
+    if (cast(i64, code) == 0 || cast(i64, len) == 0) { return errno.I_BADPARAM; }
+    if (table < 0 || table >= MP3_HUFF_TABLES) { return errno.I_BADPARAM; }
+    let is i64 as i with mut = 0;
+    while (i < MP3_HUFF_SYMBOLS) {
+        code[i] = 0;
+        len[i] = 0;
+        i = i + 1;
+    }
+    if (table == 0) { return errno.I_OK; }
+    let is *u8 as s = _mp3_huff_blob(table);
+    if (cast(i64, s) == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as pos with mut = 0;
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as x with mut = 0;
+        let is i64 as r with mut = _mp3_blob_token(s, &pos, &x);
+        if (r == errno.I_EOF) { break; }
+        if (r < 0) { return r; }
+        let is i64 as y with mut = 0;
+        let is i64 as l with mut = 0;
+        let is i64 as c with mut = 0;
+        r = _mp3_blob_token(s, &pos, &y);
+        if (r < 0) { return errno.I_CORRUPT; }
+        r = _mp3_blob_token(s, &pos, &l);
+        if (r < 0) { return errno.I_CORRUPT; }
+        r = _mp3_blob_token(s, &pos, &c);
+        if (r < 0) { return errno.I_CORRUPT; }
+        if (x < 0 || x > 15 || y < 0 || y > 15) { return errno.I_CORRUPT; }
+        if (l < 0 || l > MP3_HUFF_MAX_CODE_BITS) { return errno.I_CORRUPT; }
+        if (l == 0) {
+            if (c != 0) { return errno.I_CORRUPT; }
+        } else {
+            if (c < 0 || c >= (1 << l)) { return errno.I_CORRUPT; }
+        }
+        let is i64 as idx = x * 16 + y;
+        if (len[idx] != 0) { return errno.I_CORRUPT; }
+        len[idx] = l;
+        code[idx] = c;
+        n = n + 1;
+    }
+    let is i64 as expected = _mp3_huff_count(table);
+    if (expected == 0 || n != expected) { return errno.I_CORRUPT; }
+    return errno.I_OK;
+}
+
+// ── count1 tables and MPEG-2 scalefactor partitions ─────────────────
+
+// Returns 16 for count1 table A (0) or B (1), and 0 for any other index.
+// The two tables are the quadruple codes used after big_values; table A
+// maps 0000 to one bit, table B is a fixed four-bit code for every symbol.
+fn mp3_count1_table_count(table as i64) as i64 {
+    if (table < 0 || table > 1) { return 0; }
+    return MP3_COUNT1_COUNT;
+}
+
+fn _mp3_code_prefix(a as i64, la as i64, b as i64, lb as i64) as i64 {
+    if (la <= 0 || lb <= 0) { return 0; }
+    if (la <= lb) {
+        if ((b >> (lb - la)) == a) { return 1; }
+        return 0;
+    }
+    if ((a >> (la - lb)) == b) { return 1; }
+    return 0;
+}
+
+// Build the 16-entry lookup of count1 table A (table 0) or B (table 1).
+// code[symbol] and len[symbol] are indexed by (v<<3)|(w<<2)|(x<<1)|y.
+// A malformed blob, a duplicate symbol, a length outside 1..6 or a
+// non-prefix-free set is I_CORRUPT. The arrays are cleared first.
+fn mp3_count1_load(table as i64, code as *i64, len as *i64) as i64 {
+    if (cast(i64, code) == 0 || cast(i64, len) == 0) { return errno.I_BADPARAM; }
+    if (table < 0 || table > 1) { return errno.I_BADPARAM; }
+    let is i64 as i with mut = 0;
+    while (i < MP3_COUNT1_COUNT) {
+        code[i] = 0;
+        len[i] = 0;
+        i = i + 1;
+    }
+    let is *u8 as s with mut = data.MP3_COUNT1_A;
+    if (table == 1) { s = data.MP3_COUNT1_B; }
+
+    let is i64 as pos with mut = 0;
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as sym with mut = 0;
+        let is i64 as r with mut = _mp3_blob_token(s, &pos, &sym);
+        if (r == errno.I_EOF) { break; }
+        if (r < 0) { return r; }
+        let is i64 as l with mut = 0;
+        let is i64 as c with mut = 0;
+        r = _mp3_blob_token(s, &pos, &l);
+        if (r < 0) { return errno.I_CORRUPT; }
+        r = _mp3_blob_token(s, &pos, &c);
+        if (r < 0) { return errno.I_CORRUPT; }
+        if (sym < 0 || sym >= MP3_COUNT1_COUNT) { return errno.I_CORRUPT; }
+        if (l < 1 || l > 6) { return errno.I_CORRUPT; }
+        if (c < 0 || c >= (1 << l)) { return errno.I_CORRUPT; }
+        if (len[sym] != 0) { return errno.I_CORRUPT; }
+        len[sym] = l;
+        code[sym] = c;
+        n = n + 1;
+    }
+    if (n != MP3_COUNT1_COUNT) { return errno.I_CORRUPT; }
+    i = 0;
+    while (i < MP3_COUNT1_COUNT) {
+        let is i64 as j with mut = 0;
+        while (j < MP3_COUNT1_COUNT) {
+            if (i != j) {
+                if (_mp3_code_prefix(code[i], len[i], code[j], len[j]) != 0) {
+                    return errno.I_CORRUPT;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// MPEG-1 Table 16: number of bits per scalefactor for scalefac_compress.
+fn mp3_slen1(compress as i64) as i64 {
+    if (compress < 0 || compress > 15) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SLEN_MPEG1, compress * 2, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+fn mp3_slen2(compress as i64) as i64 {
+    if (compress < 0 || compress > 15) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SLEN_MPEG1, compress * 2 + 1, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+// Number of scalefactors in one MPEG-2/2.5 partition. context selects the
+// six procedures (three by scalefac_compress range, three by the intensity
+// side), block_case is 0 long / 1 short not mixed / 2 short mixed, and
+// partition is 0..3.
+fn mp3_lsf_nsf(context as i64, block_case as i64, partition as i64) as i64 {
+    if (context < 0 || context >= MP3_LSF_CONTEXTS) { return 0; }
+    if (block_case < 0 || block_case >= MP3_LSF_BLOCK_CASES) { return 0; }
+    if (partition < 0 || partition >= MP3_LSF_PARTITIONS) { return 0; }
+    let is i64 as idx = (context * MP3_LSF_BLOCK_CASES + block_case) *
+                        MP3_LSF_PARTITIONS + partition;
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_LSF_NSF, idx, 1, &v) < 0) { return 0; }
+    return v;
+}
+
+// ── pending analytic window tables ─────────────────────────────────
+
+// 1 once the optional analytic MP3_WINDOW_* blobs in mp3_tables_data.cst
+// are filled. Stage 8b builds its IMDCT windows analytically at init and
+// does not consult this; the tables are not needed by the parser.
+fn mp3_window_tables_ready() as i64 {
+    return data.MP3_WINDOW_TABLES_GENERATED;
+}
