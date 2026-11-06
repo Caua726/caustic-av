@@ -1,0 +1,78 @@
+// =======================================================
+// caustic-av/dsp/x86_64/vp9_cpu.cst
+// Runtime CPU feature detection for the x86_64 VP9 kernels.
+//
+// x86_64 only, System V ABI only: the asm below reads the argument registers
+// the SysV calling convention defines and is imported only under
+// `__target_is_x86_64 - __target_is_windows == 1` (see dsp/vp9_dsp.cst).
+//
+// caustic-as has no `cpuid` mnemonic, so the instruction is emitted the way
+// the compiler's own feature probe emits it: `asm(".byte 15, 162\n")`
+// (`src/codegen/emit_inst.cst`). The results the bits come from are the ones
+// the Intel SDM defines:
+//
+//   leaf 1, EDX bit 26   SSE2
+//   leaf 1, ECX bit 19   SSE4.1
+//   leaf 1, ECX bit 28   AVX
+//   leaf 7 subleaf 0, EBX bit 5   AVX2
+//
+// AVX and AVX2 also require the operating system to have enabled the
+// extended state (XCR0 bits 1 and 2, gated on leaf 1 ECX bit 27 OSXSAVE and
+// an XGETBV). The probe reports the raw CPUID bits and does not test XCR0,
+// because no kernel here uses a VEX-encoded instruction: an AVX2 kernel must
+// add that gate together with the kernel. This is recorded as UNCONFIRMED in
+// dsp/vp9_dsp.md.
+//
+// The function returns the VP9_DSP_* bits of dsp/vp9_dsp_abi.cst in rax.
+// =======================================================
+
+// x86_64 System V only. A top-level `if (...) { ... }` is not part of the
+// grammar (a top-level `if` must wrap a `use`), so the target check lives in
+// `vp9_dsp_init_x86_64` in vp9_dsp_x86.cst, which is the only caller of this
+// probe: a call reached on another target is a programming error the
+// installer reports. Importing this file alone does not run anything.
+
+// rbx is callee-saved and CPUID writes ebx, so it is pushed for the call.
+// No other register CPUID touches (eax, ecx, edx) is callee-saved.
+fn vp9_cpu_probe_x86_64() as i64 with naked {
+    asm("push rbx\n");
+    // Highest basic leaf, kept in r8d (CPUID does not touch r8).
+    asm("xor eax, eax\n");
+    asm("xor ecx, ecx\n");
+    asm(".byte 15, 162\n");   // cpuid
+    asm("mov r8d, eax\n");
+    // Leaf 1: SSE2 (EDX bit 26), SSE4.1 (ECX bit 19), AVX (ECX bit 28).
+    asm("mov eax, 1\n");
+    asm("xor ecx, ecx\n");
+    asm(".byte 15, 162\n");   // cpuid
+    asm("xor r9d, r9d\n");
+    asm("mov eax, edx\n");
+    asm("and eax, 67108864\n");
+    asm("jz .Lvp9dsp_cpu_no_sse2\n");
+    asm("or r9d, 1\n");
+    asm(".Lvp9dsp_cpu_no_sse2:\n");
+    asm("mov eax, ecx\n");
+    asm("and eax, 524288\n");
+    asm("jz .Lvp9dsp_cpu_no_sse41\n");
+    asm("or r9d, 2\n");
+    asm(".Lvp9dsp_cpu_no_sse41:\n");
+    asm("mov eax, ecx\n");
+    asm("and eax, 268435456\n");
+    asm("jz .Lvp9dsp_cpu_no_avx\n");
+    asm("or r9d, 4\n");
+    asm(".Lvp9dsp_cpu_no_avx:\n");
+    // Leaf 7 subleaf 0 exists only when the highest basic leaf is at least 7.
+    asm("cmp r8d, 7\n");
+    asm("jb .Lvp9dsp_cpu_done\n");
+    asm("mov eax, 7\n");
+    asm("xor ecx, ecx\n");
+    asm(".byte 15, 162\n");   // cpuid
+    asm("mov eax, ebx\n");
+    asm("and eax, 32\n");
+    asm("jz .Lvp9dsp_cpu_done\n");
+    asm("or r9d, 8\n");
+    asm(".Lvp9dsp_cpu_done:\n");
+    asm("mov eax, r9d\n");
+    asm("pop rbx\n");
+    asm("ret\n");
+}

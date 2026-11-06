@@ -30,9 +30,18 @@
 //
 // 32x32 has a DCT only: the spec defines no 32-point ADST. Lossless has a
 // 4x4 WHT only and the syntax forces TxType = DCT_DCT for it.
+//
+// Acceleration
+// ------------
+// tx_add_residual (8.6.2 step 4) has an SSE2 kernel in dsp/ (see
+// dsp/vp9_dsp.md). When the runtime table has one, the validated request is
+// handed to it; the loop below stays the reference and runs for every other
+// request, target and CPU. The transforms themselves are scalar.
 // =======================================================
 
 use "../../core/errno.cst" as errno;
+use "../../dsp/vp9_dsp.cst" as dsp;
+use "../../dsp/vp9_dsp_abi.cst" as abi;
 use "recon_tables.cst" as rt;
 
 // Round2 and Clip1 come from recon_tables (rt.recon_round2, rt.recon_clip1),
@@ -585,6 +594,20 @@ fn tx_add_residual(dst as *u8, stride as i64, dq as *i32, n0 as i64) as i64 {
     if (n0 < 4 || n0 > 32) { return errno.I_BADPARAM; }
     if (cast(i64, dst) == 0 || cast(i64, dq) == 0) { return errno.I_BADPARAM; }
     if (stride < n0) { return errno.I_BADPARAM; }
+
+    // Accelerated residual add (dsp/x86_64/vp9_idct.cst), when the runtime
+    // table has one. The side is restricted to the four transform sizes so the
+    // kernel's only reachable shapes are the ones it implements; any other n0
+    // (which no caller produces) runs the reference loop below.
+    if (n0 == 4 || n0 == 8 || n0 == 16 || n0 == 32) {
+        let is *abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
+        let is *u8 as ar = dt.add_residual;
+        if (cast(i64, ar) != 0) {
+            call(ar, dst, stride, dq, n0);
+            return errno.I_OK;
+        }
+    }
+
     let is i64 as i with mut = 0;
     while (i < n0) {
         let is i64 as j with mut = 0;

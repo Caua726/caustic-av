@@ -1,0 +1,80 @@
+// =======================================================
+// caustic-av/dsp/vp9_dsp.cst
+// The VP9 acceleration dispatcher: one process-wide table of kernels, filled
+// at first use, and the accessor the codec modules call.
+//
+// Layering
+// --------
+//   vp9_dsp_abi.cst   the Vp9Dsp type and the feature bits (imports nothing)
+//   x86_64/*          the kernels and their install pass (System V x86_64)
+//   this file         the storage, the one-time install, the accessor
+// The codec modules (video/vp9/predict.cst, transforms.cst, inter.cst) import
+// this file and nothing else from dsp/, so a target without kernels links no
+// architecture code at all: the import of dsp/x86_64/vp9_dsp_x86.cst is gated
+// on the target below, and every call site is written as `if the slot is
+// non-null, call it; else run the scalar kernel that already lives there`.
+//
+// Ownership and lifetime
+// ----------------------
+// The table lives in this module's data, is owned by nobody, and is never
+// freed. The function pointers it holds point into the program image. Nothing
+// is allocated, so a caller that never decodes VP9 pays for one zeroed struct.
+//
+// Thread safety
+// -------------
+// Initialisation is a monotonic publish, not a lock:
+//   * every slot is written exactly once per install pass, with a value that
+//     does not depend on the caller (CPU feature bits are a property of the
+//     machine), so two threads that install concurrently store identical
+//     values into each slot;
+//   * an 8-byte aligned pointer store is not torn on x86_64 or AArch64, so a
+//     reader sees either the initial zero or the finished pointer;
+//   * a reader that sees zero runs the scalar kernel, which is correct by
+//     definition, so a lost race costs speed and never output.
+// `g_dsp_state` is a fast path only: it skips the CPUID probe once the table
+// is known filled. It is written with an atomic release store and read with
+// an atomic load (the language's atomics are sequentially consistent), so a
+// thread that observes 2 also observes every slot written before it.
+//
+// AArch64 and any target that is not x86_64 System V installs nothing: the
+// table stays zeroed, every call site falls through to the scalar kernel, and
+// dsp/vp9_dsp.md records that no NEON kernel exists. That is the honest state
+// rather than a second, unverified implementation.
+// =======================================================
+
+use "vp9_dsp_abi.cst" as abi;
+if (__target_is_x86_64 - __target_is_windows == 1) use "x86_64/vp9_dsp_x86.cst" as x86;
+
+// Zero-initialised (.bss). Written by vp9_dsp_init only.
+let is abi.Vp9Dsp as g_dsp with mut;
+
+// 0 = not installed, 2 = installed. 1 is never stored; a racing installer
+// repeats the work instead of waiting, because the work is a CPUID probe and
+// five pointer stores, and waiting would need a futex this module cannot own.
+let is u32 as g_dsp_state with mut = 0;
+
+// Fill the table from the CPU. Idempotent, callable from any thread, and
+// infallible: a CPU without SSE2 is not an error, it only means no kernel is
+// published and the scalar kernels run.
+fn vp9_dsp_init() as void {
+    if (atomic_load(&g_dsp_state) == 2) { return; }
+    // One comparison of literals, so the branch is dead — and `x86` is never
+    // resolved — on a target whose import the gate above skipped.
+    if (abi.VP9_X86_SYSV == 1) { x86.vp9_dsp_init_x86_64(&g_dsp); }
+    atomic_store(&g_dsp_state, 2);
+}
+
+// The table, installing it on first use. Every hook calls this; a null slot
+// means the caller must run its own scalar kernel.
+fn vp9_dsp_table() as *abi.Vp9Dsp {
+    if (atomic_load(&g_dsp_state) != 2) { vp9_dsp_init(); }
+    return &g_dsp;
+}
+
+// The CPU feature bits the install pass saw (VP9_DSP_* in vp9_dsp_abi.cst),
+// or 0 on a target with no probe. Diagnostics only: nothing in the decoder
+// branches on these.
+fn vp9_dsp_features() as i64 {
+    if (atomic_load(&g_dsp_state) != 2) { vp9_dsp_init(); }
+    return g_dsp.features;
+}

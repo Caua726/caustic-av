@@ -1,0 +1,312 @@
+// =======================================================
+// caustic-av/dsp/x86_64/vp9_intra.cst
+// SSE2 intra predictors for VP9 section 8.5.1: V, H and TM.
+//
+// x86_64 System V only (args in rdi, rsi, rdx, rcx, r8; result unused).
+// Imported only under `__target_is_x86_64 - __target_is_windows == 1`.
+//
+// Why raw bytes
+// -------------
+// caustic's assembler (caustic-as) has mnemonics for a small SSE2 subset:
+// movdqu/movaps/movupd/movd/movq, paddd/paddq/psubd/psubq/pxor/psrldq and
+// the scalar float forms. It has no packed byte or word arithmetic, no
+// shuffles, and no AVX form at all, so the instructions these predictors need
+// cannot be written by mnemonic. They are emitted as `.byte` with the encoding
+// from the Intel SDM, register-only forms (modrm = 11 ddd sss), and each line
+// names the instruction, the opcode and the modrm it encodes. `.byte` is the
+// assembler's documented way to emit a hand-encoded instruction, and the
+// compiler's own AVX2 backend is written the same way.
+//
+//   opcode legend used in this file (legacy 66 prefix, 128-bit operands):
+//     punpcklbw  66 0F 60 /r
+//     paddw      66 0F FD /r
+//     packuswb   66 0F 67 /r
+//     pshufd     66 0F 70 /r ib
+//
+// The edge arrays are the section 8.5.1 ones, already substituted with
+// 127/129 where a side is unavailable, so every input byte is 0..255 and
+// every output byte is a single byte. `above` points at aboveRow[0]
+// (aboveRow[-1] is above[-1]); `left` points at leftCol[0].
+//
+// Preconditions, checked by the caller (video/vp9/predict.cst):
+//   size in { 4, 8, 16, 32 }; stride > 0 and covers size bytes per row;
+//   `above` has at least 32 readable bytes from above[-1] (the caller's
+//   aboveRow buffer is 65 entries and `above` points one past its first);
+//   `left` has at least size readable bytes. No alignment is required:
+//   every load and store is unaligned (movdqu / movss / movsd).
+//
+// A kernel writes the whole size x size block into the plane. Bytes beyond
+// the block's width are loaded but never stored, so the garbage the widened
+// lanes carry for size 4 and 8 cannot reach the frame.
+// =======================================================
+
+// x86_64 System V only. The target check is in `vp9_dsp_init_x86_64`
+// (vp9_dsp_x86.cst): a top-level `if (...) { ... }` is not part of the
+// grammar, and these kernels are reached only through the install pass.
+
+// ── V_PRED: every row is the above row ──────────────────────────────
+fn vp9_x86_pred_v(dst as *u8, stride as i64, above as *u8,
+                  left as *u8, size as i64) as void with naked {
+    // rdi dst, rsi stride, rdx above, rcx left (unused), r8 size.
+    asm("cmp r8, 4\n");
+    asm("je .Lvp9dsp_pv4\n");
+    asm("cmp r8, 8\n");
+    asm("je .Lvp9dsp_pv8\n");
+    asm("cmp r8, 16\n");
+    asm("je .Lvp9dsp_pv16\n");
+    asm("cmp r8, 32\n");
+    asm("je .Lvp9dsp_pv32\n");
+    asm("ret\n");
+
+    // 4x4: one dword per row. `above` has 2*size entries, so the load is
+    // inside the caller's buffer.
+    asm(".Lvp9dsp_pv4:\n");
+    asm("mov eax, DWORD PTR [rdx]\n");
+    asm("mov r9, rdi\n");
+    asm("mov r10d, 4\n");
+    asm(".Lvp9dsp_pv4_l:\n");
+    asm("mov DWORD PTR [r9], eax\n");
+    asm("add r9, rsi\n");
+    asm("sub r10d, 1\n");
+    asm("jnz .Lvp9dsp_pv4_l\n");
+    asm("ret\n");
+
+    // 8x8: one qword per row.
+    asm(".Lvp9dsp_pv8:\n");
+    asm("mov r9, QWORD PTR [rdx]\n");
+    asm("mov r10, rdi\n");
+    asm("mov r11d, 8\n");
+    asm(".Lvp9dsp_pv8_l:\n");
+    asm("mov QWORD PTR [r10], r9\n");
+    asm("add r10, rsi\n");
+    asm("sub r11d, 1\n");
+    asm("jnz .Lvp9dsp_pv8_l\n");
+    asm("ret\n");
+
+    // 16x16: one 16-byte row, broadcast by storing it again each row.
+    asm(".Lvp9dsp_pv16:\n");
+    asm("movdqu xmm0, [rdx]\n");
+    asm("mov r9, rdi\n");
+    asm("mov r10d, 16\n");
+    asm(".Lvp9dsp_pv16_l:\n");
+    asm("movdqu [r9], xmm0\n");
+    asm("add r9, rsi\n");
+    asm("sub r10d, 1\n");
+    asm("jnz .Lvp9dsp_pv16_l\n");
+    asm("ret\n");
+
+    // 32x32: two 16-byte rows.
+    asm(".Lvp9dsp_pv32:\n");
+    asm("movdqu xmm0, [rdx]\n");
+    asm("movdqu xmm1, [rdx + 16]\n");
+    asm("mov r9, rdi\n");
+    asm("mov r10d, 32\n");
+    asm(".Lvp9dsp_pv32_l:\n");
+    asm("movdqu [r9], xmm0\n");
+    asm("movdqu [r9 + 16], xmm1\n");
+    asm("add r9, rsi\n");
+    asm("sub r10d, 1\n");
+    asm("jnz .Lvp9dsp_pv32_l\n");
+    asm("ret\n");
+}
+
+// ── H_PRED: row i is leftCol[i] repeated across the block ───────────
+//
+// The repeated byte is built in a general register (byte -> 2 bytes ->
+// 4 bytes -> 8 bytes by shift and or), which needs no shuffle instruction:
+// a 64-bit register holds one full row of eight samples.
+fn vp9_x86_pred_h(dst as *u8, stride as i64, above as *u8,
+                  left as *u8, size as i64) as void with naked {
+    // rdi dst, rsi stride, rdx above (unused), rcx left, r8 size.
+    asm("cmp r8, 4\n");
+    asm("je .Lvp9dsp_ph4\n");
+    asm("cmp r8, 8\n");
+    asm("je .Lvp9dsp_ph8\n");
+    asm("cmp r8, 16\n");
+    asm("je .Lvp9dsp_ph16\n");
+    asm("cmp r8, 32\n");
+    asm("je .Lvp9dsp_ph32\n");
+    asm("ret\n");
+
+    // 4x4: four copies of left[i] in one dword.
+    asm(".Lvp9dsp_ph4:\n");
+    asm("mov r9, rdi\n");
+    asm("xor r10d, r10d\n");
+    asm(".Lvp9dsp_ph4_l:\n");
+    asm("movzx eax, BYTE PTR [rcx + r10]\n");
+    asm("mov r11d, eax\n");
+    asm("shl r11d, 8\n");
+    asm("or eax, r11d\n");
+    asm("mov r11d, eax\n");
+    asm("shl r11d, 16\n");
+    asm("or eax, r11d\n");
+    asm("mov DWORD PTR [r9], eax\n");
+    asm("add r9, rsi\n");
+    asm("add r10, 1\n");
+    asm("cmp r10, 4\n");
+    asm("jb .Lvp9dsp_ph4_l\n");
+    asm("ret\n");
+
+    // 8x8: eight copies of left[i] in one qword.
+    asm(".Lvp9dsp_ph8:\n");
+    asm("mov r9, rdi\n");
+    asm("xor r10d, r10d\n");
+    asm(".Lvp9dsp_ph8_l:\n");
+    asm("movzx eax, BYTE PTR [rcx + r10]\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 8\n");
+    asm("or rax, r11\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 16\n");
+    asm("or rax, r11\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 32\n");
+    asm("or rax, r11\n");
+    asm("mov QWORD PTR [r9], rax\n");
+    asm("add r9, rsi\n");
+    asm("add r10, 1\n");
+    asm("cmp r10, 8\n");
+    asm("jb .Lvp9dsp_ph8_l\n");
+    asm("ret\n");
+
+    // 16x16: the 8-byte pattern twice per row.
+    asm(".Lvp9dsp_ph16:\n");
+    asm("mov r9, rdi\n");
+    asm("xor r10d, r10d\n");
+    asm(".Lvp9dsp_ph16_l:\n");
+    asm("movzx eax, BYTE PTR [rcx + r10]\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 8\n");
+    asm("or rax, r11\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 16\n");
+    asm("or rax, r11\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 32\n");
+    asm("or rax, r11\n");
+    asm("mov QWORD PTR [r9], rax\n");
+    asm("mov QWORD PTR [r9 + 8], rax\n");
+    asm("add r9, rsi\n");
+    asm("add r10, 1\n");
+    asm("cmp r10, 16\n");
+    asm("jb .Lvp9dsp_ph16_l\n");
+    asm("ret\n");
+
+    // 32x32: the 8-byte pattern four times per row.
+    asm(".Lvp9dsp_ph32:\n");
+    asm("mov r9, rdi\n");
+    asm("xor r10d, r10d\n");
+    asm(".Lvp9dsp_ph32_l:\n");
+    asm("movzx eax, BYTE PTR [rcx + r10]\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 8\n");
+    asm("or rax, r11\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 16\n");
+    asm("or rax, r11\n");
+    asm("mov r11, rax\n");
+    asm("shl r11, 32\n");
+    asm("or rax, r11\n");
+    asm("mov QWORD PTR [r9], rax\n");
+    asm("mov QWORD PTR [r9 + 8], rax\n");
+    asm("mov QWORD PTR [r9 + 16], rax\n");
+    asm("mov QWORD PTR [r9 + 24], rax\n");
+    asm("add r9, rsi\n");
+    asm("add r10, 1\n");
+    asm("cmp r10, 32\n");
+    asm("jb .Lvp9dsp_ph32_l\n");
+    asm("ret\n");
+}
+
+// ── TM_PRED: Clip1(above[j] + left[i] - above[-1]) ──────────────────
+//
+// Sixteen samples at a time: the above row is zero-extended to 16-bit lanes
+// (punpcklbw against a zero register widens the low eight bytes, psrldq
+// moves the high eight into the low half for the second widening), the
+// per-row offset left[i] - above[-1] is added in 16-bit lanes (paddw cannot
+// wrap here: 0..255 plus -255..255 stays inside a signed 16-bit lane), and
+// packuswb performs the Clip1 to 0..255 -- unsigned saturation is exactly
+// the section 4.6 Clip1 for a byte.
+fn vp9_x86_pred_tm(dst as *u8, stride as i64, above as *u8,
+                   left as *u8, size as i64) as void with naked {
+    // rdi dst, rsi stride, rdx above, rcx left, r8 size.
+    // r9 row pointer, r10 row index, r11 temp, eax temp.
+    // xmm2 zero, xmm4 the broadcast offset, xmm0/xmm1 the two result halves.
+    asm("pxor xmm2, xmm2\n");
+    asm("mov r9, rdi\n");
+    asm("xor r10d, r10d\n");
+    asm("cmp r8, 4\n");
+    asm("jb .Lvp9dsp_ptm_done\n");
+    asm("cmp r8, 32\n");
+    asm("ja .Lvp9dsp_ptm_done\n");
+
+    asm(".Lvp9dsp_ptm_row:\n");
+    // r11d = left[i]; eax = above[-1]; eax = (left[i] - above[-1]) & 0xFFFF,
+    // then doubled inside the dword so pshufd broadcasts the *word* into all
+    // eight 16-bit lanes.
+    asm("movzx eax, BYTE PTR [rcx + r10]\n");
+    asm("movzx r11d, BYTE PTR [rdx - 1]\n");
+    asm("sub eax, r11d\n");
+    asm("and eax, 65535\n");
+    asm("mov r11d, eax\n");
+    asm("shl r11d, 16\n");
+    asm("or eax, r11d\n");
+    asm("movd xmm4, eax\n");
+    // pshufd xmm4, xmm4, 0   66 0F 70 /r ib, modrm E4 (11 100 100)
+    asm(".byte 102,15,112,228,0\n");
+
+    // Samples 0..15: widen, add, pack.
+    asm("movdqu xmm0, [rdx]\n");
+    asm("movdqu xmm3, xmm0\n");
+    // punpcklbw xmm0, xmm2   66 0F 60 /r, modrm C2 (11 000 010)
+    asm(".byte 102,15,96,194\n");
+    asm("psrldq xmm3, 8\n");
+    // punpcklbw xmm3, xmm2   66 0F 60 /r, modrm DA (11 011 010)
+    asm(".byte 102,15,96,218\n");
+    // paddw xmm0, xmm4       66 0F FD /r, modrm C4 (11 000 100)
+    asm(".byte 102,15,253,196\n");
+    // paddw xmm3, xmm4       66 0F FD /r, modrm DC (11 011 100)
+    asm(".byte 102,15,253,220\n");
+    // packuswb xmm0, xmm3    66 0F 67 /r, modrm C3 (11 000 011)
+    asm(".byte 102,15,103,195\n");
+
+    // 32x32 has a second group of sixteen.
+    asm("cmp r8, 32\n");
+    asm("jne .Lvp9dsp_ptm_store\n");
+    asm("movdqu xmm1, [rdx + 16]\n");
+    asm("movdqu xmm3, xmm1\n");
+    // punpcklbw xmm1, xmm2   66 0F 60 /r, modrm CA (11 001 010)
+    asm(".byte 102,15,96,202\n");
+    asm("psrldq xmm3, 8\n");
+    // punpcklbw xmm3, xmm2   66 0F 60 /r, modrm DA (11 011 010)
+    asm(".byte 102,15,96,218\n");
+    // paddw xmm1, xmm4       66 0F FD /r, modrm CC (11 001 100)
+    asm(".byte 102,15,253,204\n");
+    // paddw xmm3, xmm4       66 0F FD /r, modrm DC (11 011 100)
+    asm(".byte 102,15,253,220\n");
+    // packuswb xmm1, xmm3    66 0F 67 /r, modrm CB (11 001 011)
+    asm(".byte 102,15,103,203\n");
+
+    asm(".Lvp9dsp_ptm_store:\n");
+    asm("cmp r8, 4\n");
+    asm("je .Lvp9dsp_ptm_s4\n");
+    asm("cmp r8, 8\n");
+    asm("je .Lvp9dsp_ptm_s8\n");
+    asm("movdqu [r9], xmm0\n");
+    asm("cmp r8, 32\n");
+    asm("jne .Lvp9dsp_ptm_next\n");
+    asm("movdqu [r9 + 16], xmm1\n");
+    asm("jmp .Lvp9dsp_ptm_next\n");
+    asm(".Lvp9dsp_ptm_s4:\n");
+    asm("movss [r9], xmm0\n");
+    asm("jmp .Lvp9dsp_ptm_next\n");
+    asm(".Lvp9dsp_ptm_s8:\n");
+    asm("movsd [r9], xmm0\n");
+    asm(".Lvp9dsp_ptm_next:\n");
+    asm("add r9, rsi\n");
+    asm("add r10, 1\n");
+    asm("cmp r10, r8\n");
+    asm("jb .Lvp9dsp_ptm_row\n");
+    asm(".Lvp9dsp_ptm_done:\n");
+    asm("ret\n");
+}

@@ -171,11 +171,71 @@ struct Vp9Blk {
     scratch as *u8;            // inter prediction intermediate buffer
     cc as *res.Vp9CoefCtx;
     coef as *i64;
+
+    // Section 9.3.4 counters of the thread that decodes this block. The
+    // sequential path leaves this null and counts into b.st.counts, exactly
+    // as before; the tile-threaded path (threads.cst) gives every worker
+    // its own counter set so no two threads touch the same counter word,
+    // then sums them after the join.
+    counts as *t.Vp9Counts;
 }
 
 fn _zero(p as *u8, n as i64) as void {
     let is i64 as i with mut = 0;
     while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+// The section 9.3.4 counter set this block increments: the worker's own set
+// when threads.cst is decoding tiles in parallel, otherwise the shared
+// Vp9State.counts of the sequential decoder.
+fn _cnt(b as *Vp9Blk) as *t.Vp9Counts {
+    if (cast(i64, b.counts) != 0) { return b.counts; }
+    return &b.st.counts;
+}
+
+// Copy the frame-wide half of a block context (the per-worker pointers are
+// overwritten by the caller). threads.cst calls this once per worker to give
+// it the shared work arrays and the private left/coefficient buffers.
+fn blk_copy(d as *Vp9Blk, s as *Vp9Blk) as void {
+    if (cast(i64, d) == 0 || cast(i64, s) == 0) { return; }
+    d.h = s.h;
+    d.st = s.st;
+    d.fr = s.fr;
+    d.mi_cols = s.mi_cols;
+    d.mi_rows = s.mi_rows;
+    d.mi_col_start = s.mi_col_start;
+    d.mi_col_end = s.mi_col_end;
+    d.acols = s.acols;
+    d.arows = s.arows;
+    d.sub_x = s.sub_x;
+    d.sub_y = s.sub_y;
+    d.lossless = s.lossless;
+    d.mi_sizes = s.mi_sizes;
+    d.tx_sizes = s.tx_sizes;
+    d.skips = s.skips;
+    d.segment_ids = s.segment_ids;
+    d.ref_frames = s.ref_frames;
+    d.y_modes = s.y_modes;
+    d.sub_modes = s.sub_modes;
+    d.prev_seg_ids = s.prev_seg_ids;
+    d.interp_filters = s.interp_filters;
+    d.mvs = s.mvs;
+    d.sub_mvs = s.sub_mvs;
+    d.prev_ref_frames = s.prev_ref_frames;
+    d.prev_mvs = s.prev_mvs;
+    d.above_part = s.above_part;
+    d.left_part = s.left_part;
+    d.above_segpred = s.above_segpred;
+    d.left_segpred = s.left_segpred;
+    d.above_nz = s.above_nz;
+    d.left_nz = s.left_nz;
+    d.nz_above_stride = s.nz_above_stride;
+    d.nz_left_stride = s.nz_left_stride;
+    d.refs = s.refs;
+    d.scratch = s.scratch;
+    d.cc = s.cc;
+    d.coef = s.coef;
+    d.counts = s.counts;
 }
 
 // Section 7.4.1: clear AbovePartitionContext, AboveNonzeroContext and
@@ -278,6 +338,7 @@ fn _read_tx_size(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
     let is i64 as max_tx = rt.recon_max_txsize(bs);
     if (max_tx < 0) { return errno.I_CORRUPT; }
     if (max_tx > rt.TX_32X32) { return errno.I_CORRUPT; }
+    let is *t.Vp9Counts as cnt = _cnt(b);
 
     if (allow_select == 1 && b.h.tx_mode == t.VP9_TX_MODE_SELECT
         && bs >= rt.BLOCK_8X8) {
@@ -322,8 +383,8 @@ fn _read_tx_size(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
             tx_sz = tx_sz + b3;
         }
         if (tx_sz < 0 || tx_sz > max_tx) { return errno.I_CORRUPT; }
-        b.st.counts.tx[max_tx][ctx][tx_sz] =
-            b.st.counts.tx[max_tx][ctx][tx_sz] + 1;
+        cnt.tx[max_tx][ctx][tx_sz] =
+            cnt.tx[max_tx][ctx][tx_sz] + 1;
         return tx_sz;
     }
 
@@ -385,6 +446,7 @@ fn _read_skip(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
     if (segment_id < 0 || segment_id >= rt.MAX_SEGMENTS) {
         return errno.I_CORRUPT;
     }
+    let is *t.Vp9Counts as cnt = _cnt(b);
     let is i64 as sk with mut = 0;
     if (b.h.seg_enabled == 1
         && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_SKIP] == 1) {
@@ -400,7 +462,7 @@ fn _read_skip(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
                                              cast(i64, b.st.probs.skip[ctx]));
         if (bit < 0) { return bit; }
         sk = bit;
-        b.st.counts.skip[ctx][sk] = b.st.counts.skip[ctx][sk] + 1;
+        cnt.skip[ctx][sk] = cnt.skip[ctx][sk] + 1;
     }
     *out = sk;
     return errno.I_OK;
@@ -432,6 +494,7 @@ fn _read_intra_modes(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
     if (cast(i64, b) == 0 || cast(i64, sm) == 0) { return errno.I_BADPARAM; }
     if (cast(i64, ym) == 0 || cast(i64, uvm) == 0) { return errno.I_BADPARAM; }
     if (kf != 0 && kf != 1) { return errno.I_BADPARAM; }
+    let is *t.Vp9Counts as cnt = _cnt(b);
 
     let is i64 as group = _size_group(bs);
     let is i64 as mode_y with mut = 0;
@@ -452,8 +515,8 @@ fn _read_intra_modes(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
         if (mode_y < 0) { return mode_y; }
         if (mode_y >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
         if (kf == 0) {
-            b.st.counts.y_mode[group][mode_y] =
-                b.st.counts.y_mode[group][mode_y] + 1;
+            cnt.y_mode[group][mode_y] =
+                cnt.y_mode[group][mode_y] + 1;
         }
         sm[0] = cast(u8, mode_y);
         sm[1] = cast(u8, mode_y);
@@ -490,7 +553,7 @@ fn _read_intra_modes(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
                 if (m < 0) { return m; }
                 if (m >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
                 if (kf == 0) {
-                    b.st.counts.y_mode[0][m] = b.st.counts.y_mode[0][m] + 1;
+                    cnt.y_mode[0][m] = cnt.y_mode[0][m] + 1;
                 }
                 let is i64 as y2 with mut = 0;
                 while (y2 < n4h) {
@@ -518,8 +581,8 @@ fn _read_intra_modes(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
     if (mode_uv < 0) { return mode_uv; }
     if (mode_uv >= t.VP9_INTRA_MODES) { return errno.I_CORRUPT; }
     if (kf == 0) {
-        b.st.counts.uv_mode[mode_y][mode_uv] =
-            b.st.counts.uv_mode[mode_y][mode_uv] + 1;
+        cnt.uv_mode[mode_y][mode_uv] =
+            cnt.uv_mode[mode_y][mode_uv] + 1;
     }
 
     *ym = mode_y;
@@ -612,6 +675,7 @@ fn _neigh_refs(b as *Vp9Blk, r as i64, c as i64, n as *NeighRefs) as void {
 // read_is_inter (section 6.4.13).
 fn _read_is_inter(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
                   n as *NeighRefs, out as *i64) as i64 {
+    let is *t.Vp9Counts as cnt = _cnt(b);
     if (b.h.seg_enabled == 1
         && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_REF_FRAME] == 1) {
         let is i64 as rf =
@@ -640,7 +704,7 @@ fn _read_is_inter(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
     let is i64 as bit = vb.vp9_bool_read(br,
                                          cast(i64, b.st.probs.is_inter[ctx]));
     if (bit < 0) { return bit; }
-    b.st.counts.is_inter[ctx][bit] = b.st.counts.is_inter[ctx][bit] + 1;
+    cnt.is_inter[ctx][bit] = cnt.is_inter[ctx][bit] + 1;
     *out = bit;
     return errno.I_OK;
 }
@@ -725,6 +789,7 @@ fn _read_inter_mode(b as *Vp9Blk, br as *vb.Vp9Bool, ctx as i64) as i64 {
     if (ctx < 0 || ctx >= t.VP9_INTER_MODE_CONTEXTS) {
         return errno.I_CORRUPT;
     }
+    let is *t.Vp9Counts as cnt = _cnt(b);
     let is i64 as p0 = cast(i64, b.st.probs.inter_mode[ctx][0]);
     let is i64 as b0 = vb.vp9_bool_read(br, p0);
     if (b0 < 0) { return b0; }
@@ -743,8 +808,8 @@ fn _read_inter_mode(b as *Vp9Blk, br as *vb.Vp9Bool, ctx as i64) as i64 {
             else { mode = 3; }          // NEWMV
         }
     }
-    b.st.counts.inter_mode[ctx][mode] =
-        b.st.counts.inter_mode[ctx][mode] + 1;
+    cnt.inter_mode[ctx][mode] =
+        cnt.inter_mode[ctx][mode] + 1;
     return mode;
 }
 
@@ -752,6 +817,7 @@ fn _read_inter_mode(b as *Vp9Blk, br as *vb.Vp9Bool, ctx as i64) as i64 {
 fn _read_interp_filter(b as *Vp9Blk, br as *vb.Vp9Bool,
                        n as *NeighRefs, r as i64, c as i64,
                        out as *i64) as i64 {
+    let is *t.Vp9Counts as cnt = _cnt(b);
     if (b.h.interpolation_filter != t.VP9_SWITCHABLE) {
         *out = b.h.interpolation_filter;
         return errno.I_OK;
@@ -787,8 +853,8 @@ fn _read_interp_filter(b as *Vp9Blk, br as *vb.Vp9Bool,
         if (bit2 == 0) { f = it.EIGHTTAP_SMOOTH; }
         else { f = it.EIGHTTAP_SHARP; }
     }
-    b.st.counts.interp_filter[ctx][f] =
-        b.st.counts.interp_filter[ctx][f] + 1;
+    cnt.interp_filter[ctx][f] =
+        cnt.interp_filter[ctx][f] + 1;
     *out = f;
     return errno.I_OK;
 }
@@ -882,37 +948,38 @@ fn _read_mv_component(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64,
                       use_hp as i64, out as *i64) as i64 {
     if (comp < 0 || comp > 1) { return errno.I_BADPARAM; }
     if (use_hp != 0 && use_hp != 1) { return errno.I_BADPARAM; }
+    let is *t.Vp9Counts as cnt = _cnt(b);
 
     let is i64 as sign = vb.vp9_bool_read(br,
         cast(i64, b.st.probs.mv_sign[comp]));
     if (sign < 0) { return sign; }
-    b.st.counts.mv_sign[comp][sign] =
-        b.st.counts.mv_sign[comp][sign] + 1;
+    cnt.mv_sign[comp][sign] =
+        cnt.mv_sign[comp][sign] + 1;
 
     let is i64 as cls = _read_mv_class(b, br, comp);
     if (cls < 0) { return cls; }
-    b.st.counts.mv_class[comp][cls] =
-        b.st.counts.mv_class[comp][cls] + 1;
+    cnt.mv_class[comp][cls] =
+        cnt.mv_class[comp][cls] + 1;
 
     let is i64 as mag with mut = 0;
     if (cls == 0) {
         let is i64 as bit = vb.vp9_bool_read(br,
             cast(i64, b.st.probs.mv_class0_bit[comp]));
         if (bit < 0) { return bit; }
-        b.st.counts.mv_class0_bit[comp][bit] =
-            b.st.counts.mv_class0_bit[comp][bit] + 1;
+        cnt.mv_class0_bit[comp][bit] =
+            cnt.mv_class0_bit[comp][bit] + 1;
         let is i64 as fr = _read_mv_fr(br,
             &b.st.probs.mv_class0_fr[comp][bit][0]);
         if (fr < 0) { return fr; }
-        b.st.counts.mv_class0_fr[comp][bit][fr] =
-            b.st.counts.mv_class0_fr[comp][bit][fr] + 1;
+        cnt.mv_class0_fr[comp][bit][fr] =
+            cnt.mv_class0_fr[comp][bit][fr] + 1;
         let is i64 as hp with mut = 1;
         if (use_hp == 1) {
             hp = vb.vp9_bool_read(br,
                 cast(i64, b.st.probs.mv_class0_hp[comp]));
             if (hp < 0) { return hp; }
-            b.st.counts.mv_class0_hp[comp][hp] =
-                b.st.counts.mv_class0_hp[comp][hp] + 1;
+            cnt.mv_class0_hp[comp][hp] =
+                cnt.mv_class0_hp[comp][hp] + 1;
         }
         mag = ((bit << 3) | (fr << 1) | hp) + 1;
     } else {
@@ -922,21 +989,21 @@ fn _read_mv_component(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64,
             let is i64 as bit = vb.vp9_bool_read(br,
                 cast(i64, b.st.probs.mv_bits[comp][i]));
             if (bit < 0) { return bit; }
-            b.st.counts.mv_bits[comp][i][bit] =
-                b.st.counts.mv_bits[comp][i][bit] + 1;
+            cnt.mv_bits[comp][i][bit] =
+                cnt.mv_bits[comp][i][bit] + 1;
             d = d | (bit << i);
             i = i + 1;
         }
         mag = 2 << (cls + 2);
         let is i64 as fr = _read_mv_fr(br, &b.st.probs.mv_fr[comp][0]);
         if (fr < 0) { return fr; }
-        b.st.counts.mv_fr[comp][fr] = b.st.counts.mv_fr[comp][fr] + 1;
+        cnt.mv_fr[comp][fr] = cnt.mv_fr[comp][fr] + 1;
         let is i64 as hp with mut = 1;
         if (use_hp == 1) {
             hp = vb.vp9_bool_read(br, cast(i64, b.st.probs.mv_hp[comp]));
             if (hp < 0) { return hp; }
-            b.st.counts.mv_hp[comp][hp] =
-                b.st.counts.mv_hp[comp][hp] + 1;
+            cnt.mv_hp[comp][hp] =
+                cnt.mv_hp[comp][hp] + 1;
         }
         mag = mag + ((d << 3) | (fr << 1) | hp) + 1;
     }
@@ -950,6 +1017,7 @@ fn _read_mv(b as *Vp9Blk, br as *vb.Vp9Bool, ref_list as i64,
             best_row as i64, best_col as i64,
             out_row as *i64, out_col as *i64) as i64 {
     if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
+    let is *t.Vp9Counts as cnt = _cnt(b);
     let is i64 as use_hp with mut = 0;
     if (b.h.allow_high_precision_mv == 1
         && mvp.mv_use_hp(best_row, best_col) == 1) {
@@ -958,7 +1026,7 @@ fn _read_mv(b as *Vp9Blk, br as *vb.Vp9Bool, ref_list as i64,
 
     let is i64 as joint = _read_mv_joint(b, br);
     if (joint < 0) { return joint; }
-    b.st.counts.mv_joint[joint] = b.st.counts.mv_joint[joint] + 1;
+    cnt.mv_joint[joint] = cnt.mv_joint[joint] + 1;
 
     let is i64 as drow with mut = 0;
     let is i64 as dcol with mut = 0;
@@ -1219,6 +1287,7 @@ fn _single_p2_ctx(n as *NeighRefs) as i64 {
 // read_ref_frames (section 6.4.17).
 fn _read_ref_frames(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
                     n as *NeighRefs, mi as *ModeInfo) as i64 {
+    let is *t.Vp9Counts as cnt = _cnt(b);
     if (b.h.seg_enabled == 1
         && b.h.seg_feature_enabled[segment_id][t.VP9_SEG_LVL_REF_FRAME] == 1) {
         let is i64 as rf =
@@ -1240,8 +1309,8 @@ fn _read_ref_frames(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
         let is i64 as bit = vb.vp9_bool_read(br,
             cast(i64, b.st.probs.comp_mode[ctx]));
         if (bit < 0) { return bit; }
-        b.st.counts.comp_mode[ctx][bit] =
-            b.st.counts.comp_mode[ctx][bit] + 1;
+        cnt.comp_mode[ctx][bit] =
+            cnt.comp_mode[ctx][bit] + 1;
         comp_mode = bit;
     } else {
         comp_mode = b.h.reference_mode;
@@ -1256,8 +1325,8 @@ fn _read_ref_frames(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
         let is i64 as bit = vb.vp9_bool_read(br,
             cast(i64, b.st.probs.comp_ref[ctx]));
         if (bit < 0) { return bit; }
-        b.st.counts.comp_ref[ctx][bit] =
-            b.st.counts.comp_ref[ctx][bit] + 1;
+        cnt.comp_ref[ctx][bit] =
+            cnt.comp_ref[ctx][bit] + 1;
         mi.ref_frame[idx] = fixed;
         mi.ref_frame[1 - idx] = b.h.comp_var_ref[bit];
     } else if (comp_mode == t.VP9_SINGLE_REFERENCE) {
@@ -1268,8 +1337,8 @@ fn _read_ref_frames(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
         let is i64 as bit0 = vb.vp9_bool_read(br,
             cast(i64, b.st.probs.single_ref[ctx0][0]));
         if (bit0 < 0) { return bit0; }
-        b.st.counts.single_ref[ctx0][0][bit0] =
-            b.st.counts.single_ref[ctx0][0][bit0] + 1;
+        cnt.single_ref[ctx0][0][bit0] =
+            cnt.single_ref[ctx0][0][bit0] + 1;
         if (bit0 == 1) {
             let is i64 as ctx1 = _single_p2_ctx(n);
             if (ctx1 < 0 || ctx1 >= t.VP9_REF_CONTEXTS) {
@@ -1278,8 +1347,8 @@ fn _read_ref_frames(b as *Vp9Blk, br as *vb.Vp9Bool, segment_id as i64,
             let is i64 as bit1 = vb.vp9_bool_read(br,
                 cast(i64, b.st.probs.single_ref[ctx1][1]));
             if (bit1 < 0) { return bit1; }
-            b.st.counts.single_ref[ctx1][1][bit1] =
-                b.st.counts.single_ref[ctx1][1][bit1] + 1;
+            cnt.single_ref[ctx1][1][bit1] =
+                cnt.single_ref[ctx1][1][bit1] + 1;
             if (bit1 == 1) { mi.ref_frame[0] = it.ALTREF_FRAME; }
             else { mi.ref_frame[0] = it.GOLDEN_FRAME; }
         } else {
@@ -1800,6 +1869,7 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
     }
     if (cast(i64, b.cc) == 0) { return errno.I_BADPARAM; }
     if (cast(i64, b.coef) == 0) { return errno.I_BADPARAM; }
+    let is *t.Vp9Counts as cnt = _cnt(b);
 
     let is i64 as segment_id = mi.segment_id;
     let is i64 as skip = mi.skip;
@@ -1909,7 +1979,7 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                                                         b.lossless,
                                                         mi.is_inter, mode);
                     if (txt < 0) { return txt; }
-                    st = res.vp9_residual_decode(br, &b.st.probs, &b.st.counts,
+                    st = res.vp9_residual_decode(br, &b.st.probs, cnt,
                                                  &q, plane, txs, txt,
                                                  mi.is_inter,
                                                  sx, sy, b.cc, b.coef,
@@ -2063,6 +2133,7 @@ fn _partition_ctx(b as *Vp9Blk, r as i64, c as i64, bs as i64,
 // header.cst's vp9_partition_prob, which implements the errata E1 rule.
 fn _read_partition(b as *Vp9Blk, br as *vb.Vp9Bool, ctx as i64,
                    has_rows as i64, has_cols as i64) as i64 {
+    let is *t.Vp9Counts as cnt = _cnt(b);
     let is i64 as part with mut = PART_SPLIT;
     if (has_rows == 1 && has_cols == 1) {
         let is i64 as p0 = hd.vp9_partition_prob(b.h, &b.st.probs, ctx, 0);
@@ -2107,7 +2178,7 @@ fn _read_partition(b as *Vp9Blk, br as *vb.Vp9Bool, ctx as i64,
     }
     if (part < 0 || part > PART_SPLIT) { return errno.I_CORRUPT; }
     if (ctx < 0 || ctx >= t.VP9_PARTITION_CONTEXTS) { return errno.I_CORRUPT; }
-    b.st.counts.partition[ctx][part] = b.st.counts.partition[ctx][part] + 1;
+    cnt.partition[ctx][part] = cnt.partition[ctx][part] + 1;
     return part;
 }
 

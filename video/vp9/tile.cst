@@ -18,9 +18,25 @@
 //     inside a tile, so information from a different tile cannot leak in
 //     from the left.
 //
+// Tiles in different columns are independent; section 2's note says a tile
+// whose row is not the first depends on the tile above it, so the only
+// parallel axis is the tile column. tile_decode_all keeps the sequential
+// raster walk and adds an optional split of the frame's tile columns over a
+// worker pool (threads.cst): one worker decodes one contiguous range of
+// tile columns for every tile row, in ascending row order, which preserves
+// the per-column above-context chain and writes only its own columns. The
+// choice is per frame: an unbound pool, a worker count of 0/1, or a frame
+// with a single tile column all take the sequential walk, whose behaviour
+// is unchanged.
+//
 // Every tile is independent in the bitstream; an error in one aborts the
 // frame with its negative status rather than resynchronising, since the
-// frame cannot be reconstructed once a tile is lost.
+// frame cannot be reconstructed once a tile is lost. In the threaded walk
+// an error still aborts the frame; the status returned is the smallest
+// (row, column) among the failures the workers reached, which is
+// deterministic but, for a multiply corrupt frame, not necessarily the tile
+// the sequential raster walk would have reported first (a worker stops at
+// its own first failure in column-major order).
 // =======================================================
 
 use "../../core/errno.cst" as errno;
@@ -28,6 +44,15 @@ use "bool.cst" as vb;
 use "header.cst" as hd;
 use "recon_tables.cst" as rt;
 use "block.cst" as blk;
+use "threads.cst" as threads;
+
+// Worker slots for the parallel walk. Must equal threads.VP9_MAX_WORKERS,
+// the number of slots Vp9Threads hands out; the pool clamps the requested
+// count to that value, and this array must be able to hold every slot. A
+// cross-module constant is not used as an array length here, so the
+// equality is kept by hand; if the two drift, _tile_decode_mt refuses the
+// frame with I_BADPARAM instead of indexing past this array.
+let is i64 as TILE_MT_MAX with imut = 16;
 
 // get_tile_offset (section 6.4.1): the first mode-info row/column of a tile.
 // `mis` is MiRows or MiCols, `tile_sz_log2` the tile-column/row log2.
@@ -66,10 +91,239 @@ fn _decode_tile(b as *blk.Vp9Blk, br as *vb.Vp9Bool,
 fn t_max_cols_log2() as i64 { return 6; }
 fn t_max_rows_log2() as i64 { return 2; }
 
-// decode_tiles (section 6.4): validate every tile range against the frame
-// slice, then decode each tile in header order. `len` is the whole coded
+// ── tile-threaded walk ──────────────────────────────────────────────
+
+// One worker's assignment: tile columns [first, last) of every tile row,
+// decoded top to bottom. `b` is the worker's block context from
+// threads.cst: the frame-wide work arrays and above contexts are shared,
+// while its left contexts, coefficient buffer, inter scratch, coefficient
+// context and counters are private.
+struct Vp9TileJob {
+    b        as *blk.Vp9Blk;
+    h        as *hd.Vp9Header;
+    data     as *u8;
+    len      as i64;
+    cols     as i64;       // tile columns of the frame
+    first    as i64;       // first tile column of this worker
+    last     as i64;       // one past the last
+    fail_row as i64;
+    fail_col as i64;
+    status   as i64;
+}
+
+// Record the first failing tile of a worker and yield its code. Split out
+// so every failure path in _tile_worker_run stays one statement.
+fn _job_fail(j as *Vp9TileJob, row as i64, col as i64, st as i64) as i64 {
+    j.fail_row = row;
+    j.fail_col = col;
+    return st;
+}
+
+// Decode one worker's tile columns. Each tile is decoded exactly as the
+// sequential walk does: bounds from get_tile_offset, its own Boolean
+// decoder over h.tiles.off/len, the partition walk of block.cst, and the
+// section 9.2.3 exit check. The above contexts at this tile's columns were
+// left by the previous tile row of the same column, which this worker
+// decoded earlier; the left contexts are cleared by _decode_tile at every
+// mode-info row.
+fn _tile_worker_run(j as *Vp9TileJob) as i64 {
+    let is *hd.Vp9Header as h = j.h;
+    let is *blk.Vp9Blk as b = j.b;
+    if (cast(i64, b) == 0) { return errno.I_BADPARAM; }
+    let is i64 as rows = 1 << h.tile_rows_log2;
+    let is i64 as tc with mut = j.first;
+    while (tc < j.last) {
+        let is i64 as tr with mut = 0;
+        while (tr < rows) {
+            let is i64 as row_start = tile_offset(tr, h.mi_rows,
+                                                  h.tile_rows_log2);
+            let is i64 as row_end = tile_offset(tr + 1, h.mi_rows,
+                                                h.tile_rows_log2);
+            let is i64 as col_start = tile_offset(tc, h.mi_cols,
+                                                  h.tile_cols_log2);
+            let is i64 as col_end = tile_offset(tc + 1, h.mi_cols,
+                                                h.tile_cols_log2);
+            if (row_start < 0 || row_end < 0 || col_start < 0
+                || col_end < 0) {
+                return _job_fail(j, tr, tc, errno.I_CORRUPT);
+            }
+            let is i64 as ti = tr * j.cols + tc;
+            if (ti < 0 || ti >= h.tiles.count) {
+                return _job_fail(j, tr, tc, errno.I_CORRUPT);
+            }
+            let is i64 as off = h.tiles.off[ti];
+            let is i64 as tlen = h.tiles.len[ti];
+            if (off < 0 || tlen < 1) {
+                return _job_fail(j, tr, tc, errno.I_CORRUPT);
+            }
+            if (off > j.len) {
+                return _job_fail(j, tr, tc, errno.I_CORRUPT);
+            }
+            if (tlen > j.len - off) {
+                return _job_fail(j, tr, tc, errno.I_CORRUPT);
+            }
+
+            b.mi_col_start = col_start;
+            b.mi_col_end = col_end;
+            let is vb.Vp9Bool as br;
+            let is i64 as st with mut = vb.vp9_bool_init(&br,
+                cast(*u8, cast(i64, j.data) + off), tlen);
+            if (st < 0) { return _job_fail(j, tr, tc, st); }
+            st = _decode_tile(b, &br, row_start, row_end,
+                              col_start, col_end);
+            if (st < 0) { return _job_fail(j, tr, tc, st); }
+            st = vb.vp9_bool_exit(&br);
+            if (st < 0) { return _job_fail(j, tr, tc, st); }
+
+            tr = tr + 1;
+        }
+        tc = tc + 1;
+    }
+    return errno.I_OK;
+}
+
+// thread.spawn entry point. The argument is the job pointer; the returned
+// value and j.status carry the worker's first error (0 when it decoded
+// every assigned tile).
+fn _tile_worker(arg as i64) as i64 {
+    let is *Vp9TileJob as j = cast(*Vp9TileJob, arg);
+    if (cast(i64, j) == 0) { return errno.I_BADPARAM; }
+    j.fail_row = 0 - 1;
+    j.fail_col = 0 - 1;
+    j.status = _tile_worker_run(j);
+    return j.status;
+}
+
+// Validate every tile range in the frame and run the tile columns over k
+// workers. Called only with k >= 2 and cols >= 2. Worker 0 runs on the
+// calling thread; workers 1..k-1 are spawned, joined, and any range whose
+// spawn failed is decoded by the calling thread afterwards. The recorded
+// failure with the smallest (row, column) is returned; on success the
+// per-worker counters are summed into Vp9State.counts in worker order and
+// I_OK is returned. The pick is deterministic but, because each worker
+// stops at its own first failure while walking its columns column-major, it
+// is not in general the tile the sequential raster walk would have failed
+// on first.
+//
+// Validation is done for the whole grid before a worker starts: a worker
+// must never be given an offset/length pair it has to trust. The sequential
+// walk validates lazily, tile by tile; both refuse the same stream, and a
+// corrupt stream's precise error code is not a valid-stream contract.
+fn _tile_decode_mt(b as *blk.Vp9Blk, data as *u8, len as i64,
+                   h as *hd.Vp9Header, cols as i64, rows as i64,
+                   th as *threads.Vp9Threads, k as i64) as i64 {
+    // The pool clamps to its own slot count; this keeps the job array safe
+    // even if the two constants ever drift apart.
+    if (k < 2 || k > TILE_MT_MAX) { return errno.I_BADPARAM; }
+    let is i64 as ti with mut = 0;
+    let is i64 as count = cols * rows;
+    while (ti < count) {
+        let is i64 as off = h.tiles.off[ti];
+        let is i64 as tlen = h.tiles.len[ti];
+        if (off < 0 || tlen < 1) { return errno.I_CORRUPT; }
+        if (off > len) { return errno.I_CORRUPT; }
+        if (tlen > len - off) { return errno.I_CORRUPT; }
+        ti = ti + 1;
+    }
+
+    let is [TILE_MT_MAX]Vp9TileJob as jobs;
+    let is i64 as w with mut = 0;
+    while (w < k) {
+        let is i64 as first with mut = 0;
+        let is i64 as last with mut = 0;
+        let is i64 as sp = threads.vp9_threads_split(cols, k, w,
+                                                     &first, &last);
+        if (sp < 0) { return sp; }
+        let is *blk.Vp9Blk as wb = threads.vp9_threads_blk(th, w);
+        if (cast(i64, wb) == 0) { return errno.I_BADPARAM; }
+        jobs[w].b = wb;
+        jobs[w].h = h;
+        jobs[w].data = data;
+        jobs[w].len = len;
+        jobs[w].cols = cols;
+        jobs[w].first = first;
+        jobs[w].last = last;
+        jobs[w].fail_row = 0 - 1;
+        jobs[w].fail_col = 0 - 1;
+        jobs[w].status = 0;
+        w = w + 1;
+    }
+
+    w = 1;
+    while (w < k) {
+        // A refused spawn is not a decode error: the caller decodes that
+        // range below, so every tile is decoded exactly once either way.
+        threads.vp9_threads_spawn(th, w, fn_ptr(_tile_worker),
+                                  cast(i64, &jobs[w]));
+        w = w + 1;
+    }
+
+    _tile_worker(cast(i64, &jobs[0]));
+
+    w = 1;
+    while (w < k) {
+        if (threads.vp9_threads_started(th, w) == 1) {
+            threads.vp9_threads_join(th, w);
+        } else {
+            _tile_worker(cast(i64, &jobs[w]));
+        }
+        w = w + 1;
+    }
+
+    // Deterministic pick: the recorded failure with the smallest (row,
+    // column). It depends only on the bitstream and the fixed column
+    // assignment; it is not in general the sequential raster walk's first
+    // failure, because a worker stops at its own first failure while
+    // walking its columns column-major. Worker ranges are disjoint, so no
+    // two failures share a position.
+    let is i64 as best with mut = 0;
+    let is i64 as best_row with mut = 0 - 1;
+    let is i64 as best_col with mut = 0 - 1;
+    w = 0;
+    while (w < k) {
+        if (jobs[w].status < 0) {
+            let is i64 as fr = jobs[w].fail_row;
+            let is i64 as fc = jobs[w].fail_col;
+            if (best == 0 || fr < best_row
+                || (fr == best_row && fc < best_col)) {
+                best = jobs[w].status;
+                best_row = fr;
+                best_col = fc;
+            }
+        }
+        w = w + 1;
+    }
+    if (best != 0) { return best; }
+
+    // Section 9.3.4 totals: the same sum the sequential walk would have
+    // accumulated in Vp9State.counts. Summed in worker order so the result
+    // is reproducible; integer addition makes the order irrelevant anyway.
+    w = 0;
+    while (w < k) {
+        let is i64 as ms = threads.vp9_threads_sum_counts(th, w,
+                                                          &b.st.counts);
+        if (ms < 0) { return ms; }
+        w = w + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── sequential walk ─────────────────────────────────────────────────
+
+// decode_tiles (section 6.4): validate the tile layout, clear the above
+// contexts, then decode each tile in header order. `len` is the whole coded
 // frame slice; h.tiles.off/len are offsets into it.
-fn tile_decode_all(b as *blk.Vp9Blk, data as *u8, len as i64) as i64 {
+//
+// `th` is the optional worker pool. A null pool, fewer than two requested
+// workers, or a frame with one tile column all take the raster walk below,
+// whose result is unchanged. Otherwise the frame's tile columns are split
+// over the pool by _tile_decode_mt. The sequential walk returns its first
+// failure in raster order; the threaded walk returns the smallest (row,
+// column) among the failures its workers reached (deterministic, but not in
+// general the sequential first failure for a multiply corrupt frame). Both
+// leave the persistent state tainted on failure.
+fn tile_decode_all(b as *blk.Vp9Blk, data as *u8, len as i64,
+                   th as *threads.Vp9Threads) as i64 {
     if (cast(i64, b) == 0 || cast(i64, b.h) == 0) { return errno.I_BADPARAM; }
     if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
     if (len < 0) { return errno.I_BADPARAM; }
@@ -90,6 +344,21 @@ fn tile_decode_all(b as *blk.Vp9Blk, data as *u8, len as i64) as i64 {
 
     // Section 7.4.1: the above contexts are cleared once, before any tile.
     blk.blk_clear_above(b);
+
+    // Optional column split. The pool's slots depend on this frame's grid,
+    // so prepare carves them first; it reports I_NOMEM (with thr.need set)
+    // rather than silently falling back when the caller sized the block for
+    // a smaller frame.
+    let is i64 as want with mut = 0;
+    if (cast(i64, th) != 0) { want = threads.vp9_threads_workers(th); }
+    if (want > cols) { want = cols; }
+    if (want > 1) {
+        let is i64 as k = threads.vp9_threads_prepare(th, b, want);
+        if (k < 0) { return k; }
+        if (k > 1) {
+            return _tile_decode_mt(b, data, len, h, cols, rows, th, k);
+        }
+    }
 
     let is i64 as ti with mut = 0;
     let is i64 as tile_row with mut = 0;
