@@ -21,11 +21,14 @@
 //   * the polyphase window D is read from mp3_tables.cst
 //     (mp3_synth_window), the dimensionless Table 3-B.3 values.
 //
-// The synthesis matrix is the unnormalised 32-point cosine matrix of
-// 2.4.3.4, whose gain is 32. The IMDCT output is therefore scaled by
-// MP3_IMDCT_SCALE = 1/32 before the matrix, which is the same convention
-// FFmpeg's float window uses (its MDCT window is divided by 32). The final
-// natural sample is multiplied by 32768 to obtain s16.
+// The requantization formula is the complete scaling: 2.4.3.4 says that
+// "all necessary scaling factors are contained within this formula", that
+// the constant 210 is "a system constant", and that the synthesis
+// filterbank is implemented "according to the formulas below", with PCM
+// output in [-1, 1]. The IMDCT expression and the unnormalised 32-point
+// matrix are therefore both used as printed and the chain needs no global
+// gain: MP3_IMDCT_SCALE is 1. The final natural sample is multiplied by
+// 32768 to obtain s16.
 //
 // State
 // -----
@@ -44,9 +47,11 @@ use "std/math.cst" as fm;
 use "mp3_tables.cst" as tbl;
 
 let is f64 as MP3_PI with imut = 3.141592653589793;
-let is f64 as MP3_INV_SQRT2 with imut = 0.70710678118654752440;
-// 1/32: the 32-point synthesis matrix below is unnormalised.
-let is f64 as MP3_IMDCT_SCALE with imut = 0.03125;
+// The one explicit global scale of the reconstruction chain. The printed
+// requantization, IMDCT and synthesis matrix already span full scale
+// (2.4.3.4), so it is unity; it stays named as the single place a PCM
+// comparison would adjust.
+let is f64 as MP3_IMDCT_SCALE with imut = 1.0;
 
 // Per-channel 18-value overlap per subband: [ch][32][18] flattened.
 let is i64 as MP3_SYN_OVERLAP with imut = 1152;
