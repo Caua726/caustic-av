@@ -78,11 +78,14 @@ must have been split first with `vp9_superframe_split`.
   refresh/parallel flags, frame context index, `setup_past_independence`
   and the save-probs rules, loop filter, quantization, segmentation and tile
   info, then `header_size_in_bytes`.
-- Frame size with refs reads `found_ref` until one is set; a reference slot
-  that was never published, or whose profile/bit depth/subsampling/color
-  space differs from this frame, is `I_CORRUPT`. Inter frames inherit the
-  color configuration of the last coded frame, as they have no color config
-  of their own.
+- Inter frames read three `ref_frame_idx` values; every one of them must
+  name a slot published by `vp9_state_publish` and must match this frame in
+  profile, bit depth, chroma subsampling and color space, otherwise
+  `I_CORRUPT` (sections 7.2 and 8.2). Only then does frame size with refs
+  read `found_ref` until one is set and take that reference's dimensions.
+  The size-ratio conformance check of section 7.2.5 is not performed; see
+  Pending review notes. Inter frames inherit the color configuration of the
+  last coded frame, as they have no color config of their own.
 - Compressed header: `load_probs`, `load_probs2`, `clear_counts`, then
   `init_bool(header_size_in_bytes)` and, in specification order, tx mode,
   tx mode probs, coefficient probs, skip probs and — for inter frames —
@@ -130,7 +133,7 @@ are correct without the blobs. `vp9_tables_ready()` reports the state, and
 
 ## Errata
 
-All three items are **UNCONFIRMED** until an external reference run confirms
+All four items are **UNCONFIRMED** until an external reference run confirms
 them. The reference decoders below were read (not copied) to settle each
 ambiguity; no test has been executed in this phase.
 
@@ -218,6 +221,60 @@ hidden frames in superframes) and confirm the per-frame byte ranges match
 big-endian reading produces frame sizes in the millions and fails the
 sum check immediately.
 
+### E4. Profile-0 intra-only frames never assign `color_range` (UNCONFIRMED)
+
+Section 6.2 says that when `intra_only == 1` and `Profile == 0` the frame
+codes no color config; the branch assigns `color_space = CS_BT_601`,
+`subsampling_x = subsampling_y = 1` and `BitDepth = 8`, but never
+`color_range`. Section 7.2.2 defines `color_range` and gives no default, so
+the value is unassigned by the syntax.
+
+Both reference decoders set studio range (0). libvpx
+`read_uncompressed_header` writes `cm->color_range = VPX_CR_STUDIO_RANGE`
+for this branch (with a comment that the 4:2:0 default is normative), and
+FFmpeg `decode_frame_header` writes `avctx->color_range = AVCOL_RANGE_MPEG`.
+
+**Adopted rule.** `color_range = 0` for a profile-0 intra-only frame. Inter
+frames inherit it through `st.cur_color_range` until the next key or
+intra-only frame sets a new value.
+
+## Pending review notes
+
+Low-severity notes from the stage 3 review. None changes valid-stream
+output or memory safety; they are recorded here so stages 4-6 do not assume
+checks the header does not perform.
+
+1. **Frame-size ratio (section 7.2.5/8.5.2.3).** The header does not enforce
+   the conformance bounds that for at least one reference `i`, all of
+   `2 * FrameWidth >= RefFrameWidth[i]`, `2 * FrameHeight >=
+   RefFrameHeight[i]`, `FrameWidth <= 16 * RefFrameWidth[i]` and
+   `FrameHeight <= 16 * RefFrameHeight[i]` hold. Section 8.5.2.3 repeats
+   those bounds where the scale factors are computed, and libvpx rejects a
+   frame whose references all fail them ("Referenced frame has invalid
+   size"). Stage 4/6 must not assume the header bounded the scale ratio:
+   recheck it where the scale factors are built and treat a ratio outside
+   1/2..16 as `I_CORRUPT`.
+2. **Profile-0 intra-only `color_range`.** The value is set to 0 as the
+   references do, but the specification never assigns it. Recorded as E4,
+   UNCONFIRMED.
+3. **`show_existing_frame` header fields.** On that path only `profile`,
+   `show_existing_frame`, `frame_to_show_map_idx`, `frame_type`,
+   `intra_only`, `show_frame` and `refresh_frame_flags` are meaningful.
+   `width`, `height`, `mi_cols`, `mi_rows`, `sb64_cols`, `sb64_rows`,
+   `render_width`, `render_height`, the color fields and `frame_is_intra`
+   stay zero because neither `frame_size` nor `compute_image_size` runs
+   (sections 6.2 and 7.2.6) and must not be read. `frame_type` and
+   `intra_only` are copied from `st.last_frame_type`/`st.last_intra_only`.
+   Stage 6 must take the shown frame's geometry and format from
+   `frame_to_show_map_idx` and the `st.ref_*` arrays.
+4. **Segment-map clear split.** `h.seg_map_clear` covers only the clear
+   that `compute_image_size` performs when the frame size is first seen or
+   changes (section 7.2.6). `setup_past_independence` (section 7.2) also
+   clears `PrevSegmentIds` for the whole frame with no size condition and
+   does not touch `SegmentId` for the current frame. Stage 4 must apply the
+   latter when `frame_is_intra == 1 || error_resilient_mode == 1`,
+   independently of `seg_map_clear`.
+
 ## Limitations and deferred work
 
 - Profile 0 only; other profiles return `I_UNSUPPORTED`.
@@ -239,15 +296,18 @@ Only for behaviour and to settle the two errata; no code was copied, ported
 or transcribed.
 
 - libvpx `main`: `vp9/decoder/vp9_decodeframe.c` (uncompressed and compressed
-  header parsing, tile sizes), `vp9/decoder/vp9_dsubexp.c` (term subexp /
-  inverse remap), `vp9/decoder/vp9_detokenize.c` (coefficient counting),
-  `vp9/common/vp9_entropymode.c` (defaults, `setup_past_independence`),
-  `vp9/common/vp9_onyxc_int.h` (`set_partition_probs`,
-  `vp9_init_macroblockd`), `vp9/encoder/vp9_tokenize.c` (encoder-side branch
-  counts), `vp9/vp9_cx_iface.c` and `vp9/decoder/vp9_decoder.c`
-  (superframe index writer and parser), `vpx_dsp/bitreader.h`,
-  `vpx_dsp/bitreader.c` (Boolean decoder window).
-- FFmpeg `master`: `libavcodec/vp9.c` (`decode_frame_header`, compressed
+  header parsing including the `ref_frame_idx` loop and
+  `setup_frame_size_with_refs`, tile sizes), `vp9/decoder/vp9_dsubexp.c`
+  (term subexp / inverse remap), `vp9/decoder/vp9_detokenize.c`
+  (coefficient counting), `vp9/common/vp9_entropymode.c` (defaults,
+  `setup_past_independence`), `vp9/common/vp9_onyxc_int.h`
+  (`set_partition_probs`, `vp9_init_macroblockd`),
+  `vp9/encoder/vp9_tokenize.c` (encoder-side branch counts),
+  `vp9/vp9_cx_iface.c` and `vp9/decoder/vp9_decoder.c` (superframe index
+  writer and parser), `vpx_dsp/bitreader.h`, `vpx_dsp/bitreader.c`
+  (Boolean decoder window).
+- FFmpeg `master`: `libavcodec/vp9.c` (`decode_frame_header` including the
+  three-refidx availability and reference pixel-format checks, compressed
   header updates, keyframe partition-table selection in `decode_sb`),
   `libavcodec/vp9block.c` (block-level prob/count usage).
 - FFmpeg `n6.1`: `libavcodec/vp9_superframe_split_bsf.c` (superframe index
