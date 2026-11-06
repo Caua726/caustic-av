@@ -1,0 +1,546 @@
+// =======================================================
+// caustic-av/demux.cst
+// The top-level demuxer: identify the container by content, dispatch it, and
+// publish one packet at a time with a track list.
+//
+//   demux_sniff(src, len)        container kind, or a negative error
+//   demux_open(d, src, len)      bind the demuxer to caller-owned bytes
+//   demux_next(d, pkt)           1 = packet, 0 = end, negative = error
+//   demux_track_count(d)         tracks discovered so far
+//   demux_track(d, i)            one codec.Track, or null out of range
+//
+// No file is opened, no byte is copied, and nothing is allocated. Every packet
+// points into the caller's source buffer (or, for an Ogg packet that spans
+// pages, into the Ogg state's own fixed assembly buffer), so the bytes are
+// valid until the next demux_next call. The source itself must outlive the
+// Demux.
+//
+// Sniffing is by leading bytes only, in this order:
+//
+//   1A 45 DF A3           EBML header        -> DEMUX_MATROSKA
+//   4F 67 67 53 "OggS"    Ogg capture        -> DEMUX_OGG
+//   49 44 33 "ID3"        ID3v2 tag          -> DEMUX_MP3
+//   otherwise             let audio/mp3 scan for the first complete
+//                         MPEG-1/2/2.5 Layer III frame after leading junk
+//
+// This is a dispatch decision, not full validation: demux_open then runs the
+// container's own open, which checks the EBML DocType, the Ogg page CRC and
+// BOS rules, the MP3 header and ID3 sizes, and returns the precise error. A
+// file whose first bytes are EBML but whose DocType is neither "webm" nor
+// "matroska" is therefore I_BADMAGIC from matroska.mk_open, not a fourth
+// container. Anything that matches none of the three is I_BADMAGIC. An empty
+// source is I_EOF, because there were no bytes to identify.
+//
+// Tracks
+// ------
+//   Matroska: every TrackEntry the container accepts, in file order. The
+//             unified codec id comes from the CodecID string, CodecPrivate is
+//             the track's private data, and timestamps are nanoseconds
+//             (timebase 1/1e9). An A_OPUS CodecPrivate is parsed for its
+//             channel count and pre-skip; the output rate is 48000 Hz, the
+//             rate RFC 7845 fixes for Opus output, whatever SamplingFrequency
+//             the container stores.
+//   Ogg:      one track per logical stream serial. The BOS packet is the
+//             track's private data. Opus is the only mapping whose granule
+//             unit this stage interprets (48 kHz samples, RFC 7845 Section 4),
+//             so only that track gets rate 48000, channels/pre-skip from
+//             OpusHead, and timebase 1/48000. A chained stream adds a track
+//             when its BOS page is first reached, so the track count can grow
+//             during iteration.
+//   MP3:      one track, index 0, from the first frame's header. Timestamps
+//             are sample ticks at the frame's sample rate (timebase
+//             1/sample_rate) and advance by samples_per_frame per packet.
+//
+// Raw MP3
+// -------
+// Each packet is one complete Layer III frame: the 4-byte header, optional
+// CRC, side information and main data, exactly the bytes mp3_next validated.
+// The decoder reparses the header from the packet and keeps the bit
+// reservoir, which Matroska and Ogg carry inside the packet only for Opus.
+// keyframe is 1 only when the frame's main_data_begin is 0, i.e. when the
+// frame's main data is self-contained; a frame that reaches into the reservoir
+// of earlier frames reports 0. A frame whose sample rate or channel count
+// differs from the first frame is I_UNSUPPORTED: the published track and its
+// timebase cannot describe both, and this module does not silently retime the
+// rest of the stream. mp3_next never skips a corrupt frame in the middle of
+// the stream; that error is returned unchanged and iteration should stop.
+//
+// Errors
+// ------
+// The demuxers keep the core/errno convention: 0 for success, a negative code
+// for failure. demux_open clears the Demux before doing anything, so a failed
+// open leaves no tracks and demux_next returns 0. demux_next returns the
+// container's error unchanged (I_BADMAGIC, I_EOF, I_CORRUPT, I_UNSUPPORTED,
+// I_DIMS), or I_CORRUPT if a container ever produced a track index outside the
+// published list.
+// =======================================================
+
+use "core/errno.cst" as errno;
+use "core/codec.cst" as codec;
+use "core/packet.cst" as packet;
+use "container/matroska.cst" as matroska;
+use "container/ogg.cst" as ogg;
+use "audio/mp3/mp3.cst" as mp3;
+use "audio/opus/opus_head.cst" as opus_head;
+
+// ── Kinds and limits ────────────────────────────────────────────────
+
+let is i64 as DEMUX_NONE     with imut = 0;
+let is i64 as DEMUX_MATROSKA with imut = 1;
+let is i64 as DEMUX_OGG      with imut = 2;
+let is i64 as DEMUX_MP3      with imut = 3;
+
+// Matroska caps a file at 64 tracks and Ogg at 16, so one array of 64 is the
+// largest list either can produce. A count past it is corrupt, never an
+// allocation.
+let is i64 as DEMUX_MAX_TRACKS with imut = 64;
+
+// 2^62, the same positive ceiling core/frame and core/samples use, keeps
+// sample-tick timestamps from wrapping when they advance.
+let is i64 as DEMUX_PTS_LIMIT with imut = 4611686018427387904;
+
+// ── Demuxer state ───────────────────────────────────────────────────
+
+struct Demux {
+    kind  as i64;    // DEMUX_*, DEMUX_NONE after a failed open
+    src   as *u8;    // borrowed, for the whole Demux lifetime
+    len   as i64;
+    tracks as [64]codec.Track;
+    track_count as i64;
+
+    mk         as matroska.Mk;
+    ogg_state  as ogg.Ogg;
+    mp3_state  as mp3.Mp3;
+
+    mp3_pts    as i64;   // next raw MP3 packet's pts, in sample ticks
+}
+
+// ── Small helpers ───────────────────────────────────────────────────
+
+fn _demux_clear(d as *Demux) as void {
+    d.kind = DEMUX_NONE;
+    d.src = cast(*u8, 0);
+    d.len = 0;
+    d.track_count = 0;
+    d.mp3_pts = 0;
+}
+
+fn _cstrlen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// 1 when id[0..len) begins with the NUL-terminated prefix. Bounds-checked
+// before every byte; a null id or a shorter id is not a match.
+fn _id_prefix(id as *u8, len as i64, p as *u8) as i64 {
+    if (cast(i64, id) == 0) { return 0; }
+    if (len < 0) { return 0; }
+    let is i64 as n = _cstrlen(p);
+    if (len < n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (id[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// A Matroska SamplingFrequency is a float. Audio rates are integers in
+// practice, so a positive finite value is truncated to Hz. A value past the
+// positive ceiling would make a later sample-count multiplication overflow;
+// it is I_DIMS rather than a clamped rate. A missing Audio master leaves 0.0,
+// which is reported as 0.
+fn _rate_from_f64(v as f64) as i64 {
+    if (v != v) { return errno.I_CORRUPT; }              // NaN
+    if (v <= 0.0) { return 0; }
+    if (v > 4611686018427387904.0) { return errno.I_DIMS; }
+    return cast(i64, v);
+}
+
+// ── Container codec-id mapping ──────────────────────────────────────
+
+// Unified codec id for a Matroska TrackEntry. Exact CodecID strings are the
+// ones RFC 9559 assigns; A_AAC variants and A_PCM/* have a prefix rule
+// because the mappings define a family, not one string. An unrecognised id
+// stays CODEC_UNKNOWN and remains listed.
+fn _mk_codec(t as *matroska.MkTrack) as i64 {
+    if (matroska.mk_track_codec_eq(t, "V_VP8") == 1)  { return codec.CODEC_VP8; }
+    if (matroska.mk_track_codec_eq(t, "V_VP9") == 1)  { return codec.CODEC_VP9; }
+    if (matroska.mk_track_codec_eq(t, "V_AV1") == 1)  { return codec.CODEC_AV1; }
+    if (matroska.mk_track_codec_eq(t, "V_MPEG4/ISO/AVC") == 1) {
+        return codec.CODEC_H264;
+    }
+    if (matroska.mk_track_codec_eq(t, "V_MPEGH/ISO/HEVC") == 1) {
+        return codec.CODEC_H265;
+    }
+    if (matroska.mk_track_codec_eq(t, "V_THEORA") == 1) {
+        return codec.CODEC_THEORA;
+    }
+    if (matroska.mk_track_codec_eq(t, "A_OPUS") == 1) {
+        return codec.CODEC_OPUS;
+    }
+    if (matroska.mk_track_codec_eq(t, "A_VORBIS") == 1) {
+        return codec.CODEC_VORBIS;
+    }
+    if (matroska.mk_track_codec_eq(t, "A_FLAC") == 1) {
+        return codec.CODEC_FLAC;
+    }
+    if (matroska.mk_track_codec_eq(t, "A_MPEG/L3") == 1) {
+        return codec.CODEC_MP3;
+    }
+    if (_id_prefix(t.codec_id, t.codec_id_len, "A_AAC") == 1) {
+        return codec.CODEC_AAC;
+    }
+    if (_id_prefix(t.codec_id, t.codec_id_len, "A_PCM/") == 1) {
+        return codec.CODEC_PCM;
+    }
+    return codec.CODEC_UNKNOWN;
+}
+
+fn _mk_kind(typ as i64) as i64 {
+    if (typ == matroska.MK_TRACK_VIDEO)    { return codec.TRACK_VIDEO; }
+    if (typ == matroska.MK_TRACK_AUDIO)    { return codec.TRACK_AUDIO; }
+    if (typ == matroska.MK_TRACK_SUBTITLE) { return codec.TRACK_SUBTITLE; }
+    return codec.TRACK_UNKNOWN;
+}
+
+fn _ogg_codec(c as i64) as i64 {
+    if (c == ogg.OGG_CODEC_OPUS)   { return codec.CODEC_OPUS; }
+    if (c == ogg.OGG_CODEC_VORBIS) { return codec.CODEC_VORBIS; }
+    if (c == ogg.OGG_CODEC_FLAC)   { return codec.CODEC_FLAC; }
+    if (c == ogg.OGG_CODEC_THEORA) { return codec.CODEC_THEORA; }
+    return codec.CODEC_UNKNOWN;
+}
+
+fn _ogg_kind(c as i64) as i64 {
+    if (c == codec.CODEC_THEORA) { return codec.TRACK_VIDEO; }
+    if (c == codec.CODEC_UNKNOWN) { return codec.TRACK_UNKNOWN; }
+    return codec.TRACK_AUDIO;
+}
+
+// ── Track list construction ─────────────────────────────────────────
+
+// Fill one codec.Track from a Matroska TrackEntry. Returns 0, or I_DIMS when
+// an audio rate cannot be represented. codec_id and priv stay borrowed from
+// the source and are never freed here.
+fn _fill_mk_track(dt as *codec.Track, t as *matroska.MkTrack) as i64 {
+    codec.track_clear(dt);
+    dt.number = t.number;
+    dt.codec = _mk_codec(t);
+    dt.kind = _mk_kind(t.typ);
+    dt.codec_id = t.codec_id;
+    dt.codec_id_len = t.codec_id_len;
+    dt.priv = t.codec_priv;
+    dt.priv_len = t.codec_priv_len;
+    dt.width = t.pixel_width;
+    dt.height = t.pixel_height;
+    dt.default_duration = t.default_duration;
+    dt.codec_delay = t.codec_delay;
+    dt.seek_pre_roll = t.seek_pre_roll;
+    dt.timebase_num = 1;
+    dt.timebase_den = 1000000000;
+
+    if (dt.codec == codec.CODEC_OPUS) {
+        // Opus output is fixed at 48 kHz for every mapping (RFC 7845
+        // Section 5.1.1). The OpusHead in CodecPrivate is the authority for
+        // channels and pre-skip; a malformed one is left for decode.open to
+        // report, with the container's own channel count as the fallback.
+        dt.rate = 48000;
+        dt.channels = t.channels;
+        let is opus_head.OpusHead as h;
+        let is i64 as r = opus_head.opus_head_parse(t.codec_priv,
+                                                  t.codec_priv_len, &h);
+        if (r == errno.I_OK) {
+            dt.channels = h.channels;
+            dt.pre_skip = h.pre_skip;
+        }
+        return errno.I_OK;
+    }
+
+    if (t.typ == matroska.MK_TRACK_AUDIO) {
+        let is i64 as rate = _rate_from_f64(t.sample_rate);
+        if (rate < 0) { return rate; }
+        dt.rate = rate;
+        dt.channels = t.channels;
+    }
+    return errno.I_OK;
+}
+
+// Fill one codec.Track from an Ogg logical stream. The Ogg module has already
+// validated the BOS page and identified the codec; nothing here can fail, so
+// a malformed OpusHead only leaves channels 0 and the decode layer reports the
+// precise error when it parses the same BOS packet.
+fn _fill_ogg_track(dt as *codec.Track, t as *ogg.OggTrack) as void {
+    codec.track_clear(dt);
+    dt.number = t.serial;
+    dt.codec = _ogg_codec(t.codec);
+    dt.kind = _ogg_kind(dt.codec);
+    dt.priv = t.head;
+    dt.priv_len = t.head_len;
+
+    if (dt.codec == codec.CODEC_OPUS) {
+        dt.rate = 48000;
+        dt.timebase_num = 1;
+        dt.timebase_den = 48000;
+        let is opus_head.OpusHead as h;
+        let is i64 as r = opus_head.opus_head_parse(t.head, t.head_len, &h);
+        if (r == errno.I_OK) {
+            dt.channels = h.channels;
+            dt.pre_skip = h.pre_skip;
+        }
+        return;
+    }
+
+    // Vorbis, FLAC and Theora put stream parameters in their own headers,
+    // which this stage does not parse. The track is still listed with its
+    // borrowed BOS packet; the timebase stays unknown (0/0) and decode.open
+    // refuses the codec.
+    dt.rate = 0;
+    dt.channels = 0;
+    dt.timebase_num = 0;
+    dt.timebase_den = 0;
+}
+
+fn _fill_mk_tracks(d as *Demux) as i64 {
+    let is i64 as n = matroska.mk_track_count(&d.mk);
+    if (n <= 0) { return errno.I_CORRUPT; }
+    if (n > DEMUX_MAX_TRACKS) { return errno.I_CORRUPT; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is *matroska.MkTrack as t = matroska.mk_track(&d.mk, i);
+        if (cast(i64, t) == 0) { return errno.I_CORRUPT; }
+        let is i64 as r = _fill_mk_track(&d.tracks[i], t);
+        if (r < 0) { return r; }
+        i = i + 1;
+    }
+    d.track_count = n;
+    return errno.I_OK;
+}
+
+// Append every Ogg track the page walker has discovered. A leading group of
+// BOS pages is registered by ogg_open; a chained stream registers another
+// serial later, so this runs after every ogg_next and grows the list then.
+fn _sync_ogg_tracks(d as *Demux) as i64 {
+    let is i64 as n = ogg.ogg_track_count(&d.ogg_state);
+    if (n < 0) { return errno.I_CORRUPT; }
+    if (n > DEMUX_MAX_TRACKS) { return errno.I_CORRUPT; }
+    while (d.track_count < n) {
+        let is i64 as i = d.track_count;
+        let is *ogg.OggTrack as t = ogg.ogg_track(&d.ogg_state, i);
+        if (cast(i64, t) == 0) { return errno.I_CORRUPT; }
+        _fill_ogg_track(&d.tracks[i], t);
+        d.track_count = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── Sniffing ────────────────────────────────────────────────────────
+
+// Container kind from the leading bytes, or a negative error. This is the
+// public "what is this" entry point and does exactly what demux_open uses to
+// dispatch:
+//
+//   * the four-byte EBML header id selects Matroska/WebM; the DocType is
+//     validated later by matroska.mk_open;
+//   * "OggS" selects Ogg; the page CRC and version are validated later by
+//     ogg.ogg_open;
+//   * "ID3" is an ID3v2 tag and therefore selects the MP3 path;
+//   * otherwise the MP3 parser scans leading junk for the first complete
+//     Layer III frame. That scan is the parser's own (audio/mp3/mp3.cst), so
+//     it applies the same header and frame-length checks demux_open will
+//     apply before publishing a packet.
+//
+// An empty source is I_EOF; a negative length or a null pointer with bytes is
+// I_BADPARAM; everything else that matches none of the three is I_BADMAGIC.
+fn demux_sniff(src as *u8, len as i64) as i64 {
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, src) == 0) { return errno.I_BADPARAM; }
+    if (len == 0) { return errno.I_EOF; }
+
+    if (len >= 4) {
+        if (cast(i64, src[0]) == 0x1A && cast(i64, src[1]) == 0x45
+            && cast(i64, src[2]) == 0xDF && cast(i64, src[3]) == 0xA3) {
+            return DEMUX_MATROSKA;
+        }
+        if (cast(i64, src[0]) == 0x4F && cast(i64, src[1]) == 0x67
+            && cast(i64, src[2]) == 0x67 && cast(i64, src[3]) == 0x53) {
+            return DEMUX_OGG;
+        }
+    }
+    if (len >= 3) {
+        if (cast(i64, src[0]) == 0x49 && cast(i64, src[1]) == 0x44
+            && cast(i64, src[2]) == 0x33) {
+            return DEMUX_MP3;
+        }
+    }
+
+    let is mp3.Mp3 as probe;
+    let is i64 as r = mp3.mp3_open(&probe, src, len);
+    if (r == errno.I_OK) { return DEMUX_MP3; }
+    return errno.I_BADMAGIC;
+}
+
+// ── Open ────────────────────────────────────────────────────────────
+
+fn _open_matroska(d as *Demux, src as *u8, len as i64) as i64 {
+    let is i64 as r = matroska.mk_open(&d.mk, src, len);
+    if (r < 0) { return r; }
+    return _fill_mk_tracks(d);
+}
+
+fn _open_ogg(d as *Demux, src as *u8, len as i64) as i64 {
+    let is i64 as r = ogg.ogg_open(&d.ogg_state, src, len);
+    if (r < 0) { return r; }
+    return _sync_ogg_tracks(d);
+}
+
+fn _open_mp3(d as *Demux, src as *u8, len as i64) as i64 {
+    let is i64 as r with mut = mp3.mp3_open(&d.mp3_state, src, len);
+    if (r < 0) { return r; }
+
+    // The parser remembers where the first frame starts; read its header for
+    // the track fields without consuming it. mp3_next starts at that same
+    // byte, so the first packet is not lost.
+    let is i64 as first = d.mp3_state.first_frame;
+    if (first < 0 || first >= len) { return errno.I_CORRUPT; }
+    let is mp3.Mp3Header as h;
+    r = mp3.mp3_header_parse(src + first, len - first, &h);
+    if (r < 0) { return r; }
+
+    let is *codec.Track as t = &d.tracks[0];
+    codec.track_clear(t);
+    t.codec = codec.CODEC_MP3;
+    t.kind = codec.TRACK_AUDIO;
+    t.rate = h.sample_rate;
+    t.channels = h.channels;
+    t.timebase_num = 1;
+    t.timebase_den = h.sample_rate;
+    t.number = 1;
+    d.track_count = 1;
+    d.mp3_pts = 0;
+    return errno.I_OK;
+}
+
+// Bind the demuxer to src[0..len) and publish the track list. Every field is
+// cleared first, so a failed open leaves a demuxer that yields no packet.
+// Returns 0 or:
+//   I_BADPARAM  null demuxer, negative length, or a null source with bytes
+//   I_EOF       empty source, or a truncated container header
+//   I_BADMAGIC  no recognised signature, or an EBML DocType other than
+//               webm/matroska, or no Layer III frame in the MP3 path
+//   I_UNSUPPORTED  a valid but unsupported container or stream feature
+//   I_CORRUPT   malformed container data
+//   I_DIMS      an audio rate too large for the timestamp arithmetic
+fn demux_open(d as *Demux, src as *u8, len as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    _demux_clear(d);
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, src) == 0) { return errno.I_BADPARAM; }
+    if (len == 0) { return errno.I_EOF; }
+
+    let is i64 as kind = demux_sniff(src, len);
+    if (kind < 0) { return kind; }
+
+    d.kind = kind;
+    d.src = src;
+    d.len = len;
+
+    let is i64 as r with mut = errno.I_OK;
+    if (kind == DEMUX_MATROSKA) {
+        r = _open_matroska(d, src, len);
+    } else if (kind == DEMUX_OGG) {
+        r = _open_ogg(d, src, len);
+    } else if (kind == DEMUX_MP3) {
+        r = _open_mp3(d, src, len);
+    } else {
+        r = errno.I_BADMAGIC;
+    }
+    if (r < 0) { _demux_clear(d); }
+    return r;
+}
+
+// ── Iteration ───────────────────────────────────────────────────────
+
+fn _next_matroska(d as *Demux, pkt as *packet.Packet) as i64 {
+    let is i64 as r = matroska.mk_next(&d.mk, pkt);
+    if (r <= 0) { return r; }
+    if (pkt.track < 0 || cast(i64, pkt.track) >= d.track_count) {
+        return errno.I_CORRUPT;
+    }
+    return 1;
+}
+
+fn _next_ogg(d as *Demux, pkt as *packet.Packet) as i64 {
+    let is i64 as r with mut = ogg.ogg_next(&d.ogg_state, pkt);
+    if (r < 0) { return r; }
+    if (r == 0) { return 0; }
+    // A packet from a chained stream can register a serial the leading BOS
+    // scan never saw; publish it before the caller looks up pkt.track.
+    r = _sync_ogg_tracks(d);
+    if (r < 0) { return r; }
+    if (pkt.track < 0 || cast(i64, pkt.track) >= d.track_count) {
+        return errno.I_CORRUPT;
+    }
+    return 1;
+}
+
+fn _next_mp3(d as *Demux, pkt as *packet.Packet) as i64 {
+    let is mp3.Mp3Frame as f;
+    let is i64 as r with mut = mp3.mp3_next(&d.mp3_state, &f);
+    if (r <= 0) { return r; }
+    if (d.track_count < 1) { return errno.I_CORRUPT; }
+
+    let is *codec.Track as t = &d.tracks[0];
+    if (f.header.sample_rate != t.rate || f.header.channels != t.channels) {
+        // The track and its timebase describe the first frame; a later frame
+        // at another rate or channel count would need a second track.
+        return errno.I_UNSUPPORTED;
+    }
+    if (d.mp3_pts > DEMUX_PTS_LIMIT - f.header.samples_per_frame) {
+        return errno.I_CORRUPT;
+    }
+
+    let is i64 as pts = d.mp3_pts;
+    let is i64 as key with mut = 0;
+    if (f.reservoir_back == 0) { key = 1; }
+    r = packet.packet_set(pkt, d.src + f.offset, f.length, cast(i32, 0),
+                          pts, pts, f.header.samples_per_frame, key);
+    if (r < 0) { return r; }
+    d.mp3_pts = pts + f.header.samples_per_frame;
+    return 1;
+}
+
+// Next packet on any track: 1 with *pkt filled, 0 at a clean end of stream, or
+// a negative code. pkt.track is a 0-based index into demux_track's list. The
+// packet's bytes are borrowed and remain valid until the next demux_next call.
+fn demux_next(d as *Demux, pkt as *packet.Packet) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
+    if (d.kind == DEMUX_NONE) { return 0; }
+    if (d.kind == DEMUX_MATROSKA) { return _next_matroska(d, pkt); }
+    if (d.kind == DEMUX_OGG)      { return _next_ogg(d, pkt); }
+    if (d.kind == DEMUX_MP3)      { return _next_mp3(d, pkt); }
+    return errno.I_BADMAGIC;
+}
+
+// ── Accessors ───────────────────────────────────────────────────────
+
+fn demux_kind(d as *Demux) as i64 {
+    if (cast(i64, d) == 0) { return DEMUX_NONE; }
+    return d.kind;
+}
+
+// Tracks discovered so far. For Ogg this can grow while demux_next walks a
+// chained bitstream; for Matroska and MP3 it is fixed by demux_open.
+fn demux_track_count(d as *Demux) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.track_count;
+}
+
+// Track by 0-based index, or a null pointer when the index is out of range.
+// The Track borrows its codec-id and private bytes from the demuxer's source.
+fn demux_track(d as *Demux, i as i64) as *codec.Track {
+    if (cast(i64, d) == 0) { return cast(*codec.Track, 0); }
+    if (i < 0 || i >= d.track_count) { return cast(*codec.Track, 0); }
+    return &d.tracks[i];
+}
