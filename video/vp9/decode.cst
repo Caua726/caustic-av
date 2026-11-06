@@ -42,7 +42,7 @@
 //     decode target that no published slot names always exists. Every buffer
 //     is caller-owned and must stay alive while a reference slot names it;
 //     vp9_refs_buffer_in_use answers when it is safe to reuse or free one.
-//     With tile threads enabled, a fourth caller block holds the per-worker
+//     With tile threads enabled, a third caller block holds the per-worker
 //     contexts (vp9_decoder_bind_threads).
 // Both are the caller's to free; vp9_decoder_free only drops views. The one
 // allocation on the threaded path is inside std/thread.cst (a 2 MiB stack
@@ -51,17 +51,20 @@
 // Threads
 // -------
 // Tile decoding can be spread over a caller-owned worker pool
-// (threads.cst): vp9_decoder_bind_threads attaches a second block, sized
-// with vp9_threads_work_size, and a worker count; vp9_decoder_set_threads
-// changes the count afterwards. The default is the sequential path, and the
-// two paths produce identical bytes for every valid stream. Per frame, one
-// worker decodes one range of tile columns for all tile rows; the pool is
-// spawned and joined inside that frame, and the probability adaptation, the
-// loop filter, the segment/motion-field updates and publication stay on the
-// calling thread after the join. A frame with one tile column uses the
-// sequential walk. See threads.md for the context isolation, the memory
-// layout and the error rules, including the I_NOMEM path that reports the
-// required block size in d.thr.need.
+// (threads.cst): vp9_decoder_bind_threads attaches a separate worker block,
+// sized with vp9_threads_work_size, and a worker count;
+// vp9_decoder_set_threads changes the count afterwards. The default is the
+// sequential path, and the two paths decode the same tiles from the same
+// contexts, so their output agrees byte for byte -- given the
+// above-contexts-across-tile-rows reading recorded as UNCONFIRMED in
+// threads.md; for a frame with a single tile row that question does not
+// arise. Per frame, one worker decodes one range of tile columns for all
+// tile rows; the pool is spawned and joined inside that frame, and the
+// probability adaptation, the loop filter, the segment/motion-field updates
+// and publication stay on the calling thread after the join. A frame with
+// one tile column uses the sequential walk. See threads.md for the context
+// isolation, the memory layout and the error rules, including the I_NOMEM
+// path that reports the required block size in d.thr.need.
 //
 // Reference lifetime and the decode target
 // ----------------------------------------
@@ -306,6 +309,11 @@ fn vp9_work_size(width as i64, height as i64) as i64 {
 // is clamped to the pool's slot count, and a value below 2 gives the size
 // the sequential decoder needs, i.e. zero.
 //
+// This wrapper is authoritative for callers: the raw layout,
+// threads.vp9_threads_size, always reports a positive size for a valid grid
+// and count, including one worker, so sizing through it directly would ask
+// for a block the sequential path never uses.
+//
 // The block is separate from the work block on purpose: the work block is
 // sized exactly by vp9_work_size and callers already allocate it, while a
 // decoder that never enables threads should not pay for the worker slots.
@@ -435,9 +443,9 @@ fn vp9_decoder_bind(d as *Vp9Decoder, work as *u8, cap as i64) as i64 {
 // I_NOMEM (with d.thr.need set) if the block was too small for that frame.
 //
 // Disabling with vp9_decoder_bind_threads(d, 0, 0, 0) or
-// vp9_decoder_set_threads(d, 1) restores the sequential path; output is
-// identical in both modes. Call this between packets, never while a packet
-// is being drained.
+// vp9_decoder_set_threads(d, 1) restores the sequential path; output agrees
+// with the threaded path as qualified in the Threads note above. Call this
+// between packets, never while a packet is being drained.
 fn vp9_decoder_bind_threads(d as *Vp9Decoder, mem as *u8, cap as i64,
                             workers as i64) as i64 {
     if (cast(i64, d) == 0) { return errno.I_BADPARAM; }

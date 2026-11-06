@@ -102,15 +102,17 @@ owns the eight slot views and all show-existing reads.
   `SubMvs` and `PrevMvs` arrays are included the 8192x8192 ceiling is about
   6.9 GiB (7,449,243,936 bytes), with those three arrays alone accounting
   for 6 GiB and the per-mode-info byte arrays about 0.94 GiB.
-- The optional worker block is a second caller-owned block, attached with
+- The optional worker block is a third caller-owned block (beside the work
+  block and the pixel buffers), attached with
   `vp9_decoder_bind_threads` and sized with
   `vp9_threads_work_size(width, height, workers)`. It holds the per-worker
   private contexts only; the work block, the pixel buffers and the header
   stay single-copy. Its layout is computed per frame from `MiCols`/`MiRows`;
   a block too small for the current frame returns `I_NOMEM` with
   `d.thr.need` set, and the caller re-binds between packets. With 0 or 1
-  workers no block is needed and the sequential path runs. Details in
-  `threads.md`.
+  workers no block is needed and the sequential path runs.
+  `vp9_threads_work_size` is the authoritative sizing function; it returns 0
+  for fewer than two workers. Details in `threads.md`.
 - The pixel buffers are caller-owned and registered up front with
   `vp9_decoder_add_buffer`. `frame.frame_size(coded_w, coded_h)` bytes are
   required per frame; when no free buffer is large enough the return is

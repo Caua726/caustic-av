@@ -753,9 +753,11 @@ notes; none changes valid-stream output or memory safety.
 - Row-mt (superblock-row jobs inside a tile), work stealing, a threaded
   loop filter and SIMD/`dsp/` kernels are not part of this stage. Optional
   tile-column threading exists (stage 9b, `threads.cst` and `threads.md`);
-  it is off by default and bit-identical to the sequential walk, and was
-  written without any measurement. Lossless encoder support remains
-  outside the decoder stages.
+  it is off by default and, under the above-contexts-across-tile-rows
+  reading recorded as UNCONFIRMED in `threads.md`, bit-identical to the
+  sequential walk (single-tile-row frames need no such assumption). It was
+  written without any measurement. Lossless encoder support remains outside
+  the decoder stages.
 
 ### Stage 9/10 scope (not this stage)
 

@@ -32,9 +32,11 @@
 // Every tile is independent in the bitstream; an error in one aborts the
 // frame with its negative status rather than resynchronising, since the
 // frame cannot be reconstructed once a tile is lost. In the threaded walk
-// an error still aborts the frame, and the status returned is the one of
-// the earliest failing tile in raster order, so the result does not depend
-// on scheduling.
+// an error still aborts the frame; the status returned is the smallest
+// (row, column) among the failures the workers reached, which is
+// deterministic but, for a multiply corrupt frame, not necessarily the tile
+// the sequential raster walk would have reported first (a worker stops at
+// its own first failure in column-major order).
 // =======================================================
 
 use "../../core/errno.cst" as errno;
@@ -46,7 +48,10 @@ use "threads.cst" as threads;
 
 // Worker slots for the parallel walk. Must equal threads.VP9_MAX_WORKERS,
 // the number of slots Vp9Threads hands out; the pool clamps the requested
-// count to that value, and this array must be able to hold every slot.
+// count to that value, and this array must be able to hold every slot. A
+// cross-module constant is not used as an array length here, so the
+// equality is kept by hand; if the two drift, _tile_decode_mt refuses the
+// frame with I_BADPARAM instead of indexing past this array.
 let is i64 as TILE_MT_MAX with imut = 16;
 
 // get_tile_offset (section 6.4.1): the first mode-info row/column of a tile.
@@ -192,9 +197,13 @@ fn _tile_worker(arg as i64) as i64 {
 // Validate every tile range in the frame and run the tile columns over k
 // workers. Called only with k >= 2 and cols >= 2. Worker 0 runs on the
 // calling thread; workers 1..k-1 are spawned, joined, and any range whose
-// spawn failed is decoded by the calling thread afterwards. The first error
-// in raster order is returned; on success the per-worker counters are
-// summed into Vp9State.counts in worker order and I_OK is returned.
+// spawn failed is decoded by the calling thread afterwards. The recorded
+// failure with the smallest (row, column) is returned; on success the
+// per-worker counters are summed into Vp9State.counts in worker order and
+// I_OK is returned. The pick is deterministic but, because each worker
+// stops at its own first failure while walking its columns column-major, it
+// is not in general the tile the sequential raster walk would have failed
+// on first.
 //
 // Validation is done for the whole grid before a worker starts: a worker
 // must never be given an offset/length pair it has to trust. The sequential
@@ -261,9 +270,12 @@ fn _tile_decode_mt(b as *blk.Vp9Blk, data as *u8, len as i64,
         w = w + 1;
     }
 
-    // First failure in the raster order the sequential walk uses: smallest
-    // tile row, then smallest tile column. Worker results live in disjoint
-    // ranges, so no two failures share a position.
+    // Deterministic pick: the recorded failure with the smallest (row,
+    // column). It depends only on the bitstream and the fixed column
+    // assignment; it is not in general the sequential raster walk's first
+    // failure, because a worker stops at its own first failure while
+    // walking its columns column-major. Worker ranges are disjoint, so no
+    // two failures share a position.
     let is i64 as best with mut = 0;
     let is i64 as best_row with mut = 0 - 1;
     let is i64 as best_col with mut = 0 - 1;
@@ -305,8 +317,11 @@ fn _tile_decode_mt(b as *blk.Vp9Blk, data as *u8, len as i64,
 // `th` is the optional worker pool. A null pool, fewer than two requested
 // workers, or a frame with one tile column all take the raster walk below,
 // whose result is unchanged. Otherwise the frame's tile columns are split
-// over the pool by _tile_decode_mt. Both paths return the first failure in
-// raster order and leave the persistent state tainted on failure.
+// over the pool by _tile_decode_mt. The sequential walk returns its first
+// failure in raster order; the threaded walk returns the smallest (row,
+// column) among the failures its workers reached (deterministic, but not in
+// general the sequential first failure for a multiply corrupt frame). Both
+// leave the persistent state tainted on failure.
 fn tile_decode_all(b as *blk.Vp9Blk, data as *u8, len as i64,
                    th as *threads.Vp9Threads) as i64 {
     if (cast(i64, b) == 0 || cast(i64, b.h) == 0) { return errno.I_BADPARAM; }

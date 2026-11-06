@@ -67,13 +67,17 @@
 // Error and taint rules
 // ---------------------
 // A worker stops at the first tile whose Boolean decoder, partition walk or
-// exit check fails, and records that tile's (row, column). tile.cst picks
-// the recorded failure with the smallest (row, column) -- the earliest
-// failing tile in the raster order the sequential walk uses -- so the
-// returned code does not depend on scheduling. On any failure the
-// per-worker counts are not summed into Vp9State.counts and the caller's
-// _decode_slice returns before adaptation, loop filtering and the
-// segment/motion-field updates, exactly as the sequential path does; the
+// exit check fails, in its own traversal order (columns ascending, rows
+// ascending inside each column), and records that tile's (row, column).
+// tile.cst returns the recorded failure with the smallest (row, column).
+// That pick is deterministic -- it depends only on the bitstream and the
+// fixed column assignment -- but it is not in general the failure the
+// sequential raster walk would have returned: a worker that fails in an
+// earlier row of a later column stops before trying raster-earlier tiles of
+// its own columns. Valid streams have no failures and are unaffected. On
+// any failure the per-worker counts are not summed into Vp9State.counts and
+// the caller's _decode_slice returns before adaptation, loop filtering and
+// the segment/motion-field updates, exactly as the sequential path does; the
 // persistent state stays tainted until the next key or intra-only frame.
 //
 // Reference frames stay read-only throughout: the workers only read the
@@ -91,7 +95,10 @@ use "inter.cst" as ip;
 // Worker slots. A frame can carry up to 64 tile columns, but past the
 // machine's core count extra workers only cost memory and spawn time. The
 // value also sizes the job array in tile.cst, which repeats it as
-// TILE_MT_MAX and must be kept equal.
+// TILE_MT_MAX and must be kept equal. If the two ever drift apart,
+// _tile_decode_mt refuses the frame with I_BADPARAM instead of indexing
+// past its job array; a cross-module constant is not used as an array
+// length here, so the equality is a hand-kept invariant.
 let is i64 as VP9_MAX_WORKERS with imut = 16;
 
 // The mode-info ceiling decode.cst enforces (65536 pixels per side / 8).
@@ -122,7 +129,6 @@ struct Vp9Threads {
     arows           as i64;
     nz_above_stride as i64;
     nz_left_stride  as i64;
-    carved          as i64;
 }
 
 // ── small helpers ───────────────────────────────────────────────────
@@ -186,7 +192,6 @@ fn vp9_threads_bind(thr as *Vp9Threads, mem as *u8, cap as i64,
     thr.count = n;
     thr.frame_workers = 0;
     thr.need = 0;
-    thr.carved = 0;
     return errno.I_OK;
 }
 
@@ -276,6 +281,12 @@ fn _carve(thr as *Vp9Threads, mi_cols as i64, mi_rows as i64,
 // Bytes vp9_threads_bind needs for a decoder that may see frames of
 // mi_cols x mi_rows mode-info units decoded with `workers` threads. Counts
 // above VP9_MAX_WORKERS are clamped, matching bind.
+//
+// This is the raw layout: for a valid grid it reports a positive size for
+// any count, including 1 (a slot nobody would use). decode.cst's
+// vp9_threads_work_size is the authoritative entry point for callers -- it
+// maps a visible width/height to the grid and returns 0 for fewer than two
+// workers, i.e. the sequential decoder needs no worker block.
 fn vp9_threads_size(mi_cols as i64, mi_rows as i64, workers as i64) as i64 {
     if (workers < 1) { return errno.I_BADPARAM; }
     let is i64 as k with mut = workers;
@@ -299,7 +310,6 @@ fn vp9_threads_prepare(thr as *Vp9Threads, tmpl as *blk.Vp9Blk,
     if (cast(i64, thr) == 0 || cast(i64, tmpl) == 0) {
         return errno.I_BADPARAM;
     }
-    thr.carved = 0;
     if (workers < 1) { return errno.I_BADPARAM; }
     let is i64 as k with mut = workers;
     if (k > VP9_MAX_WORKERS) { k = VP9_MAX_WORKERS; }
@@ -343,7 +353,6 @@ fn vp9_threads_prepare(thr as *Vp9Threads, tmpl as *blk.Vp9Blk,
         w = w + 1;
     }
     thr.frame_workers = k;
-    thr.carved = 1;
     return k;
 }
 

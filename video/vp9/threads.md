@@ -38,12 +38,16 @@ row order. Two workers therefore never touch the same column of any array:
   same columns first.
 
 This is the same decomposition FFmpeg's slice-threaded VP9 decoder uses
-(one slice job per tile column, all tile rows decoded by that job) and the
-same constraint libvpx encodes with `assert(tile_rows == 1)` in
-`decode_tiles_mt`: libvpx only enables tile workers when there is a single
-tile row, because its above contexts are shared without column ownership.
-This decoder keeps the shared above arrays but assigns every column to
-exactly one worker, which is why it can thread a multi-row tile grid too.
+(one slice job per tile column, all tile rows decoded by that job). libvpx's
+`decode_tiles_mt`/`tile_worker_hook` runs only with a single tile row: it
+asserts `tile_rows == 1` and starts every job at `mi_row = 0`. That
+restriction comes from the job layout (one tile buffer per column, a single
+row of tiles), not from above-context ownership: libvpx's above contexts
+are global-column indexed (`above_idx = mi_col * 2` in `set_skip_context`),
+just like the shared arrays here. This decoder keeps the shared above arrays
+too, but assigns every column to exactly one worker and walks the tile rows
+inside that worker, so it can thread a multi-row tile grid without the
+single-row restriction.
 
 The split itself is fixed and contiguous: worker *w* gets tile columns
 `[w*cols/k, (w+1)*cols/k)`, so every worker gets at least one column when
@@ -85,9 +89,10 @@ Nothing allocates. The caller provides:
 
 - the existing persistent work block (`vp9_decoder_bind`) — unchanged, one
   per decoder;
-- a second 8-byte aligned block for the worker slots
+- a separate 8-byte aligned block for the worker slots
   (`vp9_decoder_bind_threads`), sized with `vp9_threads_work_size(width,
-  height, workers)` for the largest frame the decoder will see;
+  height, workers)` for the largest frame the decoder will see; this is the
+  third caller-supplied block, after the work block and the pixel buffers;
 - the thread handles, which live in `Vp9Threads`, a field of the
   caller-owned `Vp9Decoder`.
 
@@ -134,14 +139,17 @@ sequential walk.
   check before touching a slice, so no worker can be handed an offset it has
   to trust.
 - A worker stops at the first tile whose Boolean decoder, partition walk or
-  exit check fails and records that tile's (row, column) in its job.
-- After all work is complete, the failure with the smallest
-  `(row, column)` — the earliest failing tile in the raster order the
-  sequential walk uses — is returned. Scheduling cannot change which tile
-  that is: tiles are deterministic functions of their columns' earlier data,
-  a worker never reads another column, and a worker never reads a tile it
-  did not decode itself. All tiles raster-before the earliest failure are
-  therefore decoded with the same inputs the sequential walk would use.
+  exit check fails and records that tile's (row, column) in its job. Its
+  traversal order is column-major (columns ascending, rows ascending inside
+  each column).
+- After all work is complete, the recorded failure with the smallest
+  `(row, column)` is returned. The pick is deterministic — it depends only
+  on the bitstream and the fixed column assignment — but it is not in
+  general the failure the sequential raster walk would have returned: a
+  worker that fails in an earlier row of a later column stops before trying
+  raster-earlier tiles of its own columns. No worker reads another
+  column's or another row's data, so a failure is caused only by its own
+  column's stream; valid streams have no failures at all.
 - On failure `Vp9State.counts` is **not** updated with the per-worker
   totals, the loop filter, `_update_seg_map`, `_update_prev_mv`, adaptation
   and publication do not run (the caller returns before them), and the
@@ -153,11 +161,11 @@ sequential walk.
 
 Two observable differences from the sequential path exist only for corrupt
 streams: the threaded walk validates the whole tile table up front (the
-sequential walk validates lazily, tile by tile), and a worker stops at the
-first failure in its own columns rather than at the first failure in raster
-order, so the returned code for a *multi-error* frame can differ. Both paths
-return a negative code and leave the frame unpublished; no valid stream is
-affected.
+sequential walk validates lazily, tile by tile), and the reported failure is
+the smallest `(row, column)` among the failures the workers reached, which
+need not be the sequential walk's first failure when a worker stopped before
+a raster-earlier tile of its own columns. Both paths return a negative code
+and leave the frame unpublished; no valid stream is affected.
 
 ## Interactions with frame flags
 
@@ -204,7 +212,13 @@ New, additive; no existing signature changed except the internal
 
 `vp9_decoder_send`, `vp9_decoder_receive`, `Vp9Output`, the work block and
 the pixel-pool API are unchanged; the default remains the sequential path.
-Enabling threads changes neither the packet handoff nor the output bytes.
+`vp9_threads_work_size` is the authoritative sizing entry point: it maps a
+visible size to the grid and returns 0 for fewer than two workers, whereas
+the internal `threads.vp9_threads_size` always reports a positive layout
+size for a valid grid and count (including one worker). Enabling threads
+changes neither the packet handoff nor, under the above-contexts-across-
+tile-rows reading in the UNCONFIRMED section, the output bytes; a frame
+with a single tile row needs no such assumption.
 
 ## What is not done
 
@@ -242,11 +256,12 @@ Enabling threads changes neither the packet handoff nor the output bytes.
   identical and avoids failing a frame for a resource shortage); no
   reference decoder was found that forces a different policy. UNCONFIRMED
   as a requirement.
-- **Error code for multi-error corrupt frames.** The threaded path reports
-  the earliest failing tile in raster order among the failures its workers
-  recorded; it does not continue decoding after a failure to discover
-  earlier-in-raster-order failures in *other* columns that its own worker
-  never reached. Valid streams are unaffected; the exact code for a doubly
+- **Error code for multi-error corrupt frames.** The threaded path returns
+  the failure with the smallest (row, column) among the failures its
+  workers recorded. Because a worker stops at its own first failure while
+  walking its columns column-major, it can leave a raster-earlier tile of
+  its own columns untried, so the code need not be the sequential walk's
+  first failure. Valid streams are unaffected; the exact code for a doubly
   corrupt frame is UNCONFIRMED against libvpx/FFmpeg.
 
 ## Checks for the test phase (NOT RUN)
@@ -260,11 +275,40 @@ Enabling threads changes neither the packet handoff nor the output bytes.
   corner (1x1, 64x1, 1x4, 64x4).
 - Run under ThreadSanitizer or helgrind over a few full streams; no race
   reports on the work/reference arrays.
-- Corrupt one tile in the middle of a frame and check that the returned
-  code and the "not published" state match the sequential path for the same
-  corruption.
+- Corrupt one tile in a frame and check that the returned code is negative
+  and the frame is not published. Where that corruption is the first failure
+  in raster order, the code should equal the sequential path's; a frame with
+  several corrupt tiles may report a different (still negative) code, as
+  described above.
 - ffprobe/ffmpeg difference and `opus_compare` are unrelated to this stage;
   fps is explicitly not measured.
+
+## Pending review notes
+
+Recorded verbatim from the stage 9b review, and all applied. Items 1-5 and
+8 changed documentation or comments only; item 6 removed the dead field
+(`Vp9Threads.carved`) and its three assignments; item 7 documents the
+hand-kept constant equality and the existing `I_BADPARAM` guard. No decode
+logic changed.
+
+1. "earliest failing tile in raster order" is false for a worker owning
+   multiple columns (column-major traversal records the first failure in
+   its own order); only determinism holds. Fix tile.cst/threads.cst/
+   threads.md wording.
+2. libvpx tile-row MT rationale is wrong: its above contexts are
+   global-column indexed; the restriction is mi_row=0 + assert(tile_rows==1).
+   Correct threads.md.
+3. init_mt is in vp9_decodeframe.c, not vp9_decoder.c; fix reference
+   attribution.
+4. decode.cst "fourth caller block" vs "second block": worker block is a
+   third block; fix wording/count.
+5. qualify the unconditional bit-identity claim with the UNCONFIRMED
+   above-context/tile-row item.
+6. dead `carved` field: remove or document.
+7. duplicated VP9_MAX_WORKERS/TILE_MT_MAX with drift turning into
+   I_BADPARAM; document/derive if trivial.
+8. vp9_threads_size vs vp9_threads_work_size workers==1 discrepancy;
+   document wrapper as authoritative.
 
 ## Reference implementations read
 
@@ -272,18 +316,20 @@ Only for behaviour; no code was copied, ported or transcribed.
 
 - libvpx `main`: `vp9/decoder/vp9_decodeframe.c` (the single-threaded
   `decode_tiles` raster order and `clear_above_context` placement, the
-  `decode_tiles_mt`/`tile_worker_hook` column split and its
-  `assert(log2_tile_rows == 0)`, `tile_data->xd.counts = NULL` when
-  `frame_parallel_decoding_mode`, and the per-tile `left_context` clears);
-  `vp9/decoder/vp9_decoder.c` (worker data allocation, `init_mt`);
+  `decode_tiles_mt`/`tile_worker_hook` column split, its single-tile-row
+  restriction with `assert(log2_tile_rows == 0)`/`mi_row = 0`, `init_mt`,
+  `tile_data->xd.counts = NULL` when `frame_parallel_decoding_mode`, and
+  the per-tile `left_context` clears); `vp9/decoder/vp9_decoder.c` (worker
+  data allocation, `vp9_dec_alloc_row_mt_mem`);
   `vp9/common/vp9_onyxc_int.h` (`set_skip_context`'s global-column above
   indexing, `set_mi_row_col`'s tile-left availability);
   `vp9/common/vp9_blockd.h` (per-plane above/left context pointers);
   `vp9/common/vp9_loopfilter.c` (frame-level filter masks, why the filter is
   a whole-frame pass).
-- libvpx `main`: `vp9/common/vp9_reconintra.c` (intra edge extension) and
-  the `vp9_reconinter.c` entry points were skimmed for the above-pixel
-  reads the column argument relies on.
+- libvpx `main`: `vp9/common/vp9_reconintra.c` (intra edge extension) was
+  read for the above-pixel reads the column argument relies on.
+  `vp9_reconinter.c` was **not** read for this slice; inter prediction reads
+  only published reference views, which no worker writes.
 - FFmpeg `master`: `libavcodec/vp9.c` (the `decode_tiles_mt` job-per-tile-
   column loop over all tile rows, `active_tile_cols`, per-tile
   `td->counts`, the post-join count summation, and `intra_pred_data`
