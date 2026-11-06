@@ -2002,7 +2002,8 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                         }
                         st = tx.tx_2d(dq, txs + 2, txt, b.lossless);
                         if (st < 0) { return st; }
-                        st = tx.tx_add_residual(pl, stride, dq, n0);
+                        st = tx.tx_add_residual(pl + sy * stride + sx, stride,
+                                               dq, n0);
                         if (st < 0) { return st; }
                     }
                 }
