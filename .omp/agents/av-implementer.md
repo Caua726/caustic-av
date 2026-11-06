@@ -58,8 +58,8 @@ or erratum, record it in the codec `.md` as unconfirmed until the test phase.
 - When stage N's writing is finished, its independent reviewer starts, and at
   the same time the writer of stage N+1 starts in a NEW worktree branched from
   stage N's branch, not from main.
-- At most ONE stage is written ahead of the last stage approved by review.
-  Do not start N+2 until N is approved.
+- Up to THREE stages may be written ahead of the last stage approved by
+  review (N+1..N+3). Do not start N+4 until N+1 is approved.
 - Merges stay in stage order: N+1 never reaches main before N. Each stage
   merges only after its own read-only approval.
 - If review requires changes to stage N, a fixer gets a new worktree on stage

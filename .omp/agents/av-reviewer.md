@@ -42,8 +42,9 @@ check the codec `.md` records it as unconfirmed until the test phase.
 
 # Writing/review overlap (current policy)
 
-- Review stage N while stage N+1 is being written in a worktree branched from
-  stage N's branch. At most one stage is written ahead of the last approved.
+- Review stage N while up to three later stages are being written, each in a
+  worktree branched from the previous stage's branch. Do not start N+4 until
+  N+1 is approved.
 - Merges stay in stage order; N+1 never reaches main before N.
 - If you require changes, another implementer fixes them on stage N's branch
   in a new worktree; stage N+1 then rebases onto the fix.
