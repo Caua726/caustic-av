@@ -1,0 +1,51 @@
+// =======================================================
+// caustic-av/dsp/x86_64/vp9_inter.cst
+// SSE2 average for the VP9 compound inter prediction of section 8.5.2:
+// out = Round2(a + b, 1) sample by sample.
+//
+// x86_64 System V only (args in rdi, rsi, rdx, rcx, r8, r9; result unused).
+//
+// Both inputs are already clipped predictions (0..255), so the rounding of
+// section 4.6 is exactly the PAVGB definition: (a + b + 1) >> 1 per byte.
+// PAVGB is the only instruction needed, and it is one caustic-as has no
+// mnemonic for, so it is emitted as bytes:
+//
+//   pavgb  66 0F E0 /r
+//
+// Preconditions, checked by the caller (video/vp9/inter.cst): w is a multiple
+// of 16, h >= 1, both pointers address their own h x stride block with at
+// least w readable bytes per row. The result replaces the first prediction in
+// place, which is what the scalar loop does. No alignment is required
+// (movdqu).
+// =======================================================
+
+// x86_64 System V only. The target check is in `vp9_dsp_init_x86_64`
+// (vp9_dsp_x86.cst): a top-level `if (...) { ... }` is not part of the
+// grammar, and this kernel is reached only through the install pass.
+
+fn vp9_x86_compound_avg(a as *u8, a_stride as i64, b as *u8,
+                        b_stride as i64, w as i64, h as i64) as void with naked {
+    // rdi a, rsi a_stride, rdx b, rcx b_stride, r8 w, r9 h.
+    // r10 column, rax row.
+    asm("xor eax, eax\n");
+    asm("cmp r9, 0\n");
+    asm("jbe .Lvp9dsp_ca_done\n");
+    asm(".Lvp9dsp_ca_row:\n");
+    asm("xor r10d, r10d\n");
+    asm(".Lvp9dsp_ca_col:\n");
+    asm("movdqu xmm0, [rdi + r10]\n");
+    asm("movdqu xmm1, [rdx + r10]\n");
+    // pavgb xmm0, xmm1   66 0F E0 /r, modrm C1 (11 000 001)
+    asm(".byte 102,15,224,193\n");
+    asm("movdqu [rdi + r10], xmm0\n");
+    asm("add r10, 16\n");
+    asm("cmp r10, r8\n");
+    asm("jb .Lvp9dsp_ca_col\n");
+    asm("add rdi, rsi\n");
+    asm("add rdx, rcx\n");
+    asm("add rax, 1\n");
+    asm("cmp rax, r9\n");
+    asm("jb .Lvp9dsp_ca_row\n");
+    asm(".Lvp9dsp_ca_done:\n");
+    asm("ret\n");
+}
