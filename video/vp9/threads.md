@@ -102,6 +102,11 @@ stay in the work block. `vp9_threads_size` (and the decoder-level
 is too small. The caller then re-binds a larger block (between packets) and
 decodes the frame again; there is no internal growth.
 
+For scale: a worker slot is about 56 KiB at 1080p and about 119 KiB at the
+8192x8192 mode-info ceiling (the `Vp9Counts` set alone is 25.9 KiB and the
+inter scratch 20.2 KiB); 16 workers therefore need roughly 0.9-1.9 MiB,
+plus 2 MiB of stack per spawned thread created by `std/thread.cst`.
+
 Threads are spawned per frame, never kept idle between frames: for a frame
 with `k` workers, workers `1..k-1` are spawned, worker 0 runs on the caller
 thread, and every started worker is joined before `tile_decode_all`

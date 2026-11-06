@@ -184,6 +184,7 @@ fn vp9_threads_bind(thr as *Vp9Threads, mem as *u8, cap as i64,
     thr.cap = cap;
     if (thr.cap < 0) { thr.cap = 0; }
     thr.count = n;
+    thr.frame_workers = 0;
     thr.need = 0;
     thr.carved = 0;
     return errno.I_OK;
@@ -329,8 +330,8 @@ fn vp9_threads_prepare(thr as *Vp9Threads, tmpl as *blk.Vp9Blk,
         wb.scratch = _at(sl, coef_off + 1024 * 8);
         wb.counts = vp9_threads_counts(thr, w);
         wb.cc = cast(*res.Vp9CoefCtx,
-                     _at(thr.base, thr.ccs_off
-                                     + w * sizeof(res.Vp9CoefCtx)));
+                     cast(i64, _at(thr.base, thr.ccs_off
+                                             + w * sizeof(res.Vp9CoefCtx))));
 
         let is i64 as cs = res.vp9_coef_ctx_init(
             wb.cc, tmpl.above_nz, thr.nz_above_stride,
@@ -352,7 +353,8 @@ fn vp9_threads_blk(thr as *Vp9Threads, w as i64) as *blk.Vp9Blk {
     if (w < 0 || w >= VP9_MAX_WORKERS) { return cast(*blk.Vp9Blk, 0); }
     if (cast(i64, thr.base) == 0) { return cast(*blk.Vp9Blk, 0); }
     return cast(*blk.Vp9Blk,
-                _at(thr.base, thr.blks_off + w * sizeof(blk.Vp9Blk)));
+                cast(i64, _at(thr.base, thr.blks_off
+                                        + w * sizeof(blk.Vp9Blk))));
 }
 
 // One worker's section 9.3.4 counter set, or null before prepare.
@@ -361,7 +363,8 @@ fn vp9_threads_counts(thr as *Vp9Threads, w as i64) as *t.Vp9Counts {
     if (w < 0 || w >= VP9_MAX_WORKERS) { return cast(*t.Vp9Counts, 0); }
     if (cast(i64, thr.base) == 0) { return cast(*t.Vp9Counts, 0); }
     return cast(*t.Vp9Counts,
-                _at(thr.base, thr.counts_off + w * sizeof(t.Vp9Counts)));
+                cast(i64, _at(thr.base, thr.counts_off
+                                        + w * sizeof(t.Vp9Counts))));
 }
 
 // ── splitting and running ───────────────────────────────────────────
