@@ -26,7 +26,8 @@ stage briefs are recorded for the test phase and have not been executed.
 | File | Holds |
 |---|---|
 | `video/vp9/block.cst` | Block geometry helpers not in recon_tables (partition subsize, log2 of a count, plane block size), the partition tree of 6.4.3, intra-frame mode info 6.4.4-6.4.10, residual orchestration 6.4.21, coefficient-context clearing and writing. |
-| `video/vp9/tile.cst` | Tile offsets 6.4.1, one Boolean decoder per tile, superblock traversal 6.4.2, per-tile error propagation. |
+| `video/vp9/tile.cst` | Tile offsets 6.4.1, one Boolean decoder per tile, superblock traversal 6.4.2, per-tile error propagation, and the optional tile-column split. |
+| `video/vp9/threads.cst` | Optional tile threading: worker pool, per-worker context carve and the deterministic error pick. Documented in `threads.md`. |
 | `video/vp9/decode.cst` | `Vp9Decoder`, the caller-owned work layout, packet send/receive handoff, `Vp9Output`, coded-surface and reference-pool selection, show-existing output, the frame driver through the loop filter, segment-map update, `vp9_refs_publish` and `refresh_frame_context` save. |
 | `video/vp9/residual.cst`, `residual_tables*.cst` | Adopted from the stage 4 residual slice (spec 6.4.24-6.4.26); table blobs are still pending. |
 | `video/vp9/{transforms,predict,loopfilter,recon_tables}.cst`, `recon.md` | Fixed reconstruction kernels adopted from `stage4-recon-fix` HEAD `54dd904`. |
@@ -52,6 +53,9 @@ vp9_decoder_receive         per receive, decode slices until one is shown:
     zero PrevSegmentIds     intra / error-resilient / size change (7.2, 7.2.6)
     tile_decode_all
       blk_clear_above       once per frame (7.4.1)
+      threaded path         threads.vp9_threads_prepare -> one worker per
+                            tile-column range, all tile rows, joined;
+                            counts summed, sequential walk otherwise
       per tile: vp9_bool_init
         _decode_tile
           blk_clear_left    once per 8x8 row (7.4.2)
@@ -98,6 +102,15 @@ owns the eight slot views and all show-existing reads.
   `SubMvs` and `PrevMvs` arrays are included the 8192x8192 ceiling is about
   6.9 GiB (7,449,243,936 bytes), with those three arrays alone accounting
   for 6 GiB and the per-mode-info byte arrays about 0.94 GiB.
+- The optional worker block is a second caller-owned block, attached with
+  `vp9_decoder_bind_threads` and sized with
+  `vp9_threads_work_size(width, height, workers)`. It holds the per-worker
+  private contexts only; the work block, the pixel buffers and the header
+  stay single-copy. Its layout is computed per frame from `MiCols`/`MiRows`;
+  a block too small for the current frame returns `I_NOMEM` with
+  `d.thr.need` set, and the caller re-binds between packets. With 0 or 1
+  workers no block is needed and the sequential path runs. Details in
+  `threads.md`.
 - The pixel buffers are caller-owned and registered up front with
   `vp9_decoder_add_buffer`. `frame.frame_size(coded_w, coded_h)` bytes are
   required per frame; when no free buffer is large enough the return is
