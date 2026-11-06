@@ -1,0 +1,818 @@
+// =======================================================
+// caustic-av/audio/mp3/mp3.cst
+// MPEG-1/2/2.5 Layer III stream parsing: ID3 tags, frame headers, side
+// information and the reservoir window. Sample synthesis is stage 8b and
+// is not here.
+//
+// The parser is pull-based and borrows the caller's buffer:
+//
+//   mp3_open(&m, src, len)      skip ID3v2, find the first Layer III frame,
+//                               remember the audio bounds, read Xing/Info
+//                               or VBRI metadata
+//   mp3_next(&m, &frame)        1 = one frame view, 0 = end of stream,
+//                               negative = error
+//
+// A frame view borrows src; it is valid only while src is. The caller keeps
+// the bit reservoir: Mp3Frame reports where this frame's main data begins
+// and how many bytes are available there, including the bytes the
+// main_data_begin backpointer reaches into earlier frames. Nothing grows a
+// buffer or copies frame data.
+//
+// Only Layer III is accepted. Free-format streams (bitrate_index 0) and the
+// other layers return I_UNSUPPORTED; reserved header values return
+// I_CORRUPT. Every offset is checked before a byte is read.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "../../core/bits.cst" as bits;
+use "mp3_tables.cst" as t;
+
+// ── result structures ───────────────────────────────────────────────
+
+// One decoded 4-byte header plus everything derived from it. Offsets are
+// relative to the beginning of this frame.
+struct Mp3Header {
+    word              as i64;   // the four bytes, most significant first
+    version           as i64;   // t.MP3_VER_1 / MP3_VER_2 / MP3_VER_25
+    mpeg1             as i64;   // 1 for MPEG-1, 0 for MPEG-2/2.5
+    layer             as i64;   // always 3 (Layer III)
+    protection        as i64;   // raw bit: 1 means no CRC
+    crc_present       as i64;   // 1 when a 16-bit CRC follows the header
+    bitrate_index     as i64;
+    bitrate_kbps      as i64;
+    sample_rate_index as i64;
+    sample_rate       as i64;
+    padding           as i64;
+    private_bit       as i64;
+    mode              as i64;   // t.MP3_MODE_*
+    mode_extension    as i64;
+    channels          as i64;   // 1 or 2
+    mono              as i64;
+    copyright         as i64;
+    original          as i64;
+    emphasis          as i64;   // 0 none, 1 50/15 us, 2 reserved, 3 J.17
+    samples_per_frame as i64;   // 1152 MPEG-1, 576 MPEG-2/2.5
+    frame_len         as i64;   // bytes, padding and CRC included
+    crc_len           as i64;   // 2 when crc_present, else 0
+    side_info_len     as i64;   // Table 13
+    side_info_offset  as i64;   // 4 + crc_len
+    side_info_end     as i64;   // side_info_offset + side_info_len
+}
+
+// One granule/channel from the side information. Fields absent from a
+// version are zero. When window_switching_flag is set, region0_count and
+// region1_count are the defaults the specification assigns (7 or 8, and
+// 63); they are not transmitted.
+struct Mp3Granule {
+    part2_3_length       as i64;
+    big_values           as i64;
+    global_gain          as i64;
+    scalefac_compress    as i64;
+    window_switching_flag as i64;
+    block_type           as i64;   // 0, 1, 2, 3
+    mixed_block_flag     as i64;
+    table_select         as [3]i64;
+    subblock_gain        as [3]i64;
+    region0_count        as i64;
+    region1_count        as i64;
+    preflag              as i64;   // MPEG-1 only
+    scalefac_scale       as i64;
+    count1table_select   as i64;
+}
+
+struct Mp3SideInfo {
+    main_data_begin as i64;
+    private_bits    as i64;
+    ngr             as i64;        // 2 MPEG-1, 1 MPEG-2/2.5
+    nch             as i64;        // 1 or 2
+    scfsi           as [2][4]i64;  // MPEG-1 only
+    granule         as [2][2]Mp3Granule;
+}
+
+// A borrowed frame. main_data_offset is absolute and points at the first
+// byte of this frame's main data; main_data_len is the number of bytes
+// physically present in this frame after the side information.
+// reservoir_offset/reservoir_len describe the whole range the decoder may
+// read, including main_data_begin bytes from earlier frames. The range is
+// [reservoir_offset, reservoir_offset + reservoir_len).
+struct Mp3Frame {
+    header           as Mp3Header;
+    side             as Mp3SideInfo;
+    offset           as i64;   // absolute frame start
+    length           as i64;   // frame bytes
+    index            as i64;   // 0-based frame number in this stream
+    side_info_offset as i64;   // absolute
+    side_info_len    as i64;
+    main_data_offset as i64;   // absolute
+    main_data_len    as i64;
+    reservoir_offset as i64;   // absolute
+    reservoir_len    as i64;
+}
+
+// Parser state. The caller owns it; mp3_open clears it and nothing here
+// allocates. VBR fields describe the first frame's Xing/Info or VBRI tag;
+// they are 0 when the tag is absent or the field was not present.
+struct Mp3 {
+    src           as *u8;
+    len           as i64;
+    pos           as i64;   // next frame start
+    audio_start   as i64;   // first byte after ID3v2; junk may precede frame 0
+    audio_end     as i64;   // end of audio, ID3v1 excluded
+    first_frame   as i64;
+    main_data_base as i64;  // first frame's side-info end; reservoir floor
+    frame_index   as i64;
+    id3v2_bytes   as i64;
+    id3v1_present as i64;
+
+    is_vbr        as i64;   // 1 for Xing or VBRI, 0 for Info or absent
+    has_xing      as i64;
+    has_vbri      as i64;
+    vbr_bytes     as i64;
+    frame_count   as i64;   // 0 when the tag did not carry it
+    xing_quality  as i64;
+    toc_present   as i64;
+    toc           as [100]i64;
+    encoder_delay as i64;   // LAME delay, in samples
+    encoder_padding as i64; // LAME padding, in samples
+    lame_present  as i64;
+    encoder_kind  as i64;   // 0 none, 1 LAME, 2 Lavf/Lavc
+    vbri_delay    as i64;
+    vbri_quality  as i64;
+}
+
+// ── small helpers ───────────────────────────────────────────────────
+
+fn _mp3_tag3(src as *u8, off as i64, a as i64, b as i64, c as i64) as i64 {
+    if (cast(i64, src[off]) != a) { return 0; }
+    if (cast(i64, src[off + 1]) != b) { return 0; }
+    if (cast(i64, src[off + 2]) != c) { return 0; }
+    return 1;
+}
+
+fn _mp3_tag4(src as *u8, off as i64, a as i64, b as i64,
+             c as i64, d as i64) as i64 {
+    if (cast(i64, src[off]) != a) { return 0; }
+    if (cast(i64, src[off + 1]) != b) { return 0; }
+    if (cast(i64, src[off + 2]) != c) { return 0; }
+    if (cast(i64, src[off + 3]) != d) { return 0; }
+    return 1;
+}
+
+fn _mp3_u16be(src as *u8, off as i64) as i64 {
+    return (cast(i64, src[off]) << 8) | cast(i64, src[off + 1]);
+}
+
+fn _mp3_u32be(src as *u8, off as i64) as i64 {
+    return (cast(i64, src[off]) << 24) |
+           (cast(i64, src[off + 1]) << 16) |
+           (cast(i64, src[off + 2]) << 8) |
+            cast(i64, src[off + 3]);
+}
+
+// ── clearing ────────────────────────────────────────────────────────
+
+fn _mp3_header_clear(h as *Mp3Header) as void {
+    h.word = 0;
+    h.version = 0;
+    h.mpeg1 = 0;
+    h.layer = 0;
+    h.protection = 0;
+    h.crc_present = 0;
+    h.bitrate_index = 0;
+    h.bitrate_kbps = 0;
+    h.sample_rate_index = 0;
+    h.sample_rate = 0;
+    h.padding = 0;
+    h.private_bit = 0;
+    h.mode = 0;
+    h.mode_extension = 0;
+    h.channels = 0;
+    h.mono = 0;
+    h.copyright = 0;
+    h.original = 0;
+    h.emphasis = 0;
+    h.samples_per_frame = 0;
+    h.frame_len = 0;
+    h.crc_len = 0;
+    h.side_info_len = 0;
+    h.side_info_offset = 0;
+    h.side_info_end = 0;
+}
+
+fn _mp3_granule_clear(g as *Mp3Granule) as void {
+    g.part2_3_length = 0;
+    g.big_values = 0;
+    g.global_gain = 0;
+    g.scalefac_compress = 0;
+    g.window_switching_flag = 0;
+    g.block_type = 0;
+    g.mixed_block_flag = 0;
+    g.table_select[0] = 0;
+    g.table_select[1] = 0;
+    g.table_select[2] = 0;
+    g.subblock_gain[0] = 0;
+    g.subblock_gain[1] = 0;
+    g.subblock_gain[2] = 0;
+    g.region0_count = 0;
+    g.region1_count = 0;
+    g.preflag = 0;
+    g.scalefac_scale = 0;
+    g.count1table_select = 0;
+}
+
+fn _mp3_side_clear(s as *Mp3SideInfo) as void {
+    s.main_data_begin = 0;
+    s.private_bits = 0;
+    s.ngr = 0;
+    s.nch = 0;
+    let is i64 as i with mut = 0;
+    while (i < 2) {
+        s.scfsi[i][0] = 0;
+        s.scfsi[i][1] = 0;
+        s.scfsi[i][2] = 0;
+        s.scfsi[i][3] = 0;
+        _mp3_granule_clear(&s.granule[i][0]);
+        _mp3_granule_clear(&s.granule[i][1]);
+        i = i + 1;
+    }
+}
+
+fn _mp3_clear(m as *Mp3) as void {
+    m.src = cast(*u8, 0);
+    m.len = 0;
+    m.pos = 0;
+    m.audio_start = 0;
+    m.audio_end = 0;
+    m.first_frame = 0;
+    m.main_data_base = 0;
+    m.frame_index = 0;
+    m.id3v2_bytes = 0;
+    m.id3v1_present = 0;
+    m.is_vbr = 0;
+    m.has_xing = 0;
+    m.has_vbri = 0;
+    m.vbr_bytes = 0;
+    m.frame_count = 0;
+    m.xing_quality = 0;
+    m.toc_present = 0;
+    m.encoder_delay = 0;
+    m.encoder_padding = 0;
+    m.lame_present = 0;
+    m.encoder_kind = 0;
+    m.vbri_delay = 0;
+    m.vbri_quality = 0;
+    let is i64 as i with mut = 0;
+    while (i < 100) {
+        m.toc[i] = 0;
+        i = i + 1;
+    }
+}
+
+// ── frame header ────────────────────────────────────────────────────
+
+// Parse four header bytes at src[0..avail). Returns 0 and fills *out, or a
+// negative code:
+//   I_EOF          fewer than four bytes
+//   I_BADMAGIC     the 11-bit sync is absent
+//   I_UNSUPPORTED  Layer I/II, or bitrate_index 0 (free format)
+//   I_CORRUPT      reserved version, layer, sample rate or bitrate, or a
+//                  frame too short to hold header, CRC and side info
+// *out is untouched on failure.
+fn mp3_header_parse(src as *u8, avail as i64, out as *Mp3Header) as i64 {
+    if (cast(i64, src) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (avail < 0) { return errno.I_BADPARAM; }
+    if (avail < 4) { return errno.I_EOF; }
+
+    let is i64 as b0 = cast(i64, src[0]);
+    let is i64 as b1 = cast(i64, src[1]);
+    let is i64 as b2 = cast(i64, src[2]);
+    let is i64 as b3 = cast(i64, src[3]);
+
+    if (b0 != 255 || (b1 & 224) != 224) { return errno.I_BADMAGIC; }
+
+    let is Mp3Header as h;
+    _mp3_header_clear(&h);
+    h.word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+
+    let is i64 as vb = (b1 >> 3) & 3;
+    if (vb == 3) { h.version = t.MP3_VER_1; }
+    else if (vb == 2) { h.version = t.MP3_VER_2; }
+    else if (vb == 0) { h.version = t.MP3_VER_25; }
+    else { return errno.I_CORRUPT; }
+    h.mpeg1 = t.mp3_is_mpeg1(h.version);
+
+    let is i64 as lb = (b1 >> 1) & 3;
+    if (lb == 1) { h.layer = 3; }
+    else if (lb == 0) { return errno.I_CORRUPT; }
+    else { return errno.I_UNSUPPORTED; }
+
+    h.protection = b1 & 1;
+    h.crc_present = 1 - h.protection;
+    h.crc_len = 0;
+    if (h.crc_present != 0) { h.crc_len = 2; }
+
+    h.bitrate_index = (b2 >> 4) & 15;
+    if (h.bitrate_index == 0) { return errno.I_UNSUPPORTED; }
+    if (h.bitrate_index == 15) { return errno.I_CORRUPT; }
+    h.bitrate_kbps = t.mp3_bitrate_kbps(h.version, h.bitrate_index);
+    if (h.bitrate_kbps <= 0) { return errno.I_CORRUPT; }
+
+    h.sample_rate_index = (b2 >> 2) & 3;
+    h.sample_rate = t.mp3_sample_rate(h.version, h.sample_rate_index);
+    if (h.sample_rate <= 0) { return errno.I_CORRUPT; }
+
+    h.padding = (b2 >> 1) & 1;
+    h.private_bit = b2 & 1;
+    h.mode = (b3 >> 6) & 3;
+    h.mode_extension = (b3 >> 4) & 3;
+    h.channels = 2;
+    h.mono = 0;
+    if (h.mode == t.MP3_MODE_MONO) {
+        h.channels = 1;
+        h.mono = 1;
+    }
+    h.copyright = (b3 >> 3) & 1;
+    h.original = (b3 >> 2) & 1;
+    h.emphasis = b3 & 3;
+
+    h.samples_per_frame = t.mp3_samples_per_frame(h.version);
+    // frame_len = floor(samples_per_frame / 8 * 1000 * bitrate / rate)
+    //           + padding. 144 or 72 times the kbit/s rate is the same
+    // integer expression the standard uses.
+    let is i64 as factor = h.samples_per_frame / 8;
+    h.frame_len = (factor * 1000 * h.bitrate_kbps) / h.sample_rate + h.padding;
+
+    h.side_info_len = t.mp3_side_info_len(h.version, h.mono);
+    h.side_info_offset = 4 + h.crc_len;
+    h.side_info_end = h.side_info_offset + h.side_info_len;
+    if (h.frame_len < h.side_info_end) { return errno.I_CORRUPT; }
+    if (h.frame_len <= 4) { return errno.I_CORRUPT; }
+
+    *out = h;
+    return errno.I_OK;
+}
+
+// ── side information ────────────────────────────────────────────────
+
+// Parse the fixed side-information block for one frame. len must be exactly
+// the Table 13 length for the version/channel mode; a short or overlong
+// block, a reserved block_type, or big_values above 288 is I_CORRUPT.
+// *out is untouched on failure.
+fn mp3_side_info_parse(src as *u8, len as i64, version as i64,
+                       nch as i64, out as *Mp3SideInfo) as i64 {
+    if (cast(i64, src) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (nch != 1 && nch != 2) { return errno.I_BADPARAM; }
+    if (t.mp3_version_ok(version) == 0) { return errno.I_BADPARAM; }
+
+    let is Mp3SideInfo as s;
+    _mp3_side_clear(&s);
+    s.ngr = t.mp3_granule_count(version);
+    s.nch = nch;
+    let is i64 as mono with mut = 0;
+    if (nch == 1) { mono = 1; }
+
+    let is i64 as expect = t.mp3_side_info_len(version, mono);
+    if (len != expect) { return errno.I_CORRUPT; }
+
+    let is bits.BitsMsb as b;
+    let is i64 as r with mut = bits.bits_msb_init(&b, src, len);
+    if (r < 0) { return r; }
+
+    let is i64 as nbits with mut = 9;
+    if (version != t.MP3_VER_1) { nbits = 8; }
+    r = bits.bits_msb_read(&b, nbits);
+    if (r < 0) { return errno.I_CORRUPT; }
+    s.main_data_begin = r;
+
+    let is i64 as priv with mut = 3;
+    if (version == t.MP3_VER_1) {
+        if (mono != 0) { priv = 5; }
+    } else {
+        if (mono != 0) { priv = 1; }
+        else { priv = 2; }
+    }
+    r = bits.bits_msb_read(&b, priv);
+    if (r < 0) { return errno.I_CORRUPT; }
+    s.private_bits = r;
+
+    if (version == t.MP3_VER_1) {
+        let is i64 as ch with mut = 0;
+        while (ch < nch) {
+            let is i64 as band with mut = 0;
+            while (band < 4) {
+                r = bits.bits_msb_bit(&b);
+                if (r < 0) { return errno.I_CORRUPT; }
+                s.scfsi[ch][band] = r;
+                band = band + 1;
+            }
+            ch = ch + 1;
+        }
+    }
+
+    let is i64 as gr with mut = 0;
+    while (gr < s.ngr) {
+        let is i64 as ch with mut = 0;
+        while (ch < nch) {
+            r = bits.bits_msb_read(&b, 12);
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].part2_3_length = r;
+
+            r = bits.bits_msb_read(&b, 9);
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].big_values = r;
+            if (r > 288) { return errno.I_CORRUPT; }
+
+            r = bits.bits_msb_read(&b, 8);
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].global_gain = r;
+
+            if (version == t.MP3_VER_1) {
+                r = bits.bits_msb_read(&b, 4);
+            } else {
+                r = bits.bits_msb_read(&b, 9);
+            }
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].scalefac_compress = r;
+
+            r = bits.bits_msb_bit(&b);
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].window_switching_flag = r;
+
+            if (r != 0) {
+                r = bits.bits_msb_read(&b, 2);
+                if (r < 0) { return errno.I_CORRUPT; }
+                s.granule[gr][ch].block_type = r;
+                if (r == 0) { return errno.I_CORRUPT; }   // reserved
+
+                r = bits.bits_msb_bit(&b);
+                if (r < 0) { return errno.I_CORRUPT; }
+                s.granule[gr][ch].mixed_block_flag = r;
+
+                let is i64 as region with mut = 0;
+                while (region < 2) {
+                    r = bits.bits_msb_read(&b, 5);
+                    if (r < 0) { return errno.I_CORRUPT; }
+                    s.granule[gr][ch].table_select[region] = r;
+                    region = region + 1;
+                }
+                let is i64 as win with mut = 0;
+                while (win < 3) {
+                    r = bits.bits_msb_read(&b, 3);
+                    if (r < 0) { return errno.I_CORRUPT; }
+                    s.granule[gr][ch].subblock_gain[win] = r;
+                    win = win + 1;
+                }
+                // Not transmitted for switched blocks; the specification
+                // assigns these values so the region walk stays in range.
+                s.granule[gr][ch].region0_count = 7;
+                if (s.granule[gr][ch].block_type == 2 &&
+                    s.granule[gr][ch].mixed_block_flag == 0) {
+                    s.granule[gr][ch].region0_count = 8;
+                }
+                s.granule[gr][ch].region1_count = 63;
+            } else {
+                s.granule[gr][ch].block_type = 0;
+                let is i64 as region with mut = 0;
+                while (region < 3) {
+                    r = bits.bits_msb_read(&b, 5);
+                    if (r < 0) { return errno.I_CORRUPT; }
+                    s.granule[gr][ch].table_select[region] = r;
+                    region = region + 1;
+                }
+                r = bits.bits_msb_read(&b, 4);
+                if (r < 0) { return errno.I_CORRUPT; }
+                s.granule[gr][ch].region0_count = r;
+                r = bits.bits_msb_read(&b, 3);
+                if (r < 0) { return errno.I_CORRUPT; }
+                s.granule[gr][ch].region1_count = r;
+            }
+
+            if (version == t.MP3_VER_1) {
+                r = bits.bits_msb_bit(&b);
+                if (r < 0) { return errno.I_CORRUPT; }
+                s.granule[gr][ch].preflag = r;
+            } else {
+                s.granule[gr][ch].preflag = 0;
+            }
+
+            r = bits.bits_msb_bit(&b);
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].scalefac_scale = r;
+
+            r = bits.bits_msb_bit(&b);
+            if (r < 0) { return errno.I_CORRUPT; }
+            s.granule[gr][ch].count1table_select = r;
+
+            ch = ch + 1;
+        }
+        gr = gr + 1;
+    }
+
+    if (bits.bits_msb_remaining(&b) != 0) { return errno.I_CORRUPT; }
+    *out = s;
+    return errno.I_OK;
+}
+
+// ── ID3 tags ────────────────────────────────────────────────────────
+
+// Skip consecutive ID3v2 tags at src[start..len). On success *out_next is
+// the first byte after them and *out_bytes how many bytes they occupied.
+// A truncated header or tag is I_EOF; an unknown major version is
+// I_UNSUPPORTED; a size byte with its high bit set is I_CORRUPT.
+fn _mp3_id3v2_skip(src as *u8, len as i64, start as i64,
+                   out_next as *i64, out_bytes as *i64) as i64 {
+    let is i64 as off with mut = start;
+    let is i64 as used with mut = 0;
+    while (1) {
+        if (off + 10 > len) {
+            if (off + 3 <= len) {
+                if (_mp3_tag3(src, off, 73, 68, 51) != 0) { return errno.I_EOF; }
+            }
+            break;
+        }
+        if (_mp3_tag3(src, off, 73, 68, 51) == 0) { break; }
+
+        let is i64 as major = cast(i64, src[off + 3]);
+        let is i64 as rev = cast(i64, src[off + 4]);
+        let is i64 as flags = cast(i64, src[off + 5]);
+        if (major < 2 || major > 4) { return errno.I_UNSUPPORTED; }
+        if (rev == 255) { return errno.I_CORRUPT; }
+
+        let is i64 as s0 = cast(i64, src[off + 6]);
+        let is i64 as s1 = cast(i64, src[off + 7]);
+        let is i64 as s2 = cast(i64, src[off + 8]);
+        let is i64 as s3 = cast(i64, src[off + 9]);
+        if ((s0 | s1 | s2 | s3) & 128) { return errno.I_CORRUPT; }
+        let is i64 as size = (s0 << 21) | (s1 << 14) | (s2 << 7) | s3;
+
+        let is i64 as footer with mut = 0;
+        if (major == 4 && (flags & 16) != 0) { footer = 10; }
+        let is i64 as total = 10 + size + footer;
+        if (off + total > len) { return errno.I_EOF; }
+        off = off + total;
+        used = used + total;
+    }
+    *out_next = off;
+    *out_bytes = used;
+    return errno.I_OK;
+}
+
+// ── Xing/Info and VBRI ──────────────────────────────────────────────
+
+fn _mp3_parse_xing(m as *Mp3, src as *u8, off as i64, end as i64) as i64 {
+    if (off + 8 > end) { return errno.I_CORRUPT; }
+    let is i64 as xing with mut = 0;
+    if (_mp3_tag4(src, off, 88, 105, 110, 103) != 0) { xing = 1; }  // Xing
+    if (_mp3_tag4(src, off, 73, 110, 102, 111) == 0 &&
+        xing == 0) { return errno.I_CORRUPT; }                       // Info
+
+    m.has_xing = 1;
+    m.is_vbr = xing;
+    let is i64 as flags = _mp3_u32be(src, off + 4);
+    let is i64 as p with mut = off + 8;
+
+    if ((flags & 1) != 0) {
+        if (p + 4 > end) { return errno.I_CORRUPT; }
+        m.frame_count = _mp3_u32be(src, p);
+        p = p + 4;
+    }
+    if ((flags & 2) != 0) {
+        if (p + 4 > end) { return errno.I_CORRUPT; }
+        m.vbr_bytes = _mp3_u32be(src, p);
+        p = p + 4;
+    }
+    if ((flags & 4) != 0) {
+        if (p + 100 > end) { return errno.I_CORRUPT; }
+        let is i64 as i with mut = 0;
+        while (i < 100) {
+            m.toc[i] = cast(i64, src[p + i]);
+            i = i + 1;
+        }
+        m.toc_present = 1;
+        p = p + 100;
+    }
+    if ((flags & 8) != 0) {
+        if (p + 4 > end) { return errno.I_CORRUPT; }
+        m.xing_quality = _mp3_u32be(src, p);
+        p = p + 4;
+    }
+
+    // The LAME extension starts with a nine-byte encoder string. Its
+    // delay/padding word is the 24-bit field at offset 21 in the tag.
+    if (p + 9 <= end) {
+        let is i64 as kind with mut = 0;
+        if (_mp3_tag4(src, p, 76, 65, 77, 69) != 0) { kind = 1; }  // LAME
+        if (_mp3_tag4(src, p, 76, 97, 118, 102) != 0) { kind = 2; } // Lavf
+        if (_mp3_tag4(src, p, 76, 97, 118, 99) != 0) { kind = 2; }  // Lavc
+        if (kind != 0) {
+            if (p + 24 > end) { return errno.I_CORRUPT; }
+            let is i64 as v = (cast(i64, src[p + 21]) << 16) |
+                              (cast(i64, src[p + 22]) << 8) |
+                               cast(i64, src[p + 23]);
+            m.encoder_kind = kind;
+            m.lame_present = 1;
+            m.encoder_delay = v >> 12;
+            m.encoder_padding = v & 4095;
+        }
+    }
+    return errno.I_OK;
+}
+
+fn _mp3_parse_vbri(m as *Mp3, src as *u8, off as i64, end as i64) as i64 {
+    if (off + 18 > end) { return errno.I_CORRUPT; }
+    if (_mp3_tag4(src, off, 86, 66, 82, 73) == 0) { return errno.I_OK; } // VBRI
+    let is i64 as version = _mp3_u16be(src, off + 4);
+    if (version != 1) { return errno.I_UNSUPPORTED; }
+    m.has_vbri = 1;
+    m.is_vbr = 1;
+    m.vbri_delay = _mp3_u16be(src, off + 6);
+    m.vbri_quality = _mp3_u16be(src, off + 8);
+    m.vbr_bytes = _mp3_u32be(src, off + 10);
+    m.frame_count = _mp3_u32be(src, off + 14);
+    return errno.I_OK;
+}
+
+// Look for the VBR tag in the first frame. Xing/Info sits immediately after
+// the side information (so after the CRC when one is present); VBRI is
+// fixed at 36 bytes from the frame start. A recognised tag that is cut
+// short is I_CORRUPT rather than silently ignored.
+fn _mp3_parse_vbr(m as *Mp3, src as *u8, frame_off as i64,
+                  h as *Mp3Header) as i64 {
+    let is i64 as end = frame_off + h.frame_len;
+    let is i64 as xing_off = frame_off + h.side_info_end;
+    let is i64 as has with mut = 0;
+    if (xing_off + 8 <= end) {
+        if (_mp3_tag4(src, xing_off, 88, 105, 110, 103) != 0) { has = 1; }
+        if (_mp3_tag4(src, xing_off, 73, 110, 102, 111) != 0) { has = 1; }
+    }
+    if (has != 0) { return _mp3_parse_xing(m, src, xing_off, end); }
+
+    let is i64 as vbri_off = frame_off + 36;
+    if (vbri_off + 18 <= end) {
+        if (_mp3_tag4(src, vbri_off, 86, 66, 82, 73) != 0) {
+            return _mp3_parse_vbri(m, src, vbri_off, end);
+        }
+    }
+    return errno.I_OK;
+}
+
+// ── leading-frame search ────────────────────────────────────────────
+
+// Scan src[start..end) for the first Layer III frame that fits entirely.
+// A candidate with a valid header but a declared length past end is skipped
+// as junk. If only Layer I/II syncs were seen, I_UNSUPPORTED is returned so
+// a caller can distinguish "wrong layer" from "not MPEG audio".
+fn _mp3_find_frame(src as *u8, start as i64, end as i64,
+                   out_off as *i64) as i64 {
+    if (cast(i64, out_off) == 0) { return errno.I_BADPARAM; }
+    let is i64 as i with mut = start;
+    let is i64 as saw_unsupported with mut = 0;
+    let is i64 as saw_truncated with mut = 0;
+    let is Mp3Header as h;
+    while (i + 4 <= end) {
+        let is i64 as r = mp3_header_parse(src + i, end - i, &h);
+        if (r == errno.I_OK) {
+            if (i + h.frame_len <= end) {
+                *out_off = i;
+                return errno.I_OK;
+            }
+            saw_truncated = 1;
+        } else if (r == errno.I_UNSUPPORTED) {
+            saw_unsupported = 1;
+        }
+        i = i + 1;
+    }
+    if (saw_truncated != 0) { return errno.I_EOF; }
+    if (saw_unsupported != 0) { return errno.I_UNSUPPORTED; }
+    return errno.I_BADMAGIC;
+}
+
+// ── public API ──────────────────────────────────────────────────────
+
+// Open src[0..len). Leading ID3v2.2/2.3/2.4 tags are skipped, then leading
+// junk is searched for the first valid Layer III frame. A trailing ID3v1
+// tag (last 128 bytes, starting "TAG") is excluded from the audio range.
+// The VBR tag in the first frame is read here; no audio is trimmed.
+//
+// Returns 0, or:
+//   I_BADPARAM    null pointer, negative length or an oversized buffer
+//   I_EOF         a tag or the first header is cut short
+//   I_BADMAGIC    no Layer III sync after the tags
+//   I_UNSUPPORTED free-format stream, Layer I/II, unknown ID3 major
+//   I_CORRUPT     reserved header values or malformed ID3/VBR fields
+// On failure every field is cleared.
+fn mp3_open(m as *Mp3, src as *u8, len as i64) as i64 {
+    if (cast(i64, m) == 0) { return errno.I_BADPARAM; }
+    _mp3_clear(m);
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > bits.BITS_MAX_BYTES) { return errno.I_DIMS; }
+    if (len > 0 && cast(i64, src) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as after_tags with mut = 0;
+    let is i64 as tag_bytes with mut = 0;
+    let is i64 as r with mut = _mp3_id3v2_skip(src, len, 0, &after_tags, &tag_bytes);
+    if (r < 0) { return r; }
+
+    let is i64 as audio_end with mut = len;
+    let is i64 as id3v1 with mut = 0;
+    if (len >= 128) {
+        if (_mp3_tag3(src, len - 128, 84, 65, 71) != 0) {  // "TAG"
+            audio_end = len - 128;
+            id3v1 = 1;
+        }
+    }
+
+    let is i64 as first with mut = 0;
+    r = _mp3_find_frame(src, after_tags, audio_end, &first);
+    if (r < 0) { return r; }
+
+    let is Mp3Header as h;
+    r = mp3_header_parse(src + first, audio_end - first, &h);
+    if (r < 0) { return r; }
+
+    m.src = src;
+    m.len = len;
+    m.audio_start = after_tags;
+    m.audio_end = audio_end;
+    m.first_frame = first;
+    m.pos = first;
+    m.main_data_base = first + h.side_info_end;
+    m.id3v2_bytes = tag_bytes;
+    m.id3v1_present = id3v1;
+
+    r = _mp3_parse_vbr(m, src, first, &h);
+    if (r < 0) { _mp3_clear(m); return r; }
+    return errno.I_OK;
+}
+
+// Return the next frame, 0 at the end of the audio range, or a negative
+// error. The frame is a view into the caller's buffer. On error the frame
+// and the parser position are unchanged.
+fn mp3_next(m as *Mp3, frame as *Mp3Frame) as i64 {
+    if (cast(i64, m) == 0 || cast(i64, frame) == 0) { return errno.I_BADPARAM; }
+    if (m.pos < m.audio_start || m.pos > m.audio_end) { return errno.I_CORRUPT; }
+    if (m.pos == m.audio_end) { return 0; }
+    if (m.pos + 4 > m.audio_end) { return errno.I_EOF; }
+
+    let is Mp3Header as h;
+    let is i64 as r with mut = mp3_header_parse(m.src + m.pos, m.audio_end - m.pos, &h);
+    if (r < 0) { return r; }
+    if (m.pos + h.frame_len > m.audio_end) { return errno.I_EOF; }
+
+    let is Mp3SideInfo as side;
+    r = mp3_side_info_parse(m.src + m.pos + h.side_info_offset,
+                            h.side_info_len, h.version, h.channels, &side);
+    if (r < 0) { return r; }
+
+    // Reservoir bound: the frame plus its backpointer may not exceed the
+    // 7680-bit Layer III buffer, and the 9/8-bit field caps it further.
+    let is i64 as max_mdb = t.MP3_RESERVOIR_BITS - h.frame_len * 8;
+    let is i64 as cap with mut = t.MP3_MAX_MDB_MPEG2;
+    if (h.mpeg1 != 0) { cap = t.MP3_MAX_MDB_MPEG1; }
+    let is i64 as mdb_max with mut = 0;
+    if (max_mdb > 0) {
+        mdb_max = max_mdb;
+        if (mdb_max > cap) { mdb_max = cap; }
+    }
+    // main_data_begin counts bytes; the standard's bound is in bits
+    // (4088/2040 for the 9/8-bit field, and 7680 minus the frame bits).
+    if (side.main_data_begin * 8 > mdb_max) { return errno.I_CORRUPT; }
+
+    let is i64 as side_end = m.pos + h.side_info_end;
+    let is i64 as reservoir = side_end - side.main_data_begin;
+    if (reservoir < m.main_data_base) { return errno.I_CORRUPT; }
+
+    let is i64 as main_len = (m.pos + h.frame_len) - side_end;
+    let is i64 as reservoir_len = side.main_data_begin + main_len;
+
+    let is i64 as used with mut = 0;
+    let is i64 as gr with mut = 0;
+    while (gr < side.ngr) {
+        let is i64 as ch with mut = 0;
+        while (ch < side.nch) {
+            used = used + side.granule[gr][ch].part2_3_length;
+            ch = ch + 1;
+        }
+        gr = gr + 1;
+    }
+    if (used > reservoir_len * 8) { return errno.I_CORRUPT; }
+
+    let is Mp3Frame as f;
+    f.header = h;
+    f.side = side;
+    f.offset = m.pos;
+    f.length = h.frame_len;
+    f.index = m.frame_index;
+    f.side_info_offset = m.pos + h.side_info_offset;
+    f.side_info_len = h.side_info_len;
+    f.main_data_offset = side_end;
+    f.main_data_len = main_len;
+    f.reservoir_offset = reservoir;
+    f.reservoir_len = reservoir_len;
+
+    *frame = f;
+    m.pos = m.pos + h.frame_len;
+    m.frame_index = m.frame_index + 1;
+    return 1;
+}
