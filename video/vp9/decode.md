@@ -301,9 +301,12 @@ Read online, not copied or ported:
   `vp9/common/vp9_onyxc_int.h` (set_mi_row_col, partition context),
   `vp9/common/vp9_reconintra.c` (intra edge building), `vp9/common/vp9_blockd.h`
   (tx contexts), `vpx_scale/generic/yv12config.c` (aligned frame buffer and
-  border).
+  border), `vp9/decoder/vp9_decoder.c` and `vp9/common/vp9_alloccommon.c`
+  (`setup_past_independence` call order and the segmentation-map reset on a
+  frame-size change).
 - FFmpeg `master`: `libavcodec/vp9.c` (decode_sb, decode_tiles, tile offsets,
-  keyframe partition table), `libavcodec/vp9block.c` (decode_mode,
+  keyframe partition table, segmentation-map retain/replace at frame start),
+  `libavcodec/vp9block.c` (decode_mode,
   coefficient context writes, block size to partition mapping),
   `libavcodec/vp9recon.c` (intra_recon, edge handling, end_x/end_y),
   `libavcodec/vp9shared.h` (BlockSize/BlockLevel enums).
