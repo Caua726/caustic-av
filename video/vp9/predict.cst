@@ -38,9 +38,20 @@
 // block itself is still size x size. The caller therefore pads each plane by
 // at least size-1 samples on the right and bottom, and the prediction writes
 // land in that padding.
+//
+// Acceleration
+// ------------
+// V, H and TM have an SSE2 kernel in dsp/ (see dsp/vp9_dsp.md). When the
+// runtime table has one, pred_intra hands it the same aboveRow/leftCol arrays
+// it built for the scalar predictor and the kernel writes the block straight
+// into the plane; every other mode, and every target or CPU with no kernel,
+// runs the scalar predictors below, which remain the reference. The edge
+// arrays are therefore u8, exactly the spec's sample type: every entry is a
+// sample or one of the 127/129 substitutes.
 // =======================================================
 
 use "../../core/errno.cst" as errno;
+use "../../dsp/vp9_dsp.cst" as dsp;
 use "recon_tables.cst" as rt;
 
 // Availability and geometry for one prediction call.
@@ -62,12 +73,12 @@ struct IntraEdge {
 }
 
 // aboveRow[k] for k = -1..2*size-1, stored at abuf[k+1].
-fn pred_above(abuf as *i32, k as i64) as i64 {
+fn pred_above(abuf as *u8, k as i64) as i64 {
     return cast(i64, abuf[k + 1]);
 }
 
 // Predicted block, row-major, size*size entries in `pr`.
-fn pred_v(abuf as *i32, size as i64, pr as *i32) as void {
+fn pred_v(abuf as *u8, size as i64, pr as *i32) as void {
     let is i64 as i with mut = 0;
     while (i < size) {
         let is i64 as j with mut = 0;
@@ -79,7 +90,7 @@ fn pred_v(abuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_h(lbuf as *i32, size as i64, pr as *i32) as void {
+fn pred_h(lbuf as *u8, size as i64, pr as *i32) as void {
     let is i64 as i with mut = 0;
     while (i < size) {
         let is i64 as v = cast(i64, lbuf[i]);
@@ -92,7 +103,7 @@ fn pred_h(lbuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_dc(abuf as *i32, lbuf as *i32, size as i64, log2size as i64,
+fn pred_dc(abuf as *u8, lbuf as *u8, size as i64, log2size as i64,
            have_left as i64, have_above as i64, pr as *i32) as void {
     let is i64 as avg with mut = 128;
     if (have_left == 1 && have_above == 1) {
@@ -131,7 +142,7 @@ fn pred_dc(abuf as *i32, lbuf as *i32, size as i64, log2size as i64,
     }
 }
 
-fn pred_d45(abuf as *i32, size as i64, pr as *i32) as void {
+fn pred_d45(abuf as *u8, size as i64, pr as *i32) as void {
     let is i64 as i with mut = 0;
     while (i < size) {
         let is i64 as j with mut = 0;
@@ -152,7 +163,7 @@ fn pred_d45(abuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_d63(abuf as *i32, size as i64, pr as *i32) as void {
+fn pred_d63(abuf as *u8, size as i64, pr as *i32) as void {
     let is i64 as i with mut = 0;
     while (i < size) {
         let is i64 as j with mut = 0;
@@ -174,7 +185,7 @@ fn pred_d63(abuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_d117(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+fn pred_d117(abuf as *u8, lbuf as *u8, size as i64, pr as *i32) as void {
     // 1. first row from the above row.
     let is i64 as j with mut = 0;
     while (j < size) {
@@ -219,7 +230,7 @@ fn pred_d117(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_d135(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+fn pred_d135(abuf as *u8, lbuf as *u8, size as i64, pr as *i32) as void {
     // 1. pred[0][0].
     pr[0 * size + 0] = cast(i32,
         rt.recon_round2(cast(i64, lbuf[0]) + 2 * pred_above(abuf, -1)
@@ -257,7 +268,7 @@ fn pred_d135(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_d153(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+fn pred_d153(abuf as *u8, lbuf as *u8, size as i64, pr as *i32) as void {
     // 1. pred[0][0].
     pr[0 * size + 0] = cast(i32,
         rt.recon_round2(cast(i64, lbuf[0]) + pred_above(abuf, -1), 1));
@@ -305,7 +316,7 @@ fn pred_d153(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_d207(lbuf as *i32, size as i64, pr as *i32) as void {
+fn pred_d207(lbuf as *u8, size as i64, pr as *i32) as void {
     // 1. last row.
     let is i64 as j with mut = 0;
     while (j < size) {
@@ -343,7 +354,7 @@ fn pred_d207(lbuf as *i32, size as i64, pr as *i32) as void {
     }
 }
 
-fn pred_tm(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+fn pred_tm(abuf as *u8, lbuf as *u8, size as i64, pr as *i32) as void {
     let is i64 as tl = pred_above(abuf, -1);
     let is i64 as i with mut = 0;
     while (i < size) {
@@ -388,8 +399,13 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
     if (x > e.max_x || y > e.max_y) { return errno.I_BADPARAM; }
 
     // aboveRow[-1..2*size-1] at abuf[0..2*size]; leftCol at lbuf[0..size-1].
-    let is [65]i32 as abuf;
-    let is [32]i32 as lbuf;
+    // u8, because every entry is a sample or one of the 127/129 substitutes,
+    // and because the accelerated intra kernels take these two arrays
+    // directly (dsp/vp9_dsp_abi.cst). The arrays are sized for the 32x32 case
+    // (aboveRow[-1..63] is 65 entries), and a kernel loads at most 32 bytes
+    // starting at `ab` -- the 2*size region the scalar predictors read.
+    let is [65]u8 as abuf;
+    let is [32]u8 as lbuf;
     let is [1024]i32 as pred;
 
     let is i64 as k with mut = 0;
@@ -397,7 +413,7 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
         if (e.have_above == 1) {
             let is i64 as xx with mut = x + k;
             if (xx > e.max_x) { xx = e.max_x; }
-            abuf[k + 1] = cast(i32, plane[(y - 1) * stride + xx]);
+            abuf[k + 1] = plane[(y - 1) * stride + xx];
         } else {
             abuf[k + 1] = 127;
         }
@@ -408,14 +424,14 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
         if (e.have_above == 1 && e.not_on_right == 1 && tx_sz == rt.TX_4X4) {
             let is i64 as xx with mut = x + k;
             if (xx > e.max_x) { xx = e.max_x; }
-            abuf[k + 1] = cast(i32, plane[(y - 1) * stride + xx]);
+            abuf[k + 1] = plane[(y - 1) * stride + xx];
         } else {
             abuf[k + 1] = abuf[size];
         }
         k = k + 1;
     }
     if (e.have_above == 1 && e.have_left == 1) {
-        abuf[0] = cast(i32, plane[(y - 1) * stride + (x - 1)]);
+        abuf[0] = plane[(y - 1) * stride + (x - 1)];
     } else if (e.have_above == 1) {
         abuf[0] = 129;
     } else {
@@ -426,16 +442,35 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
         if (e.have_left == 1) {
             let is i64 as yy with mut = y + k;
             if (yy > e.max_y) { yy = e.max_y; }
-            lbuf[k] = cast(i32, plane[yy * stride + (x - 1)]);
+            lbuf[k] = plane[yy * stride + (x - 1)];
         } else {
             lbuf[k] = 129;
         }
         k = k + 1;
     }
 
-    let is *i32 as ab = cast(*i32, &abuf);
-    let is *i32 as lb = cast(*i32, &lbuf);
+    let is *u8 as ab = cast(*u8, &abuf);
+    let is *u8 as lb = cast(*u8, &lbuf);
     let is *i32 as pr = cast(*i32, &pred);
+
+    // Accelerated kernels, when this CPU has one. Each writes the whole block
+    // into the plane itself, so the scalar predictor below and the copy that
+    // follows it are skipped; the outputs are the same bytes by construction
+    // (the scalar code is the reference the kernels are checked against).
+    // A null slot, an unimplemented mode, or a target with no kernels falls
+    // through to the scalar chain unchanged.
+    let is *dsp.abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
+    let is *u8 as at = cast(*u8, cast(i64, plane) + (y * stride + x));
+    if (mode == rt.MODE_V) {
+        let is *u8 as kv = dt.pred_v;
+        if (cast(i64, kv) != 0) { call(kv, at, stride, ab, lb, size); return errno.I_OK; }
+    } else if (mode == rt.MODE_H) {
+        let is *u8 as kh = dt.pred_h;
+        if (cast(i64, kh) != 0) { call(kh, at, stride, ab, lb, size); return errno.I_OK; }
+    } else if (mode == rt.MODE_TM) {
+        let is *u8 as kt = dt.pred_tm;
+        if (cast(i64, kt) != 0) { call(kt, at, stride, ab, lb, size); return errno.I_OK; }
+    }
 
     if (mode == rt.MODE_V) {
         pred_v(ab, size, pr);

@@ -44,9 +44,19 @@
 // `InterFrame.filter` is the block's resolved interp_filter (0..3). A frame
 // with interpolation_filter == SWITCHABLE reads it per block; passing the
 // SWITCHABLE value itself is I_UNSUPPORTED because there is no tap set for it.
+//
+// Acceleration
+// ------------
+// The compound average has an SSE2 kernel in dsp/ (see dsp/vp9_dsp.md). When
+// the runtime table has one and the block width is a multiple of 16, the two
+// prediction buffers are averaged by the kernel; otherwise the loop here runs.
+// The 8-tap horizontal and vertical filter of 8.5.2.4, including its scaled
+// (non-16 step) form, is scalar: a vector form only exists for an unscaled
+// reference and has not been written.
 // =======================================================
 
 use "../../core/errno.cst" as errno;
+use "../../dsp/vp9_dsp.cst" as dsp;
 use "inter_tables.cst" as it;
 
 // Worst case intermediate array of 8.5.2.4: h = 64 samples, yStep = 80
@@ -602,16 +612,26 @@ fn inter_predict_taps(f as *InterFrame, plane as i64, refs as *InterRefPlane,
     }
 
     if (is_compound == 1) {
-        let is i64 as rr with mut = 0;
-        while (rr < h) {
-            let is i64 as cc with mut = 0;
-            while (cc < w) {
-                let is i64 as a = cast(i64, out[rr * out_stride + cc]);
-                let is i64 as b = cast(i64, pred1[rr * w + cc]);
-                out[rr * out_stride + cc] = cast(u8, (a + b + 1) >> 1);
-                cc = cc + 1;
+        // Round2(a + b, 1) over the block. The accelerated kernel works in
+        // 16-byte groups, so it is used only for a width it can cover exactly
+        // (w is 4, 8, 16, 32 or 64 here); every other width and every target
+        // without a kernel runs the loop below, which stays the reference.
+        let is *dsp.abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
+        let is *u8 as ca = dt.compound_avg;
+        if (cast(i64, ca) != 0 && (w & 15) == 0) {
+            call(ca, out, out_stride, pred1, w, w, h);
+        } else {
+            let is i64 as rr with mut = 0;
+            while (rr < h) {
+                let is i64 as cc with mut = 0;
+                while (cc < w) {
+                    let is i64 as a = cast(i64, out[rr * out_stride + cc]);
+                    let is i64 as b = cast(i64, pred1[rr * w + cc]);
+                    out[rr * out_stride + cc] = cast(u8, (a + b + 1) >> 1);
+                    cc = cc + 1;
+                }
+                rr = rr + 1;
             }
-            rr = rr + 1;
         }
     }
     return errno.I_OK;
