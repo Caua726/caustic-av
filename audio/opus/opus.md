@@ -160,7 +160,10 @@ RFC 7845 Section 4.2: `OpusHead.pre_skip` counts 48 kHz samples that are
 decoded but discarded at the start. They are never skipped before decoding,
 because the codec is predictive. `opus_decoder_init` arms the count;
 `opus_decode` decodes every frame and drops the first `pre_skip` output
-frames, reporting fewer frames on the packets that overlap the skip.
+frames, reporting fewer frames on the packets that overlap the skip. The
+returned frame count is already net of the skip, so the Ogg layer must not
+subtract `pre_skip` a second time when it assigns timestamps; it only uses
+the value to compute PCM positions.
 
 RFC 7845 Section 4.4: the EOS page may carry a granule smaller than the
 decoded length. The Ogg layer computes the difference and calls
