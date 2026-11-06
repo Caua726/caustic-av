@@ -220,6 +220,13 @@ No value is copied from a decoder implementation.
   builds `code[x*16+y]`/`len[x*16+y]`, rejects duplicates, lengths above
   19 and codewords that do not fit their length. `mp3_huff_linbits` holds
   the linbits from the Table 40/41 headings.
+* Count1 sets A and B (Tables 24/25): `mp3_count1_load` fills
+  `code[symbol]`/`len[symbol]` for the four-bit symbol
+  `(v<<3)|(w<<2)|(x<<1)|y`, checks the 16 entries and their prefix
+  freedom.
+* Scalefactor partition sizes: `mp3_slen1`/`mp3_slen2` are Table 16;
+  `mp3_lsf_nsf` is the six-context, three-block-case, four-partition
+  MPEG-2/2.5 table from the procedure after Table 16.
 
 `mp3_tables_data.cst` can be reproduced by
 `tools/gen_mp3_tables.py --spec ... -o ...`. The generator is committed but

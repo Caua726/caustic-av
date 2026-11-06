@@ -31,9 +31,12 @@
 //   MP3_SYNTH_WINDOW_NANO                   polyphase synthesis window D,
 //                                           512 printed values scaled by
 //                                           1e9.
-//   MP3_HUFF_*                              Tables 24-41, codeword and
+//   MP3_HUFF_*                              Tables 26-41, codeword and
 //                                           length in x,y order.
 //   MP3_HUFF_LINBITS                        Tables 40 and 41 headings.
+//   MP3_COUNT1_A / MP3_COUNT1_B             Tables 24 and 25.
+//   MP3_SLEN_MPEG1                          Table 16.
+//   MP3_LSF_NSF                             the procedure after Table 16.
 //
 // IMDCT windows and the DCT twiddles are NOT in this module. They are
 // analytic, not printed, so their blobs are left pending for stage 8b,
@@ -70,6 +73,15 @@ let is i64 as MP3_SYNTH_WINDOW_COUNT with imut = 512;
 let is i64 as MP3_HUFF_TABLES        with imut = 32;
 let is i64 as MP3_HUFF_SYMBOLS       with imut = 256;
 let is i64 as MP3_HUFF_MAX_CODE_BITS with imut = 19;
+
+// Count1 tables A and B (document Tables 24/25), indexed by the four-bit
+// symbol (v<<3)|(w<<2)|(x<<1)|y.
+let is i64 as MP3_COUNT1_COUNT       with imut = 16;
+// MPEG-2/2.5 LSF scalefactor partitions: six contexts x three block cases
+// (long, short not mixed, short mixed) x four partitions.
+let is i64 as MP3_LSF_CONTEXTS       with imut = 6;
+let is i64 as MP3_LSF_BLOCK_CASES    with imut = 3;
+let is i64 as MP3_LSF_PARTITIONS     with imut = 4;
 
 // Reservoir: ISO/IEC 11172-3 fixes Layer III at 7680 bits. main_data_begin
 // counts bytes, but the standard states its bound in bits: 4088 bits (the
@@ -413,6 +425,114 @@ fn mp3_huff_load(table as i64, code as *i64, len as *i64) as i64 {
     let is i64 as expected = _mp3_huff_count(table);
     if (expected == 0 || n != expected) { return errno.I_CORRUPT; }
     return errno.I_OK;
+}
+
+// ── count1 tables and MPEG-2 scalefactor partitions ─────────────────
+
+// 1 for count1 table A, 2 for B. The two tables are the quadruple codes
+// used after big_values; table A maps 0000 to one bit, table B is a fixed
+// four-bit code for every symbol.
+fn mp3_count1_table_count(table as i64) as i64 {
+    if (table < 0 || table > 1) { return 0; }
+    return MP3_COUNT1_COUNT;
+}
+
+fn _mp3_code_prefix(a as i64, la as i64, b as i64, lb as i64) as i64 {
+    if (la <= 0 || lb <= 0) { return 0; }
+    if (la <= lb) {
+        if ((b >> (lb - la)) == a) { return 1; }
+        return 0;
+    }
+    if ((a >> (la - lb)) == b) { return 1; }
+    return 0;
+}
+
+// Build the 16-entry lookup of count1 table A (table 0) or B (table 1).
+// code[symbol] and len[symbol] are indexed by (v<<3)|(w<<2)|(x<<1)|y.
+// A malformed blob, a duplicate symbol, a length outside 1..6 or a
+// non-prefix-free set is I_CORRUPT. The arrays are cleared first.
+fn mp3_count1_load(table as i64, code as *i64, len as *i64) as i64 {
+    if (cast(i64, code) == 0 || cast(i64, len) == 0) { return errno.I_BADPARAM; }
+    if (table < 0 || table > 1) { return errno.I_BADPARAM; }
+    let is i64 as i with mut = 0;
+    while (i < MP3_COUNT1_COUNT) {
+        code[i] = 0;
+        len[i] = 0;
+        i = i + 1;
+    }
+    let is *u8 as s with mut = data.MP3_COUNT1_A;
+    if (table == 1) { s = data.MP3_COUNT1_B; }
+
+    let is i64 as pos with mut = 0;
+    let is i64 as n with mut = 0;
+    while (1) {
+        let is i64 as sym with mut = 0;
+        let is i64 as r with mut = _mp3_blob_token(s, &pos, &sym);
+        if (r == errno.I_EOF) { break; }
+        if (r < 0) { return r; }
+        let is i64 as l with mut = 0;
+        let is i64 as c with mut = 0;
+        r = _mp3_blob_token(s, &pos, &l);
+        if (r < 0) { return errno.I_CORRUPT; }
+        r = _mp3_blob_token(s, &pos, &c);
+        if (r < 0) { return errno.I_CORRUPT; }
+        if (sym < 0 || sym >= MP3_COUNT1_COUNT) { return errno.I_CORRUPT; }
+        if (l < 1 || l > 6) { return errno.I_CORRUPT; }
+        if (c < 0 || c >= (1 << l)) { return errno.I_CORRUPT; }
+        if (len[sym] != 0) { return errno.I_CORRUPT; }
+        len[sym] = l;
+        code[sym] = c;
+        n = n + 1;
+    }
+    if (n != MP3_COUNT1_COUNT) { return errno.I_CORRUPT; }
+    i = 0;
+    while (i < MP3_COUNT1_COUNT) {
+        let is i64 as j with mut = 0;
+        while (j < MP3_COUNT1_COUNT) {
+            if (i != j) {
+                if (_mp3_code_prefix(code[i], len[i], code[j], len[j]) != 0) {
+                    return errno.I_CORRUPT;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// MPEG-1 Table 16: number of bits per scalefactor for scalefac_compress.
+fn mp3_slen1(compress as i64) as i64 {
+    if (compress < 0 || compress > 15) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SLEN_MPEG1, compress * 2, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+fn mp3_slen2(compress as i64) as i64 {
+    if (compress < 0 || compress > 15) { return 0; }
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_SLEN_MPEG1, compress * 2 + 1, 1, &v) < 0) {
+        return 0;
+    }
+    return v;
+}
+
+// Number of scalefactors in one MPEG-2/2.5 partition. context selects the
+// six procedures (three by scalefac_compress range, three by the intensity
+// side), block_case is 0 long / 1 short not mixed / 2 short mixed, and
+// partition is 0..3.
+fn mp3_lsf_nsf(context as i64, block_case as i64, partition as i64) as i64 {
+    if (context < 0 || context >= MP3_LSF_CONTEXTS) { return 0; }
+    if (block_case < 0 || block_case >= MP3_LSF_BLOCK_CASES) { return 0; }
+    if (partition < 0 || partition >= MP3_LSF_PARTITIONS) { return 0; }
+    let is i64 as idx = (context * MP3_LSF_BLOCK_CASES + block_case) *
+                        MP3_LSF_PARTITIONS + partition;
+    let is i64 as v with mut = 0;
+    if (_mp3_blob_i64(data.MP3_LSF_NSF, idx, 1, &v) < 0) { return 0; }
+    return v;
 }
 
 // ── pending analytic window tables ─────────────────────────────────

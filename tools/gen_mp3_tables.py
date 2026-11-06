@@ -57,6 +57,22 @@ PRETAB = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 # 0; table 0 is the all-zero table.
 HUFF_LINBITS = [0] * 16 + [1, 2, 3, 4, 6, 8, 10, 13] + [4, 5, 6, 7, 8, 9, 11, 13]
 
+# Table 16: slen1, slen2 per scalefac_compress, interleaved.
+SLEN_MPEG1 = [0, 0, 0, 1, 0, 2, 0, 3, 3, 0, 1, 1, 1, 2, 1, 3,
+              2, 1, 2, 2, 2, 3, 3, 1, 3, 2, 3, 3, 4, 2, 4, 3]
+
+# MPEG-2/2.5 number of scalefactors per partition: six contexts x three
+# block cases (long, short not mixed, short mixed) x four partitions.  The
+# values are the ones the procedure after Table 16 assigns.
+LSF_NSF = [
+    6, 5, 5, 5,  9, 9, 9, 9,  6, 9, 9, 9,
+    6, 5, 7, 3,  9, 9, 12, 6, 6, 9, 12, 6,
+    11, 10, 0, 0, 18, 18, 0, 0, 15, 18, 0, 0,
+    7, 7, 7, 0, 12, 12, 12, 0, 6, 15, 12, 0,
+    6, 6, 6, 3, 12, 9, 9, 6, 6, 12, 9, 6,
+    8, 8, 5, 0, 15, 12, 9, 0, 6, 18, 9, 0,
+]
+
 # The document numbers its Huffman tables 0,1,2,3,5..13,15 in Tables 26-39
 # and prints the shared tables in 40 and 41.  Document table -> MPEG table.
 HUFF_DOC_TABLE = {
@@ -244,6 +260,23 @@ def huffman_entries(section, expected_count):
     return out
 
 
+def count1_entries(section, name):
+    codes = huffman_codes(section)
+    if len(codes) != 16:
+        fail("%s has %d entries, expected 16" % (name, len(codes)))
+    used = []
+    out = []
+    for symbol, code in enumerate(codes):
+        length = len(code)
+        if length < 1 or length > 6:
+            fail("%s code length %d out of range" % (name, length))
+        value = int(code, 2)
+        out.extend([symbol, length, value])
+        used.append((code, length))
+    check_prefix_free(used)
+    return out
+
+
 def blob(name, values):
     return 'let is *u8 as %s with imut = "%s";\n' % (
         name, ",".join(str(v) for v in values))
@@ -336,6 +369,18 @@ def main():
         fail("missing Table 60 (alias coefficients)")
     alias = parse_alias_c(sections[60])
 
+    if 24 not in sections:
+        fail("missing Table 24 (count1 table A)")
+    if 25 not in sections:
+        fail("missing Table 25 (count1 table B)")
+    count1_a = count1_entries(sections[24], "count1 table A")
+    count1_b = count1_entries(sections[25], "count1 table B")
+
+    if len(SLEN_MPEG1) != 32:
+        fail("MPEG-1 slen table is not 16 pairs")
+    if len(LSF_NSF) != 72:
+        fail("LSF nsf table is not 6x3x4")
+
     d_window = parse_d_window(text)
 
     # Huffman tables.
@@ -378,6 +423,10 @@ def main():
     out.append(blob("MP3_ALIAS_C_NANO", alias))
     out.append(blob("MP3_SYNTH_WINDOW_NANO", d_window))
     out.append(blob("MP3_HUFF_LINBITS", HUFF_LINBITS))
+    out.append(blob("MP3_COUNT1_A", count1_a))
+    out.append(blob("MP3_COUNT1_B", count1_b))
+    out.append(blob("MP3_SLEN_MPEG1", SLEN_MPEG1))
+    out.append(blob("MP3_LSF_NSF", LSF_NSF))
     for table in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]:
         flat = [v for entry in hunts[table] for v in entry]
         out.append(blob("MP3_HUFF_%d" % table, flat))
