@@ -754,7 +754,7 @@ notes; none changes valid-stream output or memory safety.
   part of this stage. The SIMD kernels live in `dsp/` from stage 9 on; see
   the Stage 9 section below and `dsp/vp9_dsp.md`.
 
-### Stage 9 scope (written, not this note's stages)
+### Stage 9 scope (written after this note's stages)
 
 Stage 9 adds `dsp/`: a runtime dispatch table and SSE2 kernels for
 intra V/H/TM, the residual add and the compound average, with the scalar

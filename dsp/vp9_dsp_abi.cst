@@ -56,12 +56,12 @@ let is i64 as VP9_DSP_AVX2  with imut = 8;    // leaf 7.0, EBX bit 5
 
 // 1 on x86_64 with the System V ABI (Linux and the other ELF targets), 0
 // everywhere else. Both builtins are parser-injected literals, so this folds
-// to a literal at semantic time and every `if (VP9_X86_SYSV == 1)` around a
-// reference into dsp/x86_64/ is a dead branch on the other targets — the
-// name of a module that the gated import did not load is never resolved
-// there. It is written as a single comparison at each use because the
-// compiler folds comparisons of literals but deliberately does not fold
-// arithmetic expressions into literals at the AST level.
+// to a literal at semantic time and every `if (... == VP9_X86_SYSV)` guard
+// around a reference into dsp/x86_64/ is a dead branch on the other targets —
+// the name of a module that the gated import did not load is never resolved
+// there. Each guard is written as a single comparison against a literal
+// because the compiler folds comparisons of literals but deliberately does
+// not fold arithmetic expressions into literals at the AST level.
 let is i64 as VP9_X86_SYSV with imut = __target_is_x86_64 - __target_is_windows;
 
 struct Vp9Dsp {

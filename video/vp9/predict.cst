@@ -52,6 +52,7 @@
 
 use "../../core/errno.cst" as errno;
 use "../../dsp/vp9_dsp.cst" as dsp;
+use "../../dsp/vp9_dsp_abi.cst" as abi;
 use "recon_tables.cst" as rt;
 
 // Availability and geometry for one prediction call.
@@ -459,7 +460,7 @@ fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
     // (the scalar code is the reference the kernels are checked against).
     // A null slot, an unimplemented mode, or a target with no kernels falls
     // through to the scalar chain unchanged.
-    let is *dsp.abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
+    let is *abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
     let is *u8 as at = cast(*u8, cast(i64, plane) + (y * stride + x));
     if (mode == rt.MODE_V) {
         let is *u8 as kv = dt.pred_v;

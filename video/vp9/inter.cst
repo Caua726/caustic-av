@@ -57,6 +57,7 @@
 
 use "../../core/errno.cst" as errno;
 use "../../dsp/vp9_dsp.cst" as dsp;
+use "../../dsp/vp9_dsp_abi.cst" as abi;
 use "inter_tables.cst" as it;
 
 // Worst case intermediate array of 8.5.2.4: h = 64 samples, yStep = 80
@@ -616,7 +617,7 @@ fn inter_predict_taps(f as *InterFrame, plane as i64, refs as *InterRefPlane,
         // 16-byte groups, so it is used only for a width it can cover exactly
         // (w is 4, 8, 16, 32 or 64 here); every other width and every target
         // without a kernel runs the loop below, which stays the reference.
-        let is *dsp.abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
+        let is *abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
         let is *u8 as ca = dt.compound_avg;
         if (cast(i64, ca) != 0 && (w & 15) == 0) {
             call(ca, out, out_stride, pred1, w, w, h);

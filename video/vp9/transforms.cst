@@ -41,6 +41,7 @@
 
 use "../../core/errno.cst" as errno;
 use "../../dsp/vp9_dsp.cst" as dsp;
+use "../../dsp/vp9_dsp_abi.cst" as abi;
 use "recon_tables.cst" as rt;
 
 // Round2 and Clip1 come from recon_tables (rt.recon_round2, rt.recon_clip1),
@@ -599,7 +600,7 @@ fn tx_add_residual(dst as *u8, stride as i64, dq as *i32, n0 as i64) as i64 {
     // kernel's only reachable shapes are the ones it implements; any other n0
     // (which no caller produces) runs the reference loop below.
     if (n0 == 4 || n0 == 8 || n0 == 16 || n0 == 32) {
-        let is *dsp.abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
+        let is *abi.Vp9Dsp as dt = dsp.vp9_dsp_table();
         let is *u8 as ar = dt.add_residual;
         if (cast(i64, ar) != 0) {
             call(ar, dst, stride, dq, n0);
