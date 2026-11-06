@@ -1,0 +1,333 @@
+// =======================================================
+// caustic-av/audio/opus/range.cst
+// The Opus range decoder of RFC 6716 Section 4.1, as a self-contained
+// bit-exact state machine over one borrowed frame slice.
+//
+// State follows the specification's (val, rng) pair exactly, in i64 cells
+// holding unsigned 32-bit values. `val` is the difference between the top of
+// the current range and the coded value, minus one; `rng` is the size of the
+// current range. Both stay in 0..2^32-1, `rng` above 2^23 after every
+// renormalisation, so ordinary signed i64 arithmetic is exact and no wrap
+// can occur.
+//
+// The forward stream and the raw-bit stream are two cursors over the same
+// slice. `offs` counts bytes consumed by the range coder from the front,
+// `end_offs` counts bytes consumed by raw bits from the back, and `rem`
+// buffers the low bit of the last forward byte, which renormalisation uses as
+// the high bit of the next 8-bit symbol. When either cursor passes the end of
+// the slice the reader supplies zero bytes, as Section 4.1.2.1 requires; it
+// never dereferences past the slice. Reading zero bytes is normal, not an
+// error: the range coder is expected to overrun into the raw-bit area.
+//
+// Contract:
+//   * opus_range_init binds the decoder to ptr[0..len]. len may be 0 (an
+//     empty Opus frame is legal DTX); the decoder then reads zeros.
+//   * opus_range_decode / _decode_bin leave the division factor in `ext`;
+//     the caller must follow with opus_range_update(fl, fh, ft) before the
+//     next symbol. That is the ec_decode()/ec_dec_update() pair of Section
+//     4.1.2.
+//   * opus_range_bit_logp, _icdf and _uint are the complete-symbol helpers of
+//     Sections 4.1.3 and 4.1.5; they do their own update and renormalise.
+//   * opus_range_tell / _tell_frac report the upper bound on bits used, with
+//     the whole-bit and 1/8-bit precision the specification defines
+//     (Sections 4.1.6.1 and 4.1.6.2).
+//   * opus_range_bits reads raw bits from the end of the slice, Section
+//     4.1.4. It is not in the SILK interface but CELT and ec_dec_uint need
+//     it.
+//
+// Every failure is a negative i64; a decoded symbol is non-negative. A
+// malformed frequency tuple (fl >= fh, or fh > ft), an impossible ft, an
+// icdf table that does not terminate, and a uint result past ft are reported
+// as I_CORRUPT or I_BADPARAM instead of being clamped. All reads are
+// bounds-checked.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+// 2^23: renormalisation keeps rng above this (Section 4.1.2.1).
+let is i64 as OPUS_RANGE_BOT with imut = 8388608;
+// 2^31 - 1: the mask val is kept under (Section 4.1.2.1).
+let is i64 as OPUS_RANGE_VAL_MASK with imut = 2147483647;
+// Largest total frequency a 16-bit tuple can carry (Section 4.1).
+let is i64 as OPUS_RANGE_MAX_FT with imut = 65535;
+// ec_dec_uint() takes a 32-bit value count (Section 4.1.5).
+let is i64 as OPUS_RANGE_MAX_UINT with imut = 4294967295;
+// ec_dec_uint() codes at most 8 high bits in the range coder (Section 4.1.5).
+let is i64 as OPUS_RANGE_UINT_BITS with imut = 8;
+
+struct OpusRange {
+    ptr        as *u8;  // caller-owned frame slice
+    len        as i64;  // slice length in bytes, >= 0
+    offs       as i64;  // next byte the range coder reads from the front
+    rem        as i64;  // last forward byte, 0..255; its low bit is buffered
+    rng        as i64;  // range size, 0..2^31, > 2^23 after normalisation
+    val        as i64;  // coded value, 0..2^31-1
+    ext        as i64;  // rng/ft saved by decode for the following update
+    nbits_total as i64; // whole bits processed, including buffered ones
+    end_offs   as i64;  // bytes the raw-bit reader has taken from the end
+    end_window as i64;  // pending raw bits, low-order first
+    nend_bits  as i64;  // valid bits in end_window
+}
+
+// Number of bits needed to store v (ilog in Section 1.1.10), 0 for v == 0.
+fn _ilog(v as i64) as i64 {
+    if (v <= 0) { return 0; }
+    let is i64 as x with mut = v;
+    let is i64 as n with mut = 0;
+    while (x > 0) {
+        x = x >> 1;
+        n = n + 1;
+    }
+    return n;
+}
+
+// Next byte of the forward stream, or zero past the end. Never reads past
+// ptr[len-1]; a zero-length slice yields zeros without touching ptr.
+fn _read_byte(r as *OpusRange) as i64 {
+    if (r.offs >= r.len) { return 0; }
+    let is i64 as v = cast(i64, r.ptr[r.offs]);
+    r.offs = r.offs + 1;
+    return v;
+}
+
+// Next byte of the raw-bit stream, taken from the end of the slice, or zero
+// past the start.
+fn _read_byte_from_end(r as *OpusRange) as i64 {
+    if (r.end_offs >= r.len) { return 0; }
+    r.end_offs = r.end_offs + 1;
+    return cast(i64, r.ptr[r.len - r.end_offs]);
+}
+
+// One renormalisation step (Section 4.1.2.1). The buffered low bit of the
+// previous byte becomes the high bit of sym; the top seven bits of the new
+// byte are the rest, and its low bit becomes the new buffer. Mathematically
+// sym = ((rem << 8) | next) >> 1, and only its low eight bits are used.
+fn _normalize(r as *OpusRange) as void {
+    while (r.rng <= OPUS_RANGE_BOT) {
+        r.nbits_total = r.nbits_total + 8;
+        r.rng = r.rng << 8;
+        let is i64 as sym with mut = r.rem;
+        r.rem = _read_byte(r);
+        sym = ((sym << 8) | r.rem) >> 1;
+        r.val = ((r.val << 8) + (255 - (sym & 255))) & OPUS_RANGE_VAL_MASK;
+    }
+}
+
+// Bind the decoder to ptr[0..len]. Returns 0, or I_BADPARAM for a negative
+// length or a null pointer with bytes. A zero length is accepted: the
+// specification initialises b0 to zero when the frame has no bytes.
+//
+// Initial nbits_total is 9 so that the first two bits reported are the
+// terminator the encoder reserves, as Section 4.1.6 describes; after the
+// initial renormalisation it is 33.
+fn opus_range_init(r as *OpusRange, ptr as *u8, len as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    r.ptr = cast(*u8, 0);
+    r.len = 0;
+    r.offs = 0;
+    r.rem = 0;
+    r.rng = 0;
+    r.val = 0;
+    r.ext = 0;
+    r.nbits_total = 0;
+    r.end_offs = 0;
+    r.end_window = 0;
+    r.nend_bits = 0;
+
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, ptr) == 0) { return errno.I_BADPARAM; }
+
+    r.ptr = ptr;
+    r.len = len;
+    r.nbits_total = 9;
+    r.rng = 128;
+    r.rem = _read_byte(r);
+    r.val = 127 - (r.rem >> 1);
+    _normalize(r);
+    return errno.I_OK;
+}
+
+// ec_decode(): fs for a context whose total frequency is ft (Section 4.1.2).
+// ft is 1..65535. The result is in 0..ft-1 and the caller must pass the
+// symbol's (fl, fh, ft) to opus_range_update next.
+fn opus_range_decode(r as *OpusRange, ft as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (ft < 1 || ft > OPUS_RANGE_MAX_FT) { return errno.I_BADPARAM; }
+    r.ext = r.rng / ft;
+    if (r.ext <= 0) { return errno.I_CORRUPT; }
+    let is i64 as s = r.val / r.ext;
+    if (s + 1 < ft) { return ft - (s + 1); }
+    return 0;
+}
+
+// ec_decode_bin(): the same with ft = 1 << ftb (Section 4.1.3.1). ftb is
+// 0..15 so that ft stays within 65535. ftb == 0 is the degenerate ft == 1
+// context and decodes to 0 without consuming range.
+fn opus_range_decode_bin(r as *OpusRange, ftb as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (ftb < 0 || ftb > 15) { return errno.I_BADPARAM; }
+    let is i64 as ft = 1 << ftb;
+    r.ext = r.rng >> ftb;
+    if (r.ext <= 0) { return errno.I_CORRUPT; }
+    let is i64 as s = r.val / r.ext;
+    if (s + 1 < ft) { return ft - (s + 1); }
+    return 0;
+}
+
+// ec_dec_update(): apply the three-tuple of the symbol found for the fs that
+// opus_range_decode returned, then renormalise (Section 4.1.2). The tuple
+// must satisfy 0 <= fl < fh <= ft; anything else is I_BADPARAM.
+fn opus_range_update(r as *OpusRange, fl as i64, fh as i64, ft as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (ft < 1 || ft > OPUS_RANGE_MAX_FT) { return errno.I_BADPARAM; }
+    if (fl < 0 || fh <= fl || fh > ft) { return errno.I_BADPARAM; }
+    if (r.ext <= 0) { return errno.I_CORRUPT; }
+
+    let is i64 as s = r.ext * (ft - fh);
+    if (s > r.val) { return errno.I_CORRUPT; }
+    r.val = r.val - s;
+    if (fl > 0) {
+        r.rng = r.ext * (fh - fl);
+    } else {
+        r.rng = r.rng - s;
+    }
+    if (r.rng <= 0) { return errno.I_CORRUPT; }
+    _normalize(r);
+    return errno.I_OK;
+}
+
+// ec_dec_bit_logp(): one binary symbol whose probability of a 1 is
+// 1/(1 << logp) (Section 4.1.3.2). Returns 0 or 1; logp is 1..31.
+fn opus_range_bit_logp(r as *OpusRange, logp as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (logp < 1 || logp > 31) { return errno.I_BADPARAM; }
+
+    let is i64 as d = r.val;
+    let is i64 as s = r.rng >> logp;
+    let is i64 as ret with mut = 0;
+    if (d < s) {
+        ret = 1;
+        r.rng = s;
+    } else {
+        r.val = d - s;
+        r.rng = r.rng - s;
+    }
+    if (r.rng <= 0) { return errno.I_CORRUPT; }
+    _normalize(r);
+    return ret;
+}
+
+// ec_dec_icdf(): one symbol from an inverse-CDF table (Section 4.1.3.3).
+// icdf[k] holds (1 << ftb) - fh[k]; the table is terminated by 0 and ftb is
+// 1..8, so a table has at most 256 entries. Returns the symbol index, or
+// I_CORRUPT when the table does not terminate within 256 entries or leaves
+// an empty range.
+fn opus_range_icdf(r as *OpusRange, icdf as *u8, ftb as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, icdf) == 0) { return errno.I_BADPARAM; }
+    if (ftb < 1 || ftb > 8) { return errno.I_BADPARAM; }
+
+    let is i64 as rt = r.rng >> ftb;
+    if (rt <= 0) { return errno.I_CORRUPT; }
+
+    let is i64 as s with mut = r.rng;
+    let is i64 as d = r.val;
+    let is i64 as t with mut = 0;
+    let is i64 as idx with mut = 0;
+    while (1) {
+        if (idx >= 256) { return errno.I_CORRUPT; }
+        t = s;
+        s = rt * cast(i64, icdf[idx]);
+        if (d >= s) { break; }
+        idx = idx + 1;
+    }
+    if (t <= s) { return errno.I_CORRUPT; }
+    r.val = d - s;
+    r.rng = t - s;
+    _normalize(r);
+    return idx;
+}
+
+// ec_dec_uint(): one of ft equiprobable values in 0..ft-1 (Section 4.1.5).
+// ft is 1..2^32-1. Above 8 significant bits the high part is range coded and
+// the rest are raw bits; a result past ft-1 is I_CORRUPT rather than
+// saturated, because the frame no longer matches its model.
+fn opus_range_uint(r as *OpusRange, ft as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (ft < 1 || ft > OPUS_RANGE_MAX_UINT) { return errno.I_BADPARAM; }
+    if (ft == 1) { return 0; }
+
+    let is i64 as maxv = ft - 1;
+    let is i64 as ftb = _ilog(maxv);
+    if (ftb > OPUS_RANGE_UINT_BITS) {
+        let is i64 as sh = ftb - OPUS_RANGE_UINT_BITS;
+        let is i64 as ftv = (maxv >> sh) + 1;
+        let is i64 as s = opus_range_decode(r, ftv);
+        if (s < 0) { return s; }
+        let is i64 as u = opus_range_update(r, s, s + 1, ftv);
+        if (u < 0) { return u; }
+        let is i64 as low = opus_range_bits(r, sh);
+        if (low < 0) { return low; }
+        let is i64 as t = (s << sh) | low;
+        if (t > maxv) { return errno.I_CORRUPT; }
+        return t;
+    }
+
+    let is i64 as ftv = maxv + 1;
+    let is i64 as s = opus_range_decode(r, ftv);
+    if (s < 0) { return s; }
+    let is i64 as u = opus_range_update(r, s, s + 1, ftv);
+    if (u < 0) { return u; }
+    return s;
+}
+
+// ec_dec_bits(): n raw bits from the end of the slice, LSB first (Section
+// 4.1.4). n is 0..31. Bits past the start of the slice read as zero, which
+// is the overlap behaviour Section 4.1.2.1 describes.
+fn opus_range_bits(r as *OpusRange, n as i64) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (n < 0 || n > 31) { return errno.I_BADPARAM; }
+    if (n == 0) { return 0; }
+
+    let is i64 as window with mut = r.end_window;
+    let is i64 as avail with mut = r.nend_bits;
+    while (avail < n) {
+        let is i64 as b = _read_byte_from_end(r);
+        window = window | (b << avail);
+        avail = avail + 8;
+    }
+    let is i64 as ret = window & ((1 << n) - 1);
+    r.end_window = window >> n;
+    r.nend_bits = avail - n;
+    r.nbits_total = r.nbits_total + n;
+    return ret;
+}
+
+// ec_tell(): whole-bit upper bound on the bits used so far (Section
+// 4.1.6.1). rng is always positive after init.
+fn opus_range_tell(r as *OpusRange) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (r.rng <= 0) { return errno.I_CORRUPT; }
+    return r.nbits_total - _ilog(r.rng);
+}
+
+// ec_tell_frac(): the same bound in 1/8th bits (Section 4.1.6.2). The three
+// squaring steps are the specification's; they extend lg by one bit each.
+fn opus_range_tell_frac(r as *OpusRange) as i64 {
+    if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
+    if (r.rng <= 0) { return errno.I_CORRUPT; }
+
+    let is i64 as nbits = r.nbits_total * 8;
+    let is i64 as lg with mut = _ilog(r.rng);
+    if (lg < 16) { return errno.I_CORRUPT; }
+    let is i64 as q with mut = r.rng >> (lg - 16);
+    let is i64 as i with mut = 3;
+    while (i > 0) {
+        q = (q * q) >> 15;
+        let is i64 as b = q >> 16;
+        lg = (lg << 1) | b;
+        q = q >> b;
+        i = i - 1;
+    }
+    return nbits - lg;
+}

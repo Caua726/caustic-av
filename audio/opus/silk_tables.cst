@@ -1,0 +1,132 @@
+// =======================================================
+// caustic-av/audio/opus/silk_tables.cst
+// Constants and accessors for the RFC 6716 SILK tables.
+//
+// The language has no array initialisers, so the tables live in
+// silk_tables_data.cst as comma-separated decimal blobs. This module walks
+// a blob to reach one element; every index used here is derived from a
+// decoded symbol whose range the specification fixes, so no index is
+// attacker-controlled without a prior range check in the caller.
+//
+// A blob's values are not NUL-terminated in the source (the string literal
+// adds one); silk_tbl_i stops at it. Out-of-range indices return 0 rather
+// than reading past the literal. Callers validate the symbol before
+// indexing, so a 0 here would be a programming error, not stream data.
+//
+// PDFs are stored as probabilities. silk_pdf_total() returns their sum
+// (256 for every PDF in the specification) and silk_pdf_elem() returns one
+// probability. The range coder needs the cumulative range, which
+// silk_sym() in silk.cst builds from these two.
+// =======================================================
+
+// Internal SILK sampling rates. These are bandwidth indices, and they are
+// the same numbering as the Opus TOC configuration groups (0..3 NB,
+// 4..7 MB, 8..11 WB), so the Opus decoder's helper can pass config>>2 here.
+let is i64 as SILK_BW_NB with imut = 0;   //  8 kHz
+let is i64 as SILK_BW_MB with imut = 1;   // 12 kHz
+let is i64 as SILK_BW_WB with imut = 2;   // 16 kHz
+
+// Signal type of a SILK frame (RFC 6716 section 4.2.7.3, Table 10). These
+// are also the row index of the sign PDFs (Table 52) and of the
+// quantization offsets (Table 53).
+let is i64 as SILK_SIG_INACTIVE with imut = 0;
+let is i64 as SILK_SIG_UNVOICED with imut = 1;
+let is i64 as SILK_SIG_VOICED   with imut = 2;
+
+// Conditional coding of a SILK frame. The third form is libopus's
+// CODE_INDEPENDENTLY_NO_LTP_SCALING: an independent frame that omits the
+// LTP scaling field because the previous side frame was skipped and its
+// LTP buffer is known to be zero (RFC 6716 sections 4.2.7.4, 4.2.7.6.1
+// and 4.2.7.6.3).
+let is i64 as SILK_COND_INDEPENDENT with imut = 0;
+let is i64 as SILK_COND_CONDITIONAL with imut = 1;
+let is i64 as SILK_COND_INDEP_NOLTP with imut = 2;
+
+// Fixed SILK sizes.
+let is i64 as SILK_SUBFRAMES_MAX    with imut = 4;
+let is i64 as SILK_SHELL_BLOCKS_MAX with imut = 20;   // 20 ms at 16 kHz
+let is i64 as SILK_LTP_ORDER        with imut = 5;
+
+// Resampler geometry (non-normative; section 4.2.9 leaves the method to the
+// decoder). The input rates are 8, 12 and 16 kHz and the supported output
+// rates are 8, 12, 16, 24 and 48 kHz, so the largest phase count is 6
+// (8 kHz -> 48 kHz). The kernel spans 21 input samples.
+let is i64 as SILK_RS_PHASES_MAX with imut = 6;
+let is i64 as SILK_RS_TAPS       with imut = 21;
+
+// Table element counts. Each count is the number of comma-separated values
+// in the matching blob of silk_tables_data.cst; tools/gen_opus_silk_tables.py
+// checks them against the RFC tables.
+let is i64 as SILK_STEREO_S1_N     with imut = 25;
+let is i64 as SILK_STEREO_S2_N     with imut = 3;
+let is i64 as SILK_STEREO_S3_N     with imut = 5;
+let is i64 as SILK_MID_ONLY_N      with imut = 2;
+let is i64 as SILK_FRAME_TYPE_N    with imut = 6;
+let is i64 as SILK_GAIN_MSB_N      with imut = 8;
+let is i64 as SILK_GAIN_DELTA_N    with imut = 41;
+let is i64 as SILK_LSF_S1_N        with imut = 32;
+let is i64 as SILK_LSF_S2_N        with imut = 9;
+let is i64 as SILK_LSF_S2_EXT_N    with imut = 7;
+let is i64 as SILK_LSF_SEL_NB_COLS with imut = 10;  // Table 17 has order columns
+let is i64 as SILK_LSF_SEL_WB_COLS with imut = 16;  // Table 18 has order columns
+let is i64 as SILK_LSF_PREDSEL_NB_COLS with imut = 9;
+let is i64 as SILK_LSF_PREDSEL_WB_COLS with imut = 15;
+let is i64 as SILK_LSF_INTERP_N    with imut = 5;
+let is i64 as SILK_PITCH_HIGH_N    with imut = 32;
+let is i64 as SILK_PITCH_DELTA_N   with imut = 21;
+let is i64 as SILK_LTP_PERIOD_N    with imut = 3;
+let is i64 as SILK_LTP_SCALE_N     with imut = 3;
+let is i64 as SILK_EXC_RATE_N      with imut = 9;
+let is i64 as SILK_PULSE_COUNT_N   with imut = 18;
+let is i64 as SILK_LSB_N           with imut = 2;
+let is i64 as SILK_SIGN_N          with imut = 2;
+
+// Walk a comma-separated decimal blob to element idx. A leading '-' is
+// honoured. Returns 0 when idx is negative or past the end; callers check
+// their own range first.
+fn silk_tbl_i(blob as *u8, idx as i64) as i64 {
+    if (idx < 0) { return 0; }
+    let is i64 as i with mut = 0;    // byte position
+    let is i64 as k with mut = 0;    // element being read
+    while (k < idx) {
+        if (cast(i64, blob[i]) == 0) { return 0; }
+        if (cast(i64, blob[i]) == 44) { k = k + 1; }   // ','
+        i = i + 1;
+    }
+    let is i64 as neg with mut = 0;
+    if (cast(i64, blob[i]) == 45) { neg = 1; i = i + 1; }   // '-'
+    let is i64 as v with mut = 0;
+    while (cast(i64, blob[i]) != 0 && cast(i64, blob[i]) != 44) {
+        v = v * 10 + (cast(i64, blob[i]) - 48);
+        i = i + 1;
+    }
+    if (neg != 0) { v = 0 - v; }
+    return v;
+}
+
+// Element (row, col) of a row-major rectangular blob.
+fn silk_tbl2(blob as *u8, row as i64, col as i64, cols as i64) as i64 {
+    if (row < 0 || col < 0 || col >= cols) { return 0; }
+    return silk_tbl_i(blob, row * cols + col);
+}
+
+// Sum of n probabilities starting at element `off`. Every SILK PDF sums to
+// 256; a different total means the caller passed the wrong blob or count,
+// which silk_sym reports as I_CORRUPT.
+fn silk_pdf_total(blob as *u8, off as i64, n as i64) as i64 {
+    if (off < 0 || n <= 0) { return 0; }
+    let is i64 as i with mut = 0;
+    let is i64 as total with mut = 0;
+    while (i < n) {
+        let is i64 as p = silk_tbl_i(blob, off + i);
+        if (p < 0 || p > 256) { return 0; }
+        total = total + p;
+        i = i + 1;
+    }
+    return total;
+}
+
+// One probability of a PDF.
+fn silk_pdf_elem(blob as *u8, off as i64, k as i64) as i64 {
+    return silk_tbl_i(blob, off + k);
+}

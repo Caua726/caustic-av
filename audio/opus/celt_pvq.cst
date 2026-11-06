@@ -1,0 +1,1073 @@
+// =======================================================
+// caustic-av/audio/opus/celt_pvq.cst
+// Band shape decoding for the CELT layer: PVQ codeword decoding, the
+// spreading rotation, band splits with a coded mid/side angle, time-frequency
+// Haar changes, folding and anti-collapse. RFC 6716 section 4.3.4-4.3.5.
+//
+// This file is decoder-only. The encoder-side paths of the reference
+// (intensity stereo mixing, stereo split, pulse search) are not present.
+//
+// Index bounds: every band loop is driven by [start,end) from the Opus layer
+// (start 0 or 17, end <= 21); every sub-vector length is a band width shifted
+// by LM, so it is at most 176 and always a power-of-two split of that width.
+// The MDCT buffers are sized for the 20 ms, 48 kHz mode (2*960 coefficients,
+// 2*8*78 folding samples), and celt_pvq_decode checks N and K against the
+// precomputed cache before it reads the range coder.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/math.cst" as fm;
+use "range.cst" as rc;
+use "celt_state.cst" as st;
+use "celt_tables.cst" as tbl;
+use "celt_alloc.cst" as al;
+
+// Small per-band context that the recursive band decoder threads through.
+struct CeltBandCtx {
+    band           as i64;
+    intensity      as i64;
+    spread         as i64;
+    tf_change      as i64;
+    remaining_bits as i64;   // 1/8 bits left in the frame
+    seed           as i64;   // folding/anti-collapse noise, not bitstream state
+    disable_inv    as i64;
+}
+
+// Result of decoding the split angle.
+struct CeltTheta {
+    inv    as i64;
+    imid   as i64;   // Q15 cosine of the angle
+    iside  as i64;   // Q15 cosine of the complement
+    delta  as i64;   // mid/side bit difference, 1/8 bits
+    itheta as i64;   // 0..16384
+    qalloc as i64;   // 1/8 bits spent on the angle
+}
+
+fn _pvq_seed_next(seed as i64) as i64 {
+    return (1664525 * seed + 1013904223) & 0xFFFFFFFF;
+}
+
+fn _pvq_min(a as i64, b as i64) as i64 {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn _pvq_max(a as i64, b as i64) as i64 {
+    if (a > b) { return a; }
+    return b;
+}
+
+// ── PVQ codeword decoding (RFC 4.3.4.2) ─────────────────────────────
+
+// Fill y[0..n) with the integer pulse vector for codeword index i, and return
+// sum(y^2). `u` must hold U(n, 0..k+1) on entry; it is used as scratch and
+// ends holding the U row for n-j.
+fn _celt_cwrsi(n_in as i64, k_in as i64, i_in as i64, y as *i64, u as *i64) as i64 {
+    let is i64 as n with mut = n_in;
+    let is i64 as k with mut = k_in;
+    let is i64 as idx with mut = i_in;
+    let is i64 as yy with mut = 0;
+    let is i64 as j with mut = 0;
+    while (j < n) {
+        let is i64 as p = u[k + 1];
+        let is i64 as s with mut = 0;
+        if (idx >= p) {
+            s = -1;
+            idx = idx - p;
+        } else {
+            s = 1;
+        }
+        let is i64 as k0 = k;
+        let is i64 as q with mut = u[k];
+        while (q > idx) {
+            k = k - 1;
+            q = u[k];
+        }
+        idx = idx - q;
+        let is i64 as mag = k0 - k;
+        let is i64 as val with mut = mag;
+        if (s < 0) { val = -mag; }
+        y[j] = val;
+        yy = yy + val * val;
+        // Step to the previous U row for the remaining dimensions.
+        let is i64 as len = k + 2;
+        let is i64 as ui0 with mut = 0;
+        let is i64 as t with mut = 1;
+        while (t < len) {
+            let is i64 as ui1 = u[t] - u[t - 1] - ui0;
+            u[t - 1] = ui0;
+            ui0 = ui1;
+            t = t + 1;
+        }
+        u[len - 1] = ui0;
+        j = j + 1;
+    }
+    return yy;
+}
+
+// Decode a pulse vector of n dimensions and k pulses. Returns sum(y^2), or a
+// negative error when the codeword count is out of range.
+fn celt_pvq_decode(d as *st.CeltDec, r as *rc.OpusRange, n as i64, k as i64,
+                   y as *i64) as i64 {
+    if (n < 1 || n > 176 || k < 1 || k > 128) { return errno.I_CORRUPT; }
+    let is [130]i64 as u;
+    let is *i64 as up = &u[0];
+    tbl.celt_pvq_urow(n, k, up);
+    let is i64 as v = tbl.celt_pvq_v_from_row(up, k);
+    if (v <= 0 || v > 4294967295) { return errno.I_CORRUPT; }
+    let is i64 as idx = rc.opus_range_uint(r, v);
+    if (idx < 0 || idx >= v) { return errno.I_CORRUPT; }
+    return _celt_cwrsi(n, k, idx, y, up);
+}
+
+// Normalise the integer vector to unit norm times `gain`.
+fn celt_normalise_residual(x as *f64, y as *i64, n as i64, ryy as i64,
+                           gain as f64) as void {
+    let is f64 as g with mut = 0.0;
+    if (ryy > 0) {
+        g = gain / fm.sqrt(cast(f64, ryy));
+    }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        x[i] = cast(f64, y[i]) * g;
+        i = i + 1;
+    }
+}
+
+// Collapse mask: one bit per time block, set when the block has a non-zero
+// pulse anywhere.
+fn _celt_collapse_mask(y as *i64, n as i64, B as i64) as i64 {
+    if (B <= 1) { return 1; }
+    let is i64 as n0 = n / B;
+    let is i64 as mask with mut = 0;
+    let is i64 as b with mut = 0;
+    while (b < B) {
+        let is i64 as any with mut = 0;
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            if (y[b * n0 + j] != 0) { any = 1; }
+            j = j + 1;
+        }
+        if (any != 0) { mask = mask | (1 << b); }
+        b = b + 1;
+    }
+    return mask;
+}
+
+// ── spreading rotation (RFC 4.3.4.3) ────────────────────────────────
+
+// One N-D rotation pass with stride. The two halves run in opposite
+// directions so the rotation is exactly reversible.
+fn _exp_rotation1(x as *f64, len as i64, stride as i64, c as f64, s as f64) as void {
+    let is i64 as i with mut = 0;
+    while (i < len - stride) {
+        let is f64 as x1 = x[i];
+        let is f64 as x2 = x[i + stride];
+        x[i + stride] = c * x2 + s * x1;
+        x[i] = c * x1 - s * x2;
+        i = i + 1;
+    }
+    let is i64 as j with mut = len - 2 * stride - 1;
+    while (j >= 0) {
+        let is f64 as x1 = x[j];
+        let is f64 as x2 = x[j + stride];
+        x[j + stride] = c * x2 + s * x1;
+        x[j] = c * x1 - s * x2;
+        j = j - 1;
+    }
+}
+
+// dir = -1 is the decoder direction (RFC 4.3.4.3: spread the decoded
+// vector). `len` is the number of dimensions, `K` the pulse count.
+fn celt_exp_rotation(x as *f64, len_in as i64, dir as i64, stride as i64,
+                     k as i64, spread as i64) as void {
+    if (spread <= 0 || spread > 3 || stride <= 0) { return; }
+    if (2 * k >= len_in) { return; }
+    let is i64 as factor with mut = 15;
+    if (spread == 2) { factor = 10; }
+    if (spread == 3) { factor = 5; }
+    let is f64 as gain = cast(f64, len_in) / cast(f64, len_in + factor * k);
+    let is f64 as theta = 0.5 * gain * gain;
+    let is f64 as half_pi = 1.5707963267948966;
+    let is f64 as c = fm.cos(half_pi * theta);
+    let is f64 as s = fm.sin(half_pi * theta);
+    let is i64 as stride2 with mut = 0;
+    if (len_in >= 8 * stride) {
+        stride2 = 1;
+        while ((stride2 * stride2 + stride2) * stride + (stride >> 2) < len_in) {
+            stride2 = stride2 + 1;
+        }
+    }
+    let is i64 as len = len_in / stride;
+    let is i64 as i with mut = 0;
+    while (i < stride) {
+        let is i64 as base = i * len;
+        if (dir < 0) {
+            if (stride2 != 0) {
+                _exp_rotation1(celt_elem_ptr(x, base), len, stride2, s, c);
+            }
+            _exp_rotation1(celt_elem_ptr(x, base), len, 1, c, s);
+        } else {
+            _exp_rotation1(celt_elem_ptr(x, base), len, 1, c, 0.0 - s);
+            if (stride2 != 0) {
+                _exp_rotation1(celt_elem_ptr(x, base), len, stride2, s, 0.0 - c);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Pointer helper kept local so the file does not depend on an implementation
+// detail of the tables module.
+fn celt_elem_ptr(base as *f64, off as i64) as *f64 {
+    return cast(*f64, cast(i64, base) + off * 8);
+}
+
+// ── time-frequency changes (RFC 4.3.4.5) ────────────────────────────
+
+fn celt_haar1(x as *f64, n0_in as i64, stride as i64) as void {
+    let is i64 as n0 = n0_in >> 1;
+    let is f64 as r = 0.7071067811865476;
+    let is i64 as i with mut = 0;
+    while (i < stride) {
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            let is f64 as a = r * x[stride * 2 * j + i];
+            let is f64 as b = r * x[stride * (2 * j + 1) + i];
+            x[stride * 2 * j + i] = a + b;
+            x[stride * (2 * j + 1) + i] = a - b;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Sequency order for the Hadamard interleave (RFC 4.3.4.5: "the decoder uses
+// the sequency order because the input vector is sorted in time").
+fn _celt_ordery(stride as i64, i as i64) as i64 {
+    if (stride == 2) {
+        if (i == 0) { return 1; }
+        return 0;
+    }
+    if (stride == 4) {
+        if (i == 0) { return 3; }
+        if (i == 1) { return 0; }
+        if (i == 2) { return 2; }
+        return 1;
+    }
+    if (stride == 8) {
+        if (i == 0) { return 7; }
+        if (i == 1) { return 0; }
+        if (i == 2) { return 4; }
+        if (i == 3) { return 3; }
+        if (i == 4) { return 6; }
+        if (i == 5) { return 1; }
+        if (i == 6) { return 5; }
+        return 2;
+    }
+    // stride == 16
+    if (i == 0) { return 15; }
+    if (i == 1) { return 0; }
+    if (i == 2) { return 8; }
+    if (i == 3) { return 7; }
+    if (i == 4) { return 12; }
+    if (i == 5) { return 3; }
+    if (i == 6) { return 11; }
+    if (i == 7) { return 4; }
+    if (i == 8) { return 14; }
+    if (i == 9) { return 1; }
+    if (i == 10) { return 9; }
+    if (i == 11) { return 6; }
+    if (i == 12) { return 13; }
+    if (i == 13) { return 2; }
+    if (i == 14) { return 10; }
+    return 5;
+}
+
+fn celt_deinterleave_hadamard(x as *f64, n0 as i64, stride as i64,
+                              hadamard as i64) as void {
+    let is [960]f64 as tmp;
+    let is i64 as n = n0 * stride;
+    let is i64 as i with mut = 0;
+    while (i < stride) {
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            let is i64 as dstn with mut = i * n0 + j;
+            if (hadamard != 0) { dstn = _celt_ordery(stride, i) * n0 + j; }
+            tmp[dstn] = x[j * stride + i];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        x[i] = tmp[i];
+        i = i + 1;
+    }
+}
+
+fn celt_interleave_hadamard(x as *f64, n0 as i64, stride as i64,
+                            hadamard as i64) as void {
+    let is [960]f64 as tmp;
+    let is i64 as n = n0 * stride;
+    let is i64 as i with mut = 0;
+    while (i < stride) {
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            let is i64 as srcn with mut = i * n0 + j;
+            if (hadamard != 0) { srcn = _celt_ordery(stride, i) * n0 + j; }
+            tmp[j * stride + i] = x[srcn];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        x[i] = tmp[i];
+        i = i + 1;
+    }
+}
+
+// Renormalise to `gain` times unit norm.
+fn celt_renormalise(x as *f64, n as i64, gain as f64) as void {
+    let is f64 as sum = 1e-15;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        sum = sum + x[i] * x[i];
+        i = i + 1;
+    }
+    let is f64 as g = gain / fm.sqrt(sum);
+    i = 0;
+    while (i < n) {
+        x[i] = x[i] * g;
+        i = i + 1;
+    }
+}
+
+// ── angle decoding and bit split (RFC 4.3.4.4) ──────────────────────
+
+// exp2_table8[q] = round(16384 * 2^(q/8)), Q14.
+fn _celt_exp2_q14(q as i64) as i64 {
+    if (q <= 0) { return 16384; }
+    if (q == 1) { return 17866; }
+    if (q == 2) { return 19483; }
+    if (q == 3) { return 21247; }
+    if (q == 4) { return 23170; }
+    if (q == 5) { return 25267; }
+    if (q == 6) { return 27554; }
+    return 30048;
+}
+
+// Number of quantisation levels for the split angle.
+fn celt_compute_qn(n as i64, b as i64, offset as i64, pulse_cap as i64,
+                   stereo as i64) as i64 {
+    let is i64 as n2 with mut = 2 * n - 1;
+    if (stereo != 0 && n == 2) { n2 = n2 - 1; }
+    let is i64 as qb with mut = (b + n2 * offset) / n2;
+    let is i64 as cap1 = b - pulse_cap - 32;
+    if (qb > cap1) { qb = cap1; }
+    if (qb > 64) { qb = 64; }
+    if (qb < 4) { return 1; }
+    let is i64 as qn = _celt_exp2_q14(qb & 7) >> (14 - (qb >> 3));
+    return ((qn + 1) >> 1) << 1;
+}
+
+// Decode the split angle. `b` is decremented by the bits spent, `fill` is
+// masked to the sub-blocks that survive a one-sided split.
+fn celt_compute_theta(d as *st.CeltDec, r as *rc.OpusRange, ctx as *CeltBandCtx,
+                      x as *f64, y as *f64, n as i64, b as *i64, B as i64,
+                      B0 as i64, lm as i64, stereo as i64, fill as *i64,
+                      t as *CeltTheta) as i64 {
+    let is i64 as pulse_cap = tbl.celt_logn(&d.tab, ctx.band) + lm * 8;
+    let is i64 as qoff with mut = 0;
+    if (stereo != 0 && n == 2) { qoff = 16; } else { qoff = 4; }
+    let is i64 as offset = (pulse_cap >> 1) - qoff;
+    let is i64 as qn0 = celt_compute_qn(n, *b, offset, pulse_cap, stereo);
+    let is i64 as qn with mut = qn0;
+    if (stereo != 0 && ctx.band >= ctx.intensity) { qn = 1; }
+    let is i64 as tell = rc.opus_range_tell_frac(r);
+    let is i64 as itheta0 with mut = 0;
+    let is i64 as inv with mut = 0;
+    if (qn != 1) {
+        if (stereo != 0 && n > 2) {
+            // Step PDF: weight 3 below the middle, 1 above it.
+            let is i64 as x0 = qn / 2;
+            let is i64 as ft = 3 * (x0 + 1) + x0;
+            let is i64 as fs = rc.opus_range_decode(r, ft);
+            let is i64 as xv with mut = 0;
+            if (fs < (x0 + 1) * 3) {
+                xv = fs / 3;
+            } else {
+                xv = x0 + 1 + (fs - (x0 + 1) * 3);
+            }
+            let is i64 as fl with mut = 0;
+            if (xv <= x0) { fl = 3 * xv; } else { fl = (xv - 1 - x0) + (x0 + 1) * 3; }
+            let is i64 as fh with mut = 0;
+            if (xv <= x0) { fh = 3 * (xv + 1); } else { fh = (xv - x0) + (x0 + 1) * 3; }
+            rc.opus_range_update(r, fl, fh, ft);
+            itheta0 = xv;
+        } else if (B0 > 1 || stereo != 0) {
+            itheta0 = rc.opus_range_uint(r, qn + 1);
+        } else {
+            // Triangular PDF.
+            let is i64 as half = qn >> 1;
+            let is i64 as ft = (half + 1) * (half + 1);
+            let is i64 as fmv = rc.opus_range_decode(r, ft);
+            let is i64 as it with mut = 0;
+            let is i64 as fs with mut = 0;
+            let is i64 as fl with mut = 0;
+            if (fmv < (half * (half + 1) >> 1)) {
+                it = (tbl.celt_isqrt32(8 * fmv + 1) - 1) >> 1;
+                fs = it + 1;
+                fl = it * (it + 1) >> 1;
+            } else {
+                it = (2 * (qn + 1) - tbl.celt_isqrt32(8 * (ft - fmv - 1) + 1)) >> 1;
+                fs = qn + 1 - it;
+                fl = ft - ((qn + 1 - it) * (qn + 2 - it) >> 1);
+            }
+            rc.opus_range_update(r, fl, fl + fs, ft);
+            itheta0 = it;
+        }
+        if (itheta0 < 0 || itheta0 > qn) { return errno.I_CORRUPT; }
+        t.itheta = itheta0 * 16384 / qn;
+    } else {
+        t.itheta = 0;
+        if (stereo != 0) {
+            if (*b > 16 && ctx.remaining_bits > 16) {
+                inv = rc.opus_range_bit_logp(r, 2);
+            }
+            if (ctx.disable_inv != 0) { inv = 0; }
+        }
+    }
+    t.inv = inv;
+    t.qalloc = rc.opus_range_tell_frac(r) - tell;
+    *b = *b - t.qalloc;
+    let is i64 as itheta = t.itheta;
+    if (itheta == 0) {
+        t.imid = 32767;
+        t.iside = 0;
+        *fill = *fill & ((1 << B) - 1);
+        t.delta = -16384;
+    } else if (itheta == 16384) {
+        t.imid = 0;
+        t.iside = 32767;
+        *fill = *fill & (((1 << B) - 1) << B);
+        t.delta = 16384;
+    } else {
+        t.imid = tbl.celt_bitexact_cos(itheta);
+        t.iside = tbl.celt_bitexact_cos(16384 - itheta);
+        t.delta = tbl.celt_frac_mul16((n - 1) << 7,
+                                      tbl.celt_bitexact_log2tan(t.iside, t.imid));
+    }
+    return errno.I_OK;
+}
+
+// ── band decoding ───────────────────────────────────────────────────
+
+fn _celt_quant_n1(d as *st.CeltDec, r as *rc.OpusRange, ctx as *CeltBandCtx,
+                  x as *f64, y as *f64, lowband_out as *f64) as i64 {
+    let is i64 as stereo with mut = 0;
+    if (y != cast(*f64, 0)) { stereo = 1; }
+    let is i64 as c with mut = 0;
+    while (c < 1 + stereo) {
+        let is *f64 as xp with mut = x;
+        if (c == 1) { xp = y; }
+        let is i64 as sign with mut = 0;
+        if (ctx.remaining_bits >= 8) {
+            sign = rc.opus_range_bits(r, 1);
+            ctx.remaining_bits = ctx.remaining_bits - 8;
+        }
+        if (sign != 0) {
+            xp[0] = -1.0;
+        } else {
+            xp[0] = 1.0;
+        }
+        c = c + 1;
+    }
+    if (lowband_out != cast(*f64, 0)) { lowband_out[0] = x[0]; }
+    return 1;
+}
+
+// Bit interleave used when recombining time blocks: two input bits per output
+// bit (RFC 4.3.4.5 recombine step).
+fn _bit_interleave4(v as i64) as i64 {
+    let is i64 as b0 = v & 1;
+    let is i64 as b1 = (v >> 1) & 1;
+    let is i64 as b2 = (v >> 2) & 1;
+    let is i64 as b3 = (v >> 3) & 1;
+    return (b0 | b1) | ((b2 | b3) << 1);
+}
+
+// Inverse of _bit_interleave4, generalised to 8 bits of mask.
+fn _bit_deinterleave(cm as i64) as i64 {
+    let is i64 as out with mut = 0;
+    let is i64 as b with mut = 0;
+    while (b < 8) {
+        if (((cm >> b) & 1) != 0) {
+            out = out | (3 << (2 * b));
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+fn _celt_quant_partition(d as *st.CeltDec, r as *rc.OpusRange,
+                         ctx as *CeltBandCtx, x as *f64, n_in as i64,
+                         b_in as i64, B_in as i64, lowband as *f64,
+                         lm_in as i64, gain as f64, fill_in as i64) as i64 {
+    let is i64 as n with mut = n_in;
+    let is i64 as b with mut = b_in;
+    let is i64 as B with mut = B_in;
+    let is i64 as lm with mut = lm_in;
+    let is i64 as fill with mut = fill_in;
+    let is i64 as B0 = B;
+    let is i64 as maxbits = al.celt_pulses2bits(d, n, d.tab.pvq_qmax[n]);
+    if (lm != 0 - 1 && b > maxbits + 12 && n > 2) {
+        // Split in two, coding the relative gain of the halves.
+        n = n >> 1;
+        let is *f64 as y = celt_elem_ptr(x, n);
+        lm = lm - 1;
+        if (B == 1) { fill = (fill & 1) | (fill << 1); }
+        B = (B + 1) >> 1;
+        let is CeltTheta as t;
+        let is i64 as rr = celt_compute_theta(d, r, ctx, x, y, n, &b, B, B0, lm, 0, &fill, &t);
+        if (rr != 0) { return rr; }
+        let is f64 as mid = cast(f64, t.imid) / 32768.0;
+        let is f64 as side = cast(f64, t.iside) / 32768.0;
+        let is i64 as delta with mut = t.delta;
+        if (B0 > 1 && ((t.itheta & 0x3FFF) != 0)) {
+            if (t.itheta > 8192) {
+                delta = delta - (delta >> (4 - lm));
+            } else {
+                delta = _pvq_min(0, delta + ((n << 3) >> (5 - lm)));
+            }
+        }
+        let is i64 as mbits with mut = _pvq_max(0, _pvq_min(b, (b - delta) / 2));
+        let is i64 as sbits with mut = b - mbits;
+        ctx.remaining_bits = ctx.remaining_bits - t.qalloc;
+        let is *f64 as low2 with mut = cast(*f64, 0);
+        if (lowband != cast(*f64, 0)) { low2 = celt_elem_ptr(lowband, n); }
+        let is i64 as rebalance = ctx.remaining_bits;
+        let is i64 as cm with mut = 0;
+        if (mbits >= sbits) {
+            cm = _celt_quant_partition(d, r, ctx, x, n, mbits, B, lowband, lm,
+                                       gain * mid, fill);
+            if (cm < 0) { return cm; }
+            let is i64 as used = rebalance - ctx.remaining_bits;
+            let is i64 as extra = mbits - used;
+            if (extra > 24 && t.itheta != 0) { sbits = sbits + extra - 24; }
+            let is i64 as cm2 = _celt_quant_partition(d, r, ctx, y, n, sbits, B,
+                low2, lm, gain * side, fill >> B);
+            if (cm2 < 0) { return cm2; }
+            cm = cm | (cm2 << (B0 >> 1));
+        } else {
+            cm = _celt_quant_partition(d, r, ctx, y, n, sbits, B, low2, lm,
+                                       gain * side, fill >> B);
+            if (cm < 0) { return cm; }
+            let is i64 as used = rebalance - ctx.remaining_bits;
+            let is i64 as extra = sbits - used;
+            if (extra > 24 && t.itheta != 16384) { mbits = mbits + extra - 24; }
+            let is i64 as cm2 = _celt_quant_partition(d, r, ctx, x, n, mbits, B,
+                lowband, lm, gain * mid, fill);
+            if (cm2 < 0) { return cm2; }
+            cm = (cm << (B0 >> 1)) | cm2;
+        }
+        return cm;
+    }
+
+    // No split: decode a PVQ codeword, or fill the band.
+    let is i64 as q = al.celt_bits2pulses(d, n, b);
+    let is i64 as cur = al.celt_pulses2bits(d, n, q);
+    ctx.remaining_bits = ctx.remaining_bits - cur;
+    let is i64 as qq with mut = q;
+    let is i64 as cbits with mut = cur;
+    while (ctx.remaining_bits < 0 && qq > 0) {
+        ctx.remaining_bits = ctx.remaining_bits + cbits;
+        qq = qq - 1;
+        cbits = al.celt_pulses2bits(d, n, qq);
+        ctx.remaining_bits = ctx.remaining_bits - cbits;
+    }
+    if (qq != 0) {
+        let is i64 as k = tbl.celt_get_pulses(qq);
+        let is [176]i64 as yv;
+        let is *i64 as yp = &yv[0];
+        let is i64 as yy = celt_pvq_decode(d, r, n, k, yp);
+        if (yy < 0) { return yy; }
+        celt_normalise_residual(x, yp, n, yy, gain);
+        celt_exp_rotation(x, n, 0 - 1, B, k, ctx.spread);
+        return _celt_collapse_mask(yp, n, B);
+    }
+
+    // No pulses: zero, noise or a folded copy of a previous band.
+    let is i64 as cm_mask = (1 << B) - 1;
+    fill = fill & cm_mask;
+    if (fill == 0) {
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            x[j] = 0.0;
+            j = j + 1;
+        }
+        return 0;
+    }
+    if (lowband == cast(*f64, 0)) {
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            ctx.seed = _pvq_seed_next(ctx.seed);
+            // 12-bit centred noise; only the shape survives renormalisation.
+            x[j] = cast(f64, ((ctx.seed >> 20) & 0xFFF) - 2048);
+            j = j + 1;
+        }
+        celt_renormalise(x, n, gain);
+        return cm_mask;
+    }
+    let is i64 as j with mut = 0;
+    while (j < n) {
+        ctx.seed = _pvq_seed_next(ctx.seed);
+        let is f64 as bump = 0.00390625;   // 2^-8: about 48 dB below folding
+        if ((ctx.seed & 0x8000) != 0) {
+            x[j] = lowband[j] + bump;
+        } else {
+            x[j] = lowband[j] - bump;
+        }
+        j = j + 1;
+    }
+    celt_renormalise(x, n, gain);
+    return fill;
+}
+
+fn _celt_quant_band(d as *st.CeltDec, r as *rc.OpusRange, ctx as *CeltBandCtx,
+                    x as *f64, n_in as i64, b as i64, B_in as i64,
+                    lowband_in as *f64, lm as i64, lowband_out as *f64,
+                    gain as f64, lowband_scratch as *f64, fill_in as i64) as i64 {
+    let is i64 as n0 = n_in;
+    let is i64 as n_b with mut = n_in;
+    let is i64 as B with mut = B_in;
+    let is i64 as B0 with mut = B_in;
+    let is i64 as tf_change with mut = ctx.tf_change;
+    let is i64 as long_blocks with mut = 0;
+    if (B0 == 1) { long_blocks = 1; }
+    if (n_in == 1) {
+        return _celt_quant_n1(d, r, ctx, x, cast(*f64, 0), lowband_out);
+    }
+    n_b = n_b / B;
+    let is i64 as recombine with mut = 0;
+    if (tf_change > 0) { recombine = tf_change; }
+    let is *f64 as lowband with mut = lowband_in;
+    if (lowband_scratch != cast(*f64, 0) && lowband != cast(*f64, 0)
+        && (recombine != 0 || ((n_b & 1) == 0 && tf_change < 0) || B0 > 1)) {
+        let is i64 as c with mut = 0;
+        while (c < n_in) {
+            lowband_scratch[c] = lowband[c];
+            c = c + 1;
+        }
+        lowband = lowband_scratch;
+    }
+    let is i64 as fill with mut = fill_in;
+    let is i64 as k with mut = 0;
+    while (k < recombine) {
+        celt_haar1(x, n_in >> k, 1 << k);
+        if (lowband != cast(*f64, 0)) { celt_haar1(lowband, n_in >> k, 1 << k); }
+        fill = _bit_interleave4(fill & 0xF) | (_bit_interleave4(fill >> 4) << 2);
+        k = k + 1;
+    }
+    B = B >> recombine;
+    n_b = n_b << recombine;
+    let is i64 as time_divide with mut = 0;
+    while ((n_b & 1) == 0 && tf_change < 0) {
+        celt_haar1(x, n_b, B);
+        if (lowband != cast(*f64, 0)) { celt_haar1(lowband, n_b, B); }
+        fill = fill | (fill << B);
+        B = B << 1;
+        n_b = n_b >> 1;
+        time_divide = time_divide + 1;
+        tf_change = tf_change + 1;
+    }
+    B0 = B;
+    let is i64 as n_b0 = n_b;
+    if (B0 > 1) {
+        celt_deinterleave_hadamard(x, n_b >> recombine, B0 << recombine, long_blocks);
+        if (lowband != cast(*f64, 0)) {
+            celt_deinterleave_hadamard(lowband, n_b >> recombine, B0 << recombine, long_blocks);
+        }
+    }
+    let is i64 as cm0 = _celt_quant_partition(d, r, ctx, x, n_in, b, B, lowband,
+                                              lm, gain, fill);
+    if (cm0 < 0) { return cm0; }
+    let is i64 as cm with mut = cm0;
+
+    // Undo the time-frequency rearrangement for the synthesis buffers.
+    if (B0 > 1) {
+        celt_interleave_hadamard(x, n_b >> recombine, B0 << recombine, long_blocks);
+    }
+    n_b = n_b0;
+    B = B0;
+    k = 0;
+    while (k < time_divide) {
+        B = B >> 1;
+        n_b = n_b << 1;
+        cm = cm | (cm >> B);
+        celt_haar1(x, n_b, B);
+        k = k + 1;
+    }
+    k = 0;
+    while (k < recombine) {
+        cm = _bit_deinterleave(cm);
+        celt_haar1(x, n0 >> k, 1 << k);
+        k = k + 1;
+    }
+    B = B << recombine;
+    if (lowband_out != cast(*f64, 0)) {
+        let is f64 as scale = fm.sqrt(cast(f64, n0));
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            lowband_out[j] = scale * x[j];
+            j = j + 1;
+        }
+    }
+    return cm & ((1 << B) - 1);
+}
+
+// Stereo band: the angle splits mid and side, then the two are recombined.
+fn _celt_stereo_merge(x as *f64, y as *f64, mid as f64, n as i64) as void {
+    let is f64 as xp with mut = 0.0;
+    let is f64 as side with mut = 0.0;
+    let is i64 as j with mut = 0;
+    while (j < n) {
+        xp = xp + y[j] * x[j];
+        side = side + y[j] * y[j];
+        j = j + 1;
+    }
+    xp = xp * mid;
+    let is f64 as el = mid * mid + side - 2.0 * xp;
+    let is f64 as er = mid * mid + side + 2.0 * xp;
+    if (er < 6e-4 || el < 6e-4) {
+        j = 0;
+        while (j < n) {
+            y[j] = x[j];
+            j = j + 1;
+        }
+        return;
+    }
+    let is f64 as lg = 1.0 / fm.sqrt(el);
+    let is f64 as rg = 1.0 / fm.sqrt(er);
+    j = 0;
+    while (j < n) {
+        let is f64 as l = mid * x[j];
+        let is f64 as r = y[j];
+        x[j] = lg * (l - r);
+        y[j] = rg * (l + r);
+        j = j + 1;
+    }
+}
+
+fn _celt_quant_band_stereo(d as *st.CeltDec, r as *rc.OpusRange,
+                           ctx as *CeltBandCtx, x as *f64, y as *f64,
+                           n as i64, b_in as i64, B as i64,
+                           lowband as *f64, lm as i64, lowband_out as *f64,
+                           lowband_scratch as *f64, fill_in as i64) as i64 {
+    let is i64 as orig_fill = fill_in;
+    let is i64 as fill with mut = fill_in;
+    let is i64 as b with mut = b_in;
+    if (n == 1) {
+        return _celt_quant_n1(d, r, ctx, x, y, lowband_out);
+    }
+    let is CeltTheta as t;
+    let is i64 as rr = celt_compute_theta(d, r, ctx, x, y, n, &b, B, B, lm, 1, &fill, &t);
+    if (rr != 0) { return rr; }
+    let is f64 as mid = cast(f64, t.imid) / 32768.0;
+    let is f64 as side = cast(f64, t.iside) / 32768.0;
+    let is i64 as cm with mut = 0;
+    if (n == 2) {
+        let is i64 as mbits with mut = b;
+        let is i64 as sbits with mut = 0;
+        if (t.itheta != 0 && t.itheta != 16384) { sbits = 8; }
+        mbits = mbits - sbits;
+        let is i64 as cch with mut = 0;
+        if (t.itheta > 8192) { cch = 1; }
+        ctx.remaining_bits = ctx.remaining_bits - t.qalloc - sbits;
+        let is *f64 as x2 with mut = x;
+        let is *f64 as y2 with mut = y;
+        if (cch != 0) { x2 = y; y2 = x; }
+        let is i64 as sign with mut = 0;
+        if (sbits != 0) { sign = rc.opus_range_bits(r, 1); }
+        let is i64 as sgn = 1 - 2 * sign;
+        cm = _celt_quant_band(d, r, ctx, x2, 2, mbits, B, lowband, lm,
+                              lowband_out, 1.0, lowband_scratch, orig_fill);
+        if (cm < 0) { return cm; }
+        y2[0] = 0.0 - cast(f64, sgn) * x2[1];
+        y2[1] = cast(f64, sgn) * x2[0];
+        x[0] = mid * x[0];
+        x[1] = mid * x[1];
+        y[0] = side * y[0];
+        y[1] = side * y[1];
+        let is f64 as tmp with mut = x[0];
+        x[0] = tmp - y[0];
+        y[0] = tmp + y[0];
+        tmp = x[1];
+        x[1] = tmp - y[1];
+        y[1] = tmp + y[1];
+    } else {
+        let is i64 as mbits with mut = _pvq_max(0, _pvq_min(b, (b - t.delta) / 2));
+        let is i64 as sbits with mut = b - mbits;
+        ctx.remaining_bits = ctx.remaining_bits - t.qalloc;
+        let is i64 as rebalance = ctx.remaining_bits;
+        if (mbits >= sbits) {
+            cm = _celt_quant_band(d, r, ctx, x, n, mbits, B, lowband, lm,
+                                  lowband_out, 1.0, lowband_scratch, fill);
+            if (cm < 0) { return cm; }
+            let is i64 as used = rebalance - ctx.remaining_bits;
+            let is i64 as extra = mbits - used;
+            if (extra > 24 && t.itheta != 0) { sbits = sbits + extra - 24; }
+            let is i64 as cmy = _celt_quant_band(d, r, ctx, y, n, sbits, B,
+                cast(*f64, 0), lm, cast(*f64, 0), side, cast(*f64, 0), fill >> B);
+            if (cmy < 0) { return cmy; }
+            cm = cm | cmy;
+        } else {
+            cm = _celt_quant_band(d, r, ctx, y, n, sbits, B, cast(*f64, 0), lm,
+                                  cast(*f64, 0), side, cast(*f64, 0), fill >> B);
+            if (cm < 0) { return cm; }
+            let is i64 as used = rebalance - ctx.remaining_bits;
+            let is i64 as extra = sbits - used;
+            if (extra > 24 && t.itheta != 16384) { mbits = mbits + extra - 24; }
+            let is i64 as cmx = _celt_quant_band(d, r, ctx, x, n, mbits, B,
+                lowband, lm, lowband_out, 1.0, lowband_scratch, fill);
+            if (cmx < 0) { return cmx; }
+            cm = cm | cmx;
+        }
+        _celt_stereo_merge(x, y, mid, n);
+    }
+    if (t.inv != 0) {
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            y[j] = 0.0 - y[j];
+            j = j + 1;
+        }
+    }
+    return cm;
+}
+
+// Copy the first band's folding data into the second, as RFC 8251 section 9
+// requires (the "special hybrid folding" fix). For a 48 kHz CELT-only frame
+// the two bands have the same width and the copy length is zero.
+fn _special_hybrid_folding(d as *st.CeltDec, norm as *f64, norm2 as *f64,
+                           start as i64, M as i64, dual as i64) as void {
+    let is i64 as n1 = M * (d.tab.ebands[start + 1] - d.tab.ebands[start]);
+    let is i64 as n2 = M * (d.tab.ebands[start + 2] - d.tab.ebands[start + 1]);
+    let is i64 as len = n2 - n1;
+    if (len <= 0) { return; }
+    let is i64 as src = 2 * n1 - n2;
+    let is i64 as j with mut = 0;
+    while (j < len) {
+        norm[n1 + j] = norm[src + j];
+        if (dual != 0) { norm2[n1 + j] = norm2[src + j]; }
+        j = j + 1;
+    }
+}
+
+// Fill the folding history and decode every band (quant_all_bands).
+fn celt_quant_all_bands(d as *st.CeltDec, r as *rc.OpusRange, start as i64,
+                        end as i64, short_blocks as i64, spread as i64,
+                        dual_in as i64, intensity as i64, total_bits as i64,
+                        balance_in as i64, lm as i64, coded_bands as i64,
+                        seed_in as i64) as i64 {
+    let is i64 as C = d.stream_channels;
+    let is i64 as M = 1 << lm;
+    let is i64 as n = M * 120;
+    let is i64 as B with mut = 1;
+    if (short_blocks != 0) { B = M; }
+    let is i64 as norm_offset = M * d.tab.ebands[start];
+    let is i64 as norm_stride = M * d.tab.ebands[20] - norm_offset;
+    let is *f64 as norm = &d.norm[0];
+    let is *f64 as norm2 = celt_elem_ptr(norm, norm_stride);
+    let is *f64 as xbase = &d.coeffs[0];
+    let is *f64 as scratch = &d.lowband_scratch[0];
+
+    let is CeltBandCtx as ctx;
+    ctx.band = start;
+    ctx.intensity = intensity;
+    ctx.spread = spread;
+    ctx.tf_change = 0;
+    ctx.remaining_bits = 0;
+    ctx.seed = seed_in;
+    ctx.disable_inv = d.disable_inv;
+
+    let is i64 as balance with mut = balance_in;
+    let is i64 as lowband_offset with mut = 0;
+    let is i64 as update_lowband with mut = 1;
+    let is i64 as dual with mut = dual_in;
+
+    let is i64 as i with mut = start;
+    while (i < end) {
+        ctx.band = i;
+        let is *f64 as x = celt_elem_ptr(xbase, M * d.tab.ebands[i]);
+        let is *f64 as y with mut = cast(*f64, 0);
+        if (C == 2) { y = celt_elem_ptr(xbase, n + M * d.tab.ebands[i]); }
+        let is i64 as band_n = M * (d.tab.ebands[i + 1] - d.tab.ebands[i]);
+        let is i64 as tell = rc.opus_range_tell_frac(r);
+        if (i != start) { balance = balance - tell; }
+        let is i64 as remaining = total_bits - tell - 1;
+        ctx.remaining_bits = remaining;
+        let is i64 as b with mut = 0;
+        if (i <= coded_bands - 1) {
+            let is i64 as denom with mut = 3;
+            if (coded_bands - i < 3) { denom = coded_bands - i; }
+            let is i64 as curr_balance = balance / denom;
+            b = _pvq_max(0, _pvq_min(16383,
+                    _pvq_min(remaining + 1, d.pulses[i] + curr_balance)));
+        }
+        let is i64 as last with mut = 0;
+        if (i == end - 1) { last = 1; }
+        if ((M * d.tab.ebands[i] - band_n >= M * d.tab.ebands[start]
+             || i == start + 1) && (update_lowband != 0 || lowband_offset == 0)) {
+            lowband_offset = i;
+        }
+        if (i == start + 1) {
+            _special_hybrid_folding(d, norm, norm2, start, M, dual);
+        }
+        ctx.tf_change = d.tf_res[i];
+        let is *f64 as xq with mut = x;
+        let is *f64 as yq with mut = y;
+        let is *f64 as band_scratch with mut = scratch;
+        if (i == end - 1) { band_scratch = cast(*f64, 0); }
+
+        // Conservative collapse masks from the bands used for folding.
+        let is i64 as x_cm with mut = 0;
+        let is i64 as y_cm with mut = 0;
+        let is i64 as effective with mut = 0 - 1;
+        if (lowband_offset != 0 && (spread != 3 || B > 1 || ctx.tf_change < 0)) {
+            effective = _pvq_max(0, M * d.tab.ebands[lowband_offset]
+                                    - norm_offset - band_n);
+            let is i64 as fs with mut = lowband_offset;
+            let is i64 as go1 with mut = 1;
+            while (go1 == 1 && fs > 0) {
+                fs = fs - 1;
+                if (!(M * d.tab.ebands[fs] > effective + norm_offset)) { go1 = 0; }
+            }
+            let is i64 as fe with mut = lowband_offset - 1;
+            let is i64 as go2 with mut = 1;
+            while (go2 == 1) {
+                fe = fe + 1;
+                if (!(fe < i && M * d.tab.ebands[fe] < effective + norm_offset + band_n)) {
+                    go2 = 0;
+                }
+            }
+            x_cm = 0;
+            y_cm = 0;
+            let is i64 as fi with mut = fs;
+            while (fi < fe) {
+                x_cm = x_cm | d.collapse[fi * C];
+                y_cm = y_cm | d.collapse[fi * C + C - 1];
+                fi = fi + 1;
+            }
+        } else {
+            x_cm = (1 << B) - 1;
+            y_cm = x_cm;
+        }
+
+        if (dual != 0 && i == intensity) {
+            dual = 0;
+            if (M * d.tab.ebands[i] > norm_offset) {
+                let is i64 as j with mut = 0;
+                while (j < M * d.tab.ebands[i] - norm_offset) {
+                    norm[j] = 0.5 * (norm[j] + norm2[j]);
+                    j = j + 1;
+                }
+            }
+        }
+        let is *f64 as lowband with mut = cast(*f64, 0);
+        let is *f64 as lowband2 with mut = cast(*f64, 0);
+        if (effective != 0 - 1) {
+            lowband = celt_elem_ptr(norm, effective);
+            lowband2 = celt_elem_ptr(norm2, effective);
+        }
+        let is *f64 as out1 with mut = cast(*f64, 0);
+        let is *f64 as out2 with mut = cast(*f64, 0);
+        if (last == 0) {
+            out1 = celt_elem_ptr(norm, M * d.tab.ebands[i] - norm_offset);
+            out2 = celt_elem_ptr(norm2, M * d.tab.ebands[i] - norm_offset);
+        }
+        let is i64 as cm1 with mut = 0;
+        let is i64 as cm2 with mut = 0;
+        if (dual != 0) {
+            cm1 = _celt_quant_band(d, r, &ctx, xq, band_n, b / 2, B, lowband, lm,
+                                   out1, 1.0, band_scratch, x_cm);
+            cm2 = _celt_quant_band(d, r, &ctx, yq, band_n, b / 2, B, lowband2, lm,
+                                   out2, 1.0, band_scratch, y_cm);
+        } else if (yq != cast(*f64, 0)) {
+            cm1 = _celt_quant_band_stereo(d, r, &ctx, xq, yq, band_n, b, B,
+                                          lowband, lm, out1, band_scratch, x_cm | y_cm);
+            cm2 = cm1;
+        } else {
+            cm1 = _celt_quant_band(d, r, &ctx, xq, band_n, b, B, lowband, lm,
+                                   out1, 1.0, band_scratch, x_cm | y_cm);
+            cm2 = cm1;
+        }
+        if (cm1 < 0) { return cm1; }
+        if (cm2 < 0) { return cm2; }
+        d.collapse[i * C] = cm1;
+        d.collapse[i * C + C - 1] = cm2;
+        balance = balance + d.pulses[i] + tell;
+        update_lowband = 0;
+        if (b > (band_n << 3)) { update_lowband = 1; }
+        i = i + 1;
+    }
+    d.rng = ctx.seed;
+    return errno.I_OK;
+}
+
+// Anti-collapse (RFC 4.3.5): insert noise in time blocks that decoded to
+// nothing, with an amplitude derived from the two previous frames' energy,
+// then renormalise so the band energy is preserved.
+fn celt_anti_collapse(d as *st.CeltDec, start as i64, end as i64, lm as i64,
+                      C as i64, size as i64) as i64 {
+    let is i64 as seed with mut = d.rng;
+    let is i64 as i with mut = start;
+    while (i < end) {
+        let is i64 as n0 = d.tab.ebands[i + 1] - d.tab.ebands[i];
+        let is i64 as depth = ((1 + d.pulses[i]) / n0) >> lm;
+        let is f64 as thresh = 0.5 * fm.pow(2.0, -0.125 * cast(f64, depth));
+        let is f64 as sqrt1 = 1.0 / fm.sqrt(cast(f64, n0 << lm));
+        let is i64 as c with mut = 0;
+        while (c < C) {
+            let is f64 as p1 with mut = d.old_log_e[c * 21 + i];
+            let is f64 as p2 with mut = d.old_log_e2[c * 21 + i];
+            if (C == 1) {
+                if (d.old_log_e[21 + i] > p1) { p1 = d.old_log_e[21 + i]; }
+                if (d.old_log_e2[21 + i] > p2) { p2 = d.old_log_e2[21 + i]; }
+            }
+            let is f64 as prev_min with mut = p1;
+            if (p2 < prev_min) { prev_min = p2; }
+            let is f64 as ediff = d.old_e[c * 21 + i] - prev_min;
+            let is f64 as ed with mut = ediff;
+            if (ed < 0.0) { ed = 0.0; }
+            let is f64 as r = 2.0 * fm.pow(2.0, 0.0 - ed);
+            let is f64 as rr with mut = r;
+            if (lm == 3) { rr = rr * 1.4142135623730951; }
+            if (rr > thresh) { rr = thresh; }
+            rr = rr * sqrt1;
+            let is *f64 as x = celt_elem_ptr(&d.coeffs[0], c * size + (d.tab.ebands[i] << lm));
+            let is i64 as renorm with mut = 0;
+            let is i64 as k with mut = 0;
+            while (k < (1 << lm)) {
+                if ((d.collapse[i * C + c] & (1 << k)) == 0) {
+                    let is i64 as j with mut = 0;
+                    while (j < n0) {
+                        seed = _pvq_seed_next(seed);
+                        if ((seed & 0x8000) != 0) {
+                            x[(j << lm) + k] = rr;
+                        } else {
+                            x[(j << lm) + k] = 0.0 - rr;
+                        }
+                        j = j + 1;
+                    }
+                    renorm = 1;
+                }
+                k = k + 1;
+            }
+            if (renorm != 0) { celt_renormalise(x, n0 << lm, 1.0); }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}

@@ -1,0 +1,331 @@
+// =======================================================
+// caustic-av/audio/opus/opus_packet.cst
+// The TOC byte and the internal framing of one Opus packet, RFC 6716
+// Section 3. This is packet parsing only: it locates the frames, their
+// lengths and the packet's duration. It does not start a range decoder and
+// does not decode anything.
+//
+// Durations are in samples at 48 kHz, per frame and for the whole packet.
+// Opus always codes at a multiple of 2.5 ms, so 48 kHz keeps every value
+// integral: 2.5, 5, 10, 20, 40 and 60 ms are 120, 240, 480, 960, 1920 and
+// 2880 samples. A packet may carry at most 120 ms of audio (Section 3.2.5
+// [R5]), which caps the frame count at 48 for 2.5 ms frames.
+//
+// The TOC byte (Section 3.1) holds a five-bit configuration, a stereo flag
+// and a two-bit frame count code:
+//
+//   config 0..3    SILK-only, NB, 10/20/40/60 ms
+//   config 4..7    SILK-only, MB, 10/20/40/60 ms
+//   config 8..11   SILK-only, WB, 10/20/40/60 ms
+//   config 12..13  Hybrid, SWB, 10/20 ms
+//   config 14..15  Hybrid, FB, 10/20 ms
+//   config 16..31  CELT-only, NB/WB/SWB/FB, 2.5/5/10/20 ms
+//
+// Frame packing (Section 3.2):
+//   code 0  one frame, the rest of the packet.
+//   code 1  two frames of equal size; the payload after the TOC must be
+//           even, so the total packet length must be odd [R3].
+//   code 2  two frames; N1 is coded with the 1/2-byte length coding and the
+//           second frame takes whatever remains [R4].
+//   code 3  a frame count byte with the VBR and padding flags, an optional
+//           padding length (255 means "254 more bytes, read another"), then
+//           M-1 frame lengths for VBR or equal division for CBR. Padding
+//           bytes sit at the end of the packet and may hold any value; only
+//           their count is used.
+//
+// Length coding (Section 3.2.1): a first byte 0..251 is the length; 252..255
+// asks for a second byte and the length is second*4 + first, so the maximum
+// representable length is 1275. [R2] forbids any individual frame, explicit
+// or implicit, from exceeding 1275 bytes; this module checks all of them.
+//
+// Rejected as I_CORRUPT, never clamped or truncated:
+//   * an empty packet [R1];
+//   * a code 1 packet whose payload after the TOC is odd [R3];
+//   * a code 2 packet without room for its length, or N1 larger than the
+//     remainder [R4];
+//   * a code 3 packet with a zero frame count, more than 120 ms of audio,
+//     padding past the packet, frame lengths that do not fit, or a CBR
+//     remainder that is not a multiple of the frame count [R5-R7];
+//   * any frame over 1275 bytes [R2].
+//
+// A zero-length frame is legal: it is DTX or a lost frame (Section 3.2.1),
+// so length 0 is accepted wherever a length is read, and a frame's borrowed
+// pointer still lies inside the packet.
+//
+// Frame pointers index the caller's packet. `ptr + len` for any frame never
+// leaves pkt[0..len]; the padding tail is not part of any frame.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+
+// The largest compressed frame RFC 6716 allows [R2].
+let is i64 as OPUS_MAX_FRAME_BYTES with imut = 1275;
+// 120 ms at 48 kHz: the longest packet permitted [R5].
+let is i64 as OPUS_MAX_PACKET_SAMPLES with imut = 5760;
+// 120 ms of 2.5 ms frames: the largest frame count [R5].
+let is i64 as OPUS_MAX_FRAMES with imut = 48;
+
+// Operating modes (Section 3.1).
+let is i64 as OPUS_MODE_SILK   with imut = 0;
+let is i64 as OPUS_MODE_HYBRID with imut = 1;
+let is i64 as OPUS_MODE_CELT   with imut = 2;
+
+// Audio bandwidths. MB is 6 kHz and SWB 12 kHz, per Section 2.1.3.
+let is i64 as OPUS_BANDWIDTH_NARROWBAND   with imut = 0;
+let is i64 as OPUS_BANDWIDTH_MEDIUMBAND   with imut = 1;
+let is i64 as OPUS_BANDWIDTH_WIDEBAND     with imut = 2;
+let is i64 as OPUS_BANDWIDTH_SUPERWIDEBAND with imut = 3;
+let is i64 as OPUS_BANDWIDTH_FULLBAND     with imut = 4;
+
+struct OpusFrame {
+    ptr      as *u8;  // inside the caller's packet
+    len      as i64;  // 0..1275
+    duration as i64;  // samples at 48 kHz
+}
+
+struct OpusPacket {
+    config         as i64;  // 0..31
+    stereo         as i64;  // 0 mono, 1 stereo
+    code           as i64;  // 0..3
+    mode           as i64;  // OPUS_MODE_*
+    bandwidth      as i64;  // OPUS_BANDWIDTH_*
+    frame_duration as i64;  // samples per frame at 48 kHz
+    frame_count    as i64;  // 1..48
+    total_duration as i64;  // frame_count * frame_duration, <= 5760
+    padding        as i64;  // trailing padding bytes, 0 when none
+    vbr            as i64;  // 1 for a code 3 VBR packet
+    frames         as [48]OpusFrame;
+}
+
+// Operating mode of a configuration number, or I_BADPARAM outside 0..31.
+fn opus_config_mode(config as i64) as i64 {
+    if (config < 0 || config > 31) { return errno.I_BADPARAM; }
+    if (config < 12) { return OPUS_MODE_SILK; }
+    if (config < 16) { return OPUS_MODE_HYBRID; }
+    return OPUS_MODE_CELT;
+}
+
+// Audio bandwidth of a configuration number, or I_BADPARAM.
+fn opus_config_bandwidth(config as i64) as i64 {
+    if (config < 0 || config > 31) { return errno.I_BADPARAM; }
+    if (config < 16) {
+        if (config < 4) { return OPUS_BANDWIDTH_NARROWBAND; }
+        if (config < 8) { return OPUS_BANDWIDTH_MEDIUMBAND; }
+        if (config < 12) { return OPUS_BANDWIDTH_WIDEBAND; }
+        if (config < 14) { return OPUS_BANDWIDTH_SUPERWIDEBAND; }
+        return OPUS_BANDWIDTH_FULLBAND;
+    }
+    // 16..19 NB, 20..23 WB, 24..27 SWB, 28..31 FB.
+    let is i64 as group = (config - 16) >> 2;
+    if (group == 0) { return OPUS_BANDWIDTH_NARROWBAND; }
+    if (group == 1) { return OPUS_BANDWIDTH_WIDEBAND; }
+    if (group == 2) { return OPUS_BANDWIDTH_SUPERWIDEBAND; }
+    return OPUS_BANDWIDTH_FULLBAND;
+}
+
+// Frame duration of a configuration number in samples at 48 kHz, or
+// I_BADPARAM. Section 3.1 Table 2.
+fn opus_config_frame_samples(config as i64) as i64 {
+    if (config < 0 || config > 31) { return errno.I_BADPARAM; }
+    let is i64 as idx = config & 3;
+    if (config < 12) {
+        // 10, 20, 40, 60 ms.
+        if (idx == 0) { return 480; }
+        if (idx == 1) { return 960; }
+        if (idx == 2) { return 1920; }
+        return 2880;
+    }
+    if (config < 16) {
+        // Hybrid SWB (12..13) and FB (14..15): 10, 20 ms. The pair index is
+        // the low bit, not the low two bits.
+        if ((config & 1) == 0) { return 480; }
+        return 960;
+    }
+    // 2.5, 5, 10, 20 ms.
+    return 120 << idx;
+}
+
+// Read one frame length at pkt[*pos], advancing *pos. `end` bounds the read:
+// frame lengths may not come from the padding tail. A two-byte length whose
+// second byte is missing is I_CORRUPT.
+fn _frame_len(pkt as *u8, end as i64, pos as *i64, out as *i64) as i64 {
+    if (*pos >= end) { return errno.I_CORRUPT; }
+    let is i64 as b0 = cast(i64, pkt[*pos]);
+    *pos = *pos + 1;
+    if (b0 < 252) {
+        *out = b0;
+        return errno.I_OK;
+    }
+    if (*pos >= end) { return errno.I_CORRUPT; }
+    let is i64 as b1 = cast(i64, pkt[*pos]);
+    *pos = *pos + 1;
+    *out = b1 * 4 + b0;
+    return errno.I_OK;
+}
+
+fn _packet_clear(p as *OpusPacket) as void {
+    p.config = 0;
+    p.stereo = 0;
+    p.code = 0;
+    p.mode = 0;
+    p.bandwidth = 0;
+    p.frame_duration = 0;
+    p.frame_count = 0;
+    p.total_duration = 0;
+    p.padding = 0;
+    p.vbr = 0;
+}
+
+fn _frame_set(p as *OpusPacket, i as i64, ptr as *u8, len as i64,
+              dur as i64) as void {
+    p.frames[i].ptr = ptr;
+    p.frames[i].len = len;
+    p.frames[i].duration = dur;
+}
+
+// Parse one Opus packet. On success *p is filled and 0 is returned. Every
+// failure is negative: I_BADPARAM for a null pointer with bytes or a negative
+// length, I_CORRUPT for a packet that violates [R1]-[R7]. The contents of *p
+// are unspecified after a failure and must not be used; the header fields it
+// may have written are not a partial packet.
+fn opus_packet_parse(pkt as *u8, len as i64, p as *OpusPacket) as i64 {
+    if (cast(i64, p) == 0) { return errno.I_BADPARAM; }
+    _packet_clear(p);
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, pkt) == 0) { return errno.I_BADPARAM; }
+    if (len < 1) { return errno.I_CORRUPT; }   // [R1]
+
+    let is i64 as toc = cast(i64, pkt[0]);
+    let is i64 as config = toc >> 3;
+    let is i64 as stereo = (toc >> 2) & 1;
+    let is i64 as code = toc & 3;
+
+    let is i64 as fdur = opus_config_frame_samples(config);
+    if (fdur < 0) { return fdur; }
+
+    p.config = config;
+    p.stereo = stereo;
+    p.code = code;
+    p.mode = opus_config_mode(config);
+    p.bandwidth = opus_config_bandwidth(config);
+    p.frame_duration = fdur;
+
+    if (code == 0) {
+        let is i64 as flen = len - 1;
+        if (flen > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }  // [R2]
+        p.frame_count = 1;
+        p.total_duration = fdur;
+        _frame_set(p, 0, cast(*u8, cast(i64, pkt) + 1), flen, fdur);
+        return errno.I_OK;
+    }
+
+    if (code == 1) {
+        let is i64 as payload = len - 1;
+        if ((payload % 2) != 0) { return errno.I_CORRUPT; }   // [R3]
+        let is i64 as half = payload / 2;
+        if (half > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }  // [R2]
+        p.frame_count = 2;
+        p.total_duration = fdur * 2;
+        _frame_set(p, 0, cast(*u8, cast(i64, pkt) + 1), half, fdur);
+        _frame_set(p, 1, cast(*u8, cast(i64, pkt) + 1 + half), half, fdur);
+        return errno.I_OK;
+    }
+
+    if (code == 2) {
+        let is i64 as pos with mut = 1;
+        let is i64 as n1 with mut = 0;
+        let is i64 as r = _frame_len(pkt, len, &pos, &n1);
+        if (r < 0) { return r; }                              // [R4]
+        let is i64 as remain = len - pos;
+        // [R4]: N1 must be no larger than the payload after the length.
+        if (n1 > remain) { return errno.I_CORRUPT; }
+        let is i64 as n2 = remain - n1;
+        if (n1 > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }  // [R2]
+        if (n2 > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }  // [R2]
+        p.frame_count = 2;
+        p.total_duration = fdur * 2;
+        _frame_set(p, 0, cast(*u8, cast(i64, pkt) + pos), n1, fdur);
+        _frame_set(p, 1, cast(*u8, cast(i64, pkt) + pos + n1), n2, fdur);
+        return errno.I_OK;
+    }
+
+    // code 3: frame count byte, optional padding, then CBR or VBR frames.
+    if (len < 2) { return errno.I_CORRUPT; }                 // [R6,R7]
+    let is i64 as fc = cast(i64, pkt[1]);
+    let is i64 as vbr = (fc >> 7) & 1;
+    let is i64 as has_pad = (fc >> 6) & 1;
+    let is i64 as m = fc & 63;
+    if (m == 0) { return errno.I_CORRUPT; }                  // [R5]
+    if (m > OPUS_MAX_FRAMES) { return errno.I_CORRUPT; }
+    if (m * fdur > OPUS_MAX_PACKET_SAMPLES) { return errno.I_CORRUPT; }  // [R5]
+
+    let is i64 as pos with mut = 2;
+    let is i64 as padding with mut = 0;
+    if (has_pad != 0) {
+        let is i64 as got with mut = 0;
+        while (got == 0) {
+            if (pos >= len) { return errno.I_CORRUPT; }      // [R6,R7]
+            let is i64 as b = cast(i64, pkt[pos]);
+            pos = pos + 1;
+            if (b == 255) {
+                padding = padding + 254;
+            } else {
+                padding = padding + b;
+                got = 1;
+            }
+        }
+    }
+
+    // P, the size bytes plus the padding bytes, may not exceed N-2, which is
+    // exactly `pos <= payload_end` after pos has consumed the size bytes.
+    let is i64 as payload_end = len - padding;
+    if (payload_end < pos) { return errno.I_CORRUPT; }       // [R6,R7]
+
+    p.frame_count = m;
+    p.padding = padding;
+    p.vbr = vbr;
+    p.total_duration = m * fdur;
+
+    if (vbr != 0) {
+        let is i64 as i with mut = 0;
+        let is i64 as sum with mut = 0;
+        while (i < m - 1) {
+            let is i64 as n with mut = 0;
+            let is i64 as r = _frame_len(pkt, payload_end, &pos, &n);
+            if (r < 0) { return r; }                         // [R7]
+            if (n > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }  // [R2]
+            // Header bytes and the frame data must all fit before padding.
+            if (n > payload_end - pos) { return errno.I_CORRUPT; }     // [R7]
+            sum = sum + n;
+            p.frames[i].len = n;
+            i = i + 1;
+        }
+        if (sum > payload_end - pos) { return errno.I_CORRUPT; }       // [R7]
+        let is i64 as last = payload_end - pos - sum;
+        if (last > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }   // [R2]
+
+        let is i64 as off with mut = pos;
+        i = 0;
+        while (i < m - 1) {
+            _frame_set(p, i, cast(*u8, cast(i64, pkt) + off), p.frames[i].len,
+                       fdur);
+            off = off + p.frames[i].len;
+            i = i + 1;
+        }
+        _frame_set(p, m - 1, cast(*u8, cast(i64, pkt) + off), last, fdur);
+        return errno.I_OK;
+    }
+
+    // CBR: R = N-2-P bytes, split equally over M frames [R6].
+    let is i64 as remain = payload_end - pos;
+    if ((remain % m) != 0) { return errno.I_CORRUPT; }       // [R6]
+    let is i64 as flen = remain / m;
+    if (flen > OPUS_MAX_FRAME_BYTES) { return errno.I_CORRUPT; }  // [R2]
+    let is i64 as i with mut = 0;
+    while (i < m) {
+        _frame_set(p, i, cast(*u8, cast(i64, pkt) + pos + i * flen), flen,
+                   fdur);
+        i = i + 1;
+    }
+    return errno.I_OK;
+}

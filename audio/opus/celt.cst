@@ -1,0 +1,529 @@
+// =======================================================
+// caustic-av/audio/opus/celt.cst
+// CELT layer decoder: frame flow, RFC 6716 section 4.3 (Table 56 order).
+//
+// A frame is one CELT frame payload, with no TOC byte, no packet padding and
+// no PLC: the Opus packet layer owns everything before the first range-coded
+// byte. The caller sets the coded band range and the frame-size shift with
+// celt_set_frame() (start = 0 for CELT-only, 17 for hybrid; end from the
+// bandwidth; LM 0..3), then calls celt_decode() for every frame.
+//
+// Flow, in bitstream order:
+//   silence, post-filter parameters, transient, intra
+//   coarse energy, TF changes, spread, dynalloc boosts, trim
+//   caps, allocation (skip/intensity/dual included), fine energy
+//   PVQ band shapes, anti-collapse bit, final fine energy
+//   denormalisation, inverse MDCT, overlap-add, comb post-filter, de-emphasis
+//
+// The output is interleaved f64 PCM at 48 kHz. Mono stream to stereo output
+// duplicates the channel; stereo stream to mono output averages the spectra
+// before the inverse MDCT, as the reference does. The decoder allocates
+// nothing: all buffers live in CeltDec and every length is checked against
+// the 20 ms, 48 kHz limits before use.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/math.cst" as fm;
+use "range.cst" as rc;
+use "celt_state.cst" as st;
+use "celt_tables.cst" as tbl;
+use "celt_energy.cst" as en;
+use "celt_alloc.cst" as al;
+use "celt_pvq.cst" as pvq;
+use "celt_mdct.cst" as mdct;
+
+// ── state ───────────────────────────────────────────────────────────
+
+fn _celt_zero_f64(p as *f64, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = 0.0;
+        i = i + 1;
+    }
+}
+
+fn _celt_zero_i64(p as *i64, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = 0;
+        i = i + 1;
+    }
+}
+
+// Zero everything that carries from frame to frame. Configuration and the
+// parsed tables are kept.
+fn celt_reset(d as *st.CeltDec) as i64 {
+    _celt_zero_f64(&d.old_e[0], 42);
+    _celt_zero_f64(&d.old_log_e[0], 42);
+    _celt_zero_f64(&d.old_log_e2[0], 42);
+    let is i64 as i with mut = 0;
+    while (i < 42) {
+        d.old_log_e[i] = -28.0;
+        d.old_log_e2[i] = -28.0;
+        i = i + 1;
+    }
+    _celt_zero_f64(&d.coeffs[0], 1920);
+    _celt_zero_f64(&d.norm[0], 1248);
+    _celt_zero_f64(&d.lowband_scratch[0], 960);
+    _celt_zero_f64(&d.freq[0], 960);
+    _celt_zero_f64(&d.time[0], 960);
+    _celt_zero_f64(&d.ola[0], 240);
+    _celt_zero_f64(&d.pf_hist[0], 4096);
+    _celt_zero_f64(&d.preemph[0], 2);
+    _celt_zero_i64(&d.pulses[0], 21);
+    _celt_zero_i64(&d.fine_quant[0], 21);
+    _celt_zero_i64(&d.fine_priority[0], 21);
+    _celt_zero_i64(&d.tf_res[0], 21);
+    _celt_zero_i64(&d.offsets[0], 21);
+    _celt_zero_i64(&d.cap[0], 21);
+    _celt_zero_i64(&d.collapse[0], 42);
+    d.pf_period = 0;
+    d.pf_gain = 0.0;
+    d.pf_tapset = 0;
+    d.pf_period_old = 0;
+    d.pf_gain_old = 0.0;
+    d.pf_tapset_old = 0;
+    d.alloc_trim = 5;
+    d.intensity = 0;
+    d.dual_stereo = 0;
+    d.balance = 0;
+    d.coded_bands = 0;
+    d.rng = 0;
+    return errno.I_OK;
+}
+
+// One-time setup. Validates the channel counts and parses the constant
+// tables (which are per decoder because the caller owns all memory).
+fn celt_init(d as *st.CeltDec, channels as i64, stream_channels as i64) as i64 {
+    if (channels < 1 || channels > 2) { return errno.I_BADPARAM; }
+    if (stream_channels < 1 || stream_channels > 2) { return errno.I_BADPARAM; }
+    d.channels = channels;
+    d.stream_channels = stream_channels;
+    d.rate = 48000;
+    d.start = 0;
+    d.end = 21;
+    d.lm = 3;
+    d.disable_inv = 0;
+    if (channels == 1) { d.disable_inv = 1; }
+    let is i64 as r = tbl.celt_tables_init(&d.tab);
+    if (r != errno.I_OK) { return r; }
+    return celt_reset(d);
+}
+
+// Select the band range and frame size for the next frames.
+//   start 0 for a CELT-only frame, 17 for the CELT part of a hybrid frame
+//   end   1..21, the first uncoded band
+//   lm    0..3, frame size 120 << lm samples at 48 kHz
+fn celt_set_frame(d as *st.CeltDec, start as i64, end as i64,
+                  lm as i64, stream_channels as i64) as i64 {
+    if (tbl.celt_tables_ready(&d.tab) == 0) { return errno.I_UNSUPPORTED; }
+    if (start != 0 && start != 17) { return errno.I_BADPARAM; }
+    if (end <= start || end > 21) { return errno.I_BADPARAM; }
+    if (lm < 0 || lm > 3) { return errno.I_BADPARAM; }
+    if (stream_channels < 1 || stream_channels > 2) { return errno.I_BADPARAM; }
+    d.start = start;
+    d.end = end;
+    d.lm = lm;
+    d.stream_channels = stream_channels;
+    return errno.I_OK;
+}
+
+fn celt_frame_size(d as *st.CeltDec) as i64 {
+    return 120 << d.lm;
+}
+
+// ── TF table (RFC 4.3.1, Tables 60-63) ──────────────────────────────
+
+// Index = 4*transient + 2*tf_select + per-band flag.
+fn _celt_tf_value(lm as i64, transient as i64, tf_select as i64,
+                  flag as i64) as i64 {
+    let is i64 as idx = 4 * transient + 2 * tf_select + flag;
+    if (lm == 0) {
+        if (idx == 1 || idx == 5 || idx == 7) { return -1; }
+        return 0;
+    }
+    if (lm == 1) {
+        if (idx == 0) { return 0; }
+        if (idx == 1) { return -1; }
+        if (idx == 2) { return 0; }
+        if (idx == 3) { return -2; }
+        if (idx == 4) { return 1; }
+        if (idx == 5) { return 0; }
+        if (idx == 6) { return 1; }
+        return -1;
+    }
+    if (lm == 2) {
+        if (idx == 0) { return 0; }
+        if (idx == 1) { return -2; }
+        if (idx == 2) { return 0; }
+        if (idx == 3) { return -3; }
+        if (idx == 4) { return 2; }
+        if (idx == 5) { return 0; }
+        if (idx == 6) { return 1; }
+        return -1;
+    }
+    if (idx == 0) { return 0; }
+    if (idx == 1) { return -2; }
+    if (idx == 2) { return 0; }
+    if (idx == 3) { return -3; }
+    if (idx == 4) { return 3; }
+    if (idx == 5) { return 0; }
+    if (idx == 6) { return 1; }
+    return -1;
+}
+
+// ── synthesis ───────────────────────────────────────────────────────
+
+// Denormalise one channel's unit-norm bands into d.freq (RFC 4.3.6).
+fn _celt_denormalise(d as *st.CeltDec, c as i64, n as i64, lm as i64,
+                     start as i64, end as i64) as void {
+    let is i64 as M = 1 << lm;
+    let is i64 as j with mut = 0;
+    let is i64 as lo = M * d.tab.ebands[start];
+    while (j < lo) {
+        d.freq[j] = 0.0;
+        j = j + 1;
+    }
+    let is i64 as i with mut = start;
+    while (i < end) {
+        let is i64 as j0 = M * d.tab.ebands[i];
+        let is i64 as j1 = M * d.tab.ebands[i + 1];
+        let is f64 as lg with mut = d.old_e[c * 21 + i] + d.tab.e_means[i];
+        if (lg > 32.0) { lg = 32.0; }
+        let is f64 as g = fm.pow(2.0, lg);
+        let is i64 as k with mut = j0;
+        while (k < j1) {
+            d.freq[k] = d.coeffs[c * n + k] * g;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    j = M * d.tab.ebands[end];
+    while (j < n) {
+        d.freq[j] = 0.0;
+        j = j + 1;
+    }
+}
+
+// One channel: inverse MDCT of every block, windowed and overlap-added into
+// the post-filter history, then the filter and the de-emphasis read it back.
+fn _celt_synth_channel(d as *st.CeltDec, c as i64, n as i64, lm as i64,
+                       transient as i64) as i64 {
+    let is i64 as B with mut = 1;
+    let is i64 as nb with mut = n;
+    if (transient != 0) {
+        B = 1 << lm;
+        nb = 120;
+    }
+    let is *f64 as ola = &d.ola[c * 120];
+    let is *f64 as w = &d.tab.window[0];
+    let is *f64 as out = cast(*f64, cast(i64, &d.pf_hist[0]) + (c * 2048 + 1024) * 8);
+    let is i64 as b with mut = 0;
+    while (b < B) {
+        let is i64 as r = mdct.celt_imdct_block(
+            cast(*f64, cast(i64, &d.freq[0]) + b * 8),
+            B, nb, cast(*f64, cast(i64, out) + (b * nb) * 8), ola, w);
+        if (r != errno.I_OK) { return r; }
+        b = b + 1;
+    }
+    return errno.I_OK;
+}
+
+// Full synthesis for the configured output channels.
+fn celt_synthesise(d as *st.CeltDec, n as i64, lm as i64, transient as i64,
+                   silence as i64, C as i64, CC as i64) as i64 {
+    let is i64 as i with mut = 0;
+    if (silence != 0) {
+        _celt_zero_f64(&d.freq[0], n);
+    } else if (CC == 2 && C == 1) {
+        _celt_denormalise(d, 0, n, lm, d.start, d.end);
+    } else if (CC == 1 && C == 2) {
+        _celt_denormalise(d, 0, n, lm, d.start, d.end);
+        let is i64 as j with mut = 0;
+        while (j < n) {
+            d.time[j] = d.freq[j];
+            j = j + 1;
+        }
+        _celt_denormalise(d, 1, n, lm, d.start, d.end);
+        j = 0;
+        while (j < n) {
+            d.freq[j] = 0.5 * (d.time[j] + d.freq[j]);
+            j = j + 1;
+        }
+    }
+    if (CC == 2 && C == 1) {
+        i = 0;
+        while (i < 2) {
+            let is i64 as r = _celt_synth_channel(d, i, n, lm, transient);
+            if (r != errno.I_OK) { return r; }
+            i = i + 1;
+        }
+    } else if (CC == 1 && C == 2) {
+        return _celt_synth_channel(d, 0, n, lm, transient);
+    } else {
+        i = 0;
+        while (i < CC) {
+            if (silence == 0) {
+                _celt_denormalise(d, i, n, lm, d.start, d.end);
+            } else {
+                _celt_zero_f64(&d.freq[0], n);
+            }
+            let is i64 as r = _celt_synth_channel(d, i, n, lm, transient);
+            if (r != errno.I_OK) { return r; }
+            i = i + 1;
+        }
+    }
+    return errno.I_OK;
+}
+
+// ── frame decode ────────────────────────────────────────────────────
+
+// Decode one CELT frame. `pcm` is interleaved with d.channels lanes and
+// `pcm_cap` counts scalar values. Returns frames per channel, or a negative
+// error. A NULL payload or an empty one is packet loss, which this decoder
+// does not conceal: I_UNSUPPORTED.
+fn celt_decode(d as *st.CeltDec, data as *u8, len as i64,
+               pcm as *f64, pcm_cap as i64) as i64 {
+    if (data == cast(*u8, 0)) { return errno.I_UNSUPPORTED; }   // PLC
+    if (len < 1) { return errno.I_UNSUPPORTED; }                // PLC
+    if (len > 1275) { return errno.I_CORRUPT; }
+    if (tbl.celt_tables_ready(&d.tab) == 0) { return errno.I_UNSUPPORTED; }
+    if (d.start != 0 && d.start != 17) { return errno.I_BADPARAM; }
+    if (d.end <= d.start || d.end > 21) { return errno.I_BADPARAM; }
+    if (d.lm < 0 || d.lm > 3) { return errno.I_BADPARAM; }
+    if (d.stream_channels < 1 || d.stream_channels > 2) { return errno.I_BADPARAM; }
+    if (d.channels < 1 || d.channels > 2) { return errno.I_BADPARAM; }
+    let is i64 as C = d.stream_channels;
+    let is i64 as CC = d.channels;
+    let is i64 as lm = d.lm;
+    let is i64 as start = d.start;
+    let is i64 as end = d.end;
+    let is i64 as n = 120 << lm;
+    if (pcm == cast(*f64, 0) || pcm_cap < n * CC) { return errno.I_BADPARAM; }
+
+    let is rc.OpusRange as r;
+    let is i64 as rr = rc.opus_range_init(&r, data, len);
+    if (rr != errno.I_OK) { return rr; }
+
+    let is i64 as total_bits = len * 8;
+    let is i64 as tell0 = rc.opus_range_tell(&r);
+    let is i64 as silence with mut = 0;
+    if (tell0 >= total_bits) {
+        silence = 1;
+    } else if (tell0 == 1) {
+        silence = rc.opus_range_bit_logp(&r, 15);
+    }
+    let is i64 as M = 1 << lm;
+
+    // Clear the per-frame arrays.
+    _celt_zero_i64(&d.pulses[0], 21);
+    _celt_zero_i64(&d.fine_quant[0], 21);
+    _celt_zero_i64(&d.fine_priority[0], 21);
+    _celt_zero_i64(&d.tf_res[0], 21);
+    _celt_zero_i64(&d.offsets[0], 21);
+    _celt_zero_i64(&d.collapse[0], 42);
+    d.intensity = 0;
+    d.dual_stereo = 0;
+    d.balance = 0;
+    d.alloc_trim = 5;
+    let is i64 as anti_rsv with mut = 0;
+    let is i64 as anti_on with mut = 0;
+    let is i64 as transient with mut = 0;
+    let is i64 as spread with mut = 2;
+    let is i64 as pf_period with mut = 0;
+    let is i64 as pf_tapset with mut = 0;
+    let is f64 as pf_gain with mut = 0.0;
+
+    if (silence == 0) {
+        // Post-filter parameters, RFC 4.3.7.1 (coded first, applied last).
+        let is i64 as tell with mut = rc.opus_range_tell(&r);
+        if (start == 0 && tell + 16 <= total_bits) {
+            if (rc.opus_range_bit_logp(&r, 1) != 0) {
+                let is i64 as octave = rc.opus_range_uint(&r, 6);
+                let is i64 as fine = rc.opus_range_bits(&r, 4 + octave);
+                pf_period = (16 << octave) + fine - 1;
+                let is i64 as qg = rc.opus_range_bits(&r, 3);
+                if (rc.opus_range_tell(&r) + 2 <= total_bits) {
+                    pf_tapset = rc.opus_range_icdf(&r, tbl.CELT_ICDF_TAPSET, 2);
+                }
+                pf_gain = 0.09375 * cast(f64, qg + 1);
+            }
+        }
+
+        // Transient (RFC 4.3.1).
+        tell = rc.opus_range_tell(&r);
+        if (lm > 0 && tell + 3 <= total_bits) {
+            transient = rc.opus_range_bit_logp(&r, 3);
+        }
+
+        // Intra energy flag (RFC 4.3.2.1).
+        let is i64 as intra with mut = 0;
+        tell = rc.opus_range_tell(&r);
+        if (tell + 3 <= total_bits) {
+            intra = rc.opus_range_bit_logp(&r, 3);
+        }
+
+        // Mono prediction is compared against the duplicated second slot.
+        if (C == 1) {
+            let is i64 as i with mut = 0;
+            while (i < 21) {
+                if (d.old_e[21 + i] > d.old_e[i]) { d.old_e[i] = d.old_e[21 + i]; }
+                i = i + 1;
+            }
+        }
+        let is i64 as cr = en.celt_coarse_energy(d, &r, total_bits, start, end, C, lm, intra);
+        if (cr != errno.I_OK) { return cr; }
+
+        // TF changes (RFC 4.3.1 and 4.3.4.5).
+        let is i64 as tbudget = total_bits;
+        let is i64 as tlogp with mut = 4;
+        if (transient != 0) { tlogp = 2; }
+        let is i64 as tsel_rsv with mut = 0;
+        let is i64 as ttell = rc.opus_range_tell(&r);
+        if (lm > 0 && ttell + tlogp + 1 <= tbudget) { tsel_rsv = 1; }
+        let is i64 as tbud = tbudget - tsel_rsv;
+        let is i64 as curr with mut = 0;
+        let is i64 as changed with mut = 0;
+        let is i64 as i with mut = start;
+        let is i64 as logp with mut = tlogp;
+        while (i < end) {
+            let is i64 as now = rc.opus_range_tell(&r);
+            if (now + logp <= tbud) {
+                curr = curr ^ rc.opus_range_bit_logp(&r, logp);
+                changed = changed | curr;
+            }
+            d.tf_res[i] = curr;
+            if (transient != 0) { logp = 4; } else { logp = 5; }
+            i = i + 1;
+        }
+        let is i64 as tsel with mut = 0;
+        if (tsel_rsv != 0) {
+            let is i64 as a0 = _celt_tf_value(lm, transient, 0, changed);
+            let is i64 as a1 = _celt_tf_value(lm, transient, 1, changed);
+            if (a0 != a1) { tsel = rc.opus_range_bit_logp(&r, 1); }
+        }
+        i = start;
+        while (i < end) {
+            d.tf_res[i] = _celt_tf_value(lm, transient, tsel, d.tf_res[i]);
+            i = i + 1;
+        }
+
+        // Spreading decision (RFC 4.3.4.3).
+        tell = rc.opus_range_tell(&r);
+        if (tell + 4 <= total_bits) {
+            spread = rc.opus_range_icdf(&r, tbl.CELT_ICDF_SPREAD, 5);
+        }
+
+        // Caps and dynalloc boosts (RFC 4.3.3).
+        let is i64 as car = al.celt_alloc_caps(d);
+        if (car != errno.I_OK) { return car; }
+        let is i64 as tbits with mut = total_bits << 3;
+        let is i64 as ftell with mut = rc.opus_range_tell_frac(&r);
+        let is i64 as dynalloc_logp with mut = 6;
+        i = start;
+        while (i < end) {
+            let is i64 as width = C * (d.tab.ebands[i + 1] - d.tab.ebands[i]) << lm;
+            let is i64 as qhi with mut = width;
+            if (qhi < 48) { qhi = 48; }
+            let is i64 as quanta with mut = width << 3;
+            if (quanta > qhi) { quanta = qhi; }
+            let is i64 as loop_logp with mut = dynalloc_logp;
+            let is i64 as boost with mut = 0;
+            let is i64 as go with mut = 1;
+            while (go == 1 && ftell + (loop_logp << 3) < tbits && boost < d.cap[i]) {
+                let is i64 as flag = rc.opus_range_bit_logp(&r, loop_logp);
+                ftell = rc.opus_range_tell_frac(&r);
+                if (flag == 0) {
+                    go = 0;
+                } else {
+                    boost = boost + quanta;
+                    tbits = tbits - quanta;
+                    loop_logp = 1;
+                }
+            }
+            d.offsets[i] = boost;
+            if (boost > 0) {
+                dynalloc_logp = dynalloc_logp - 1;
+                if (dynalloc_logp < 2) { dynalloc_logp = 2; }
+            }
+            i = i + 1;
+        }
+
+        // Allocation trim (RFC 4.3.3, Table 58).
+        d.alloc_trim = 5;
+        ftell = rc.opus_range_tell_frac(&r);
+        if (ftell + (6 << 3) <= tbits) {
+            d.alloc_trim = rc.opus_range_icdf(&r, tbl.CELT_ICDF_TRIM, 7);
+        }
+
+        // Anti-collapse reservation (RFC 4.3.3).
+        let is i64 as bits_left = (len * 8 << 3) - rc.opus_range_tell_frac(&r) - 1;
+        if (transient != 0 && lm >= 2 && bits_left >= ((lm + 2) << 3)) {
+            anti_rsv = 8;
+        }
+
+        let is i64 as coded = al.celt_compute_allocation(d, &r, start, end,
+            bits_left - anti_rsv, C, lm);
+        if (coded < 0) { return coded; }
+
+        let is i64 as fr = en.celt_fine_energy(d, &r, total_bits, start, end, C);
+        if (fr != errno.I_OK) { return fr; }
+
+        // Shapes. The anti-collapse bit is reserved from the band budget.
+        let is i64 as short_blocks with mut = 0;
+        if (transient != 0) { short_blocks = M; }
+        let is i64 as qb = pvq.celt_quant_all_bands(d, &r, start, end,
+            short_blocks, spread, d.dual_stereo, d.intensity,
+            (len * 8 << 3) - anti_rsv, d.balance, lm, coded, d.rng);
+        if (qb != errno.I_OK) { return qb; }
+
+        if (anti_rsv > 0) {
+            anti_on = rc.opus_range_bits(&r, 1);
+        }
+        let is i64 as left = (len * 8) - rc.opus_range_tell(&r);
+        if (left < 0) { return errno.I_CORRUPT; }
+        en.celt_final_energy(d, &r, left, start, end, C);
+        if (anti_on != 0) {
+            let is i64 as ar = pvq.celt_anti_collapse(d, start, end, lm, C, n);
+            if (ar != errno.I_OK) { return ar; }
+        }
+    } else {
+        // Silence: no further reads. Either the frame is entirely silent or
+        // the remaining bits are padding; RFC 4.3.2.1 makes every energy
+        // delta -1, but the output is zero either way and the history is
+        // reset to the silence floor.
+        _celt_zero_f64(&d.coeffs[0], 1920);
+        let is i64 as i with mut = 0;
+        while (i < 42) {
+            d.old_e[i] = -28.0;
+            i = i + 1;
+        }
+    }
+
+    // Synthesis.
+    let is i64 as sr = celt_synthesise(d, n, lm, transient, silence, C, CC);
+    if (sr != errno.I_OK) { return sr; }
+
+    // Post-filter and de-emphasis for each output channel.
+    let is i64 as c with mut = 0;
+    while (c < CC) {
+        mdct.celt_postfilter_frame(d, c, n, lm, pf_period, pf_gain, pf_tapset);
+        mdct.celt_deemphasis_write(d, c, n, CC, pcm);
+        mdct.celt_postfilter_shift(d, c, n);
+        c = c + 1;
+    }
+
+    // Energy history. Mono stream energy is mirrored before the update so
+    // anti-collapse sees both slots, as the reference does.
+    if (C == 1) {
+        let is i64 as i with mut = 0;
+        while (i < 21) {
+            d.old_e[21 + i] = d.old_e[i];
+            i = i + 1;
+        }
+    }
+    en.celt_energy_update(d, start, end, transient);
+
+    if (rc.opus_range_tell(&r) > len * 8) { return errno.I_CORRUPT; }
+    return n;
+}

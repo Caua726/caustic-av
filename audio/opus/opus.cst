@@ -1,0 +1,127 @@
+// =======================================================
+// caustic-av/audio/opus/opus.cst
+// The Opus decoder's public state and entry point. This stage fixes the
+// pieces around the transform: the identification header, the packet
+// framing, and the contract the synthesis layers will be called with. It
+// does not synthesise audio. opus_decode validates the packet and then
+// returns I_UNSUPPORTED; it writes no samples and does not pretend to.
+//
+// What the SILK/CELT slices add:
+//   * For each frame of OpusPacket.frames, opus_range_init over that frame's
+//     bytes, then a SILK pass (mode SILK or HYBRID), a CELT pass (HYBRID or
+//     CELT), or both, following the mode derived from the TOC configuration.
+//   * SILK runs at 8, 12 or 16 kHz internally and is resampled to 48 kHz
+//     before it is summed with CELT; the mode and bandwidth helpers in
+//     opus_packet.cst select the path.
+//   * The first OpusHead.pre_skip samples at 48 kHz are decoded and then
+//     discarded (RFC 7845 Section 4.2). They are not skipped before decoding:
+//     the decoder is predictive and needs that history.
+//   * Output gain (OpusHead.output_gain) scales the summed output by
+//     10^(gain/(20*256)) when the caller asks for it.
+//   * opus_decoder_decode will write interleaved i16 samples at 48 kHz and
+//     report the count, so one Ogg packet yields exactly
+//     OpusPacket.total_duration samples before end trimming.
+//
+// The state here owns no buffers. SILK and CELT need persistent history
+// across packets (predictor state, overlap-add memory); those slices will own
+// their own state and be reached from OpusDecoder, which is why this file
+// exists before them: the caller-visible object stays stable while the
+// synthesis grows behind it.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "opus_head.cst" as opus_head;
+use "opus_packet.cst" as opus_packet;
+
+// The only output rate this stage defines. Opus codes at 48 kHz with lower
+// rates formed by decimation, and RFC 7845 Section 4 counts granules at
+// 48 kHz, so an internal fixed rate keeps pre-skip and packet durations
+// exact.
+let is i64 as OPUS_OUTPUT_RATE with imut = 48000;
+
+struct OpusDecoder {
+    head        as opus_head.OpusHead;  // parsed OpusHead
+    channels    as i64;                 // 1 or 2
+    sample_rate as i64;                 // 48000
+    pre_skip    as i64;                 // samples at 48 kHz to discard at the start
+    packets     as i64;                 // packets accepted by opus_decode
+}
+
+fn opus_decoder_clear(d as *OpusDecoder) as void {
+    d.head.version = 0;
+    d.head.channels = 0;
+    d.head.pre_skip = 0;
+    d.head.input_rate = 0;
+    d.head.output_gain = 0;
+    d.head.mapping_family = 0;
+    d.channels = 0;
+    d.sample_rate = 0;
+    d.pre_skip = 0;
+    d.packets = 0;
+}
+
+// Initialise a decoder from an OpusHead packet, as Ogg carries it on the BOS
+// page (RFC 7845 Section 5.1). Returns 0, or the parse error:
+// I_BADMAGIC, I_EOF, I_CORRUPT and I_UNSUPPORTED as opus_head_parse reports
+// them. On failure the decoder is left cleared, with no channels and no rate.
+fn opus_decoder_init(d as *OpusDecoder, pkt as *u8, len as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    opus_decoder_clear(d);
+
+    let is opus_head.OpusHead as h;
+    let is i64 as r = opus_head.opus_head_parse(pkt, len, &h);
+    if (r < 0) { return r; }
+
+    d.head.version = h.version;
+    d.head.channels = h.channels;
+    d.head.pre_skip = h.pre_skip;
+    d.head.input_rate = h.input_rate;
+    d.head.output_gain = h.output_gain;
+    d.head.mapping_family = h.mapping_family;
+    d.channels = h.channels;
+    d.sample_rate = OPUS_OUTPUT_RATE;
+    d.pre_skip = h.pre_skip;
+    return errno.I_OK;
+}
+
+fn opus_decoder_channels(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.channels;
+}
+
+fn opus_decoder_rate(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.sample_rate;
+}
+
+// Samples at 48 kHz that the first decoded output must drop.
+fn opus_decoder_pre_skip(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.pre_skip;
+}
+
+// Decode one Opus packet into interleaved i16 samples at 48 kHz.
+//
+// The packet is parsed first, so malformed framing is reported as I_CORRUPT
+// even at this stage. Synthesis is not implemented: on a well-formed packet
+// the call returns I_UNSUPPORTED and leaves `out`, `cap` and `*got`
+// untouched. `cap` is a count of i16 samples (not frames) the caller made
+// available; it is checked by the synthesis slices, not here.
+//
+// There is deliberately no silent zero-fill and no sample counter advance:
+// a caller can distinguish "not implemented" from "decoded silence".
+fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
+               cap as i64, got as *i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
+    if (d.channels < 1 || d.channels > 2) { return errno.I_BADPARAM; }
+    if (cap < 0) { return errno.I_BADPARAM; }
+    if (cap > 0 && cast(i64, out) == 0) { return errno.I_BADPARAM; }
+
+    let is opus_packet.OpusPacket as p;
+    let is i64 as r = opus_packet.opus_packet_parse(pkt, len, &p);
+    if (r < 0) { return r; }
+
+    // SILK/CELT synthesis lands in later slices. Until then the packet is
+    // validated and no sample is produced.
+    return errno.I_UNSUPPORTED;
+}

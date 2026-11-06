@@ -1,0 +1,57 @@
+// =======================================================
+// caustic-av/audio/opus/silk_bits.cst
+// The three ways SILK reads a symbol from the Opus range coder.
+//
+// The range decoder API is the one fixed with the Opus packet/range layer
+// (audio/opus/range.cst): opus_range_decode(r, ft) returns the current
+// value in [0, ft), and opus_range_update(r, fl, fh, ft) narrows to the
+// chosen interval. A PDF is therefore decoded with decode/update rather
+// than a precomputed iCDF table; silk_tables_data.cst keeps the RFC's
+// probabilities verbatim and silk_sym builds the cumulative range.
+//
+// All three helpers return a non-negative symbol or a negative errno.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "range.cst" as rc;
+use "silk_tables.cst" as t;
+
+// Decode one symbol from PDF blob[off .. off+n-1].
+fn silk_sym(r as *rc.OpusRange, blob as *u8, off as i64, n as i64) as i64 {
+    if (off < 0 || n <= 0 || n > 64) { return errno.I_BADPARAM; }
+    let is i64 as ft = t.silk_pdf_total(blob, off, n);
+    if (ft <= 0 || ft > 65535) { return errno.I_CORRUPT; }
+
+    let is i64 as v = rc.opus_range_decode(r, ft);
+    if (v < 0) { return v; }
+
+    let is i64 as cum with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        let is i64 as p = t.silk_pdf_elem(blob, off, i);
+        if (p < 0 || p > ft) { return errno.I_CORRUPT; }
+        if (v < cum + p) {
+            let is i64 as u = rc.opus_range_update(r, cum, cum + p, ft);
+            if (u < 0) { return u; }
+            return i;
+        }
+        cum = cum + p;
+        i = i + 1;
+    }
+    return errno.I_CORRUPT;
+}
+
+// One symbol from a uniform PDF of n entries, without a stored table.
+fn silk_uniform(r as *rc.OpusRange, n as i64) as i64 {
+    if (n <= 0 || n > 65536) { return errno.I_BADPARAM; }
+    let is i64 as v = rc.opus_range_decode(r, n);
+    if (v < 0) { return v; }
+    let is i64 as u = rc.opus_range_update(r, v, v + 1, n);
+    if (u < 0) { return u; }
+    return v;
+}
+
+// One binary symbol with p(0) = 1/2, the VAD and LBRR header bits.
+fn silk_bit(r as *rc.OpusRange) as i64 {
+    return rc.opus_range_bit_logp(r, 1);
+}

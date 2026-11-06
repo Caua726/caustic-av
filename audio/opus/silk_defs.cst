@@ -1,0 +1,73 @@
+// =======================================================
+// caustic-av/audio/opus/silk_defs.cst
+// Per-channel and per-frame SILK state shared by the parser, the
+// excitation decoder and the synthesis filters.
+//
+// Everything is fixed-size and caller-owned. There is no allocation: a
+// SilkDecoder is one object the caller provides, and a frame's parameters
+// live in a SilkParams on the decoder's stack (or in a caller-provided
+// object) while it is being decoded.
+//
+// SilkChan keeps exactly the history the specification mentions:
+//   out_hist  306 clamped output samples (288 maximum pitch lag + 16 LPC
+//             order + 2 filter taps) plus room for the current frame;
+//   lpc_hist  16 unclamped LPC synthesis samples (plus current frame);
+//   nlsf      the previous normalized LSFs for 20 ms interpolation;
+//   log_gain  the last dequantized gain index, -1 when none is available.
+// =======================================================
+
+let is i64 as SILK_OUT_HISTORY with imut = 306;
+let is i64 as SILK_LPC_HISTORY with imut = 16;
+let is i64 as SILK_FRAME_SAMPLES with imut = 320;
+
+struct SilkParams {
+    // Decoded side information.
+    signal_type as i64;   // SILK_SIG_* (silk_tables.cst)
+    qoff_high   as i64;   // quantization offset type, 0 low / 1 high
+    voiced      as i64;   // signal_type == SILK_SIG_VOICED
+    interp      as i64;   // NLSF interpolation, Q2; 4 means none
+    seed        as i64;   // LCG seed, 0..3
+    w0_Q13      as i64;   // stereo weights for this frame
+    w1_Q13      as i64;
+    primary_lag as i64;   // unclamped primary pitch lag
+
+    gain_idx  as [4]i64;  // symbols as decoded (0..63 or 0..40)
+    gain_q16  as [4]i64;  // dequantized gains
+    nlsf      as [16]i64; // Q15, after stabilization
+    lpc_a     as [2][16]i64; // [0] lead-in, [1] body, Q12
+    pitch     as [4]i64;  // per-subframe lag, clamped
+    ltp_taps  as [4][5]i64;  // Q7
+    ltp_scale as i64;     // Q14, default 15565
+
+    exc       as [320]i64; // signed pulse magnitudes after sign decoding
+    exc_q23   as [320]i64; // reconstructed excitation, Q23
+}
+
+struct SilkChan {
+    first_reset as i64;   // no usable LPC/LSF history (section 4.5.2)
+    prev_voiced as i64;
+    prev_lag    as i64;   // previous primary lag, unclamped
+    log_gain    as i64;   // previous dequantized gain index, -1 if none
+    nlsf        as [16]i64;
+
+    out_hist as [626]f64; // 306 history + 320 current
+    lpc_hist as [336]f64; // 16 history + 320 current
+}
+
+fn _silk_zero(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        p[i] = 0;
+        i = i + 1;
+    }
+}
+
+// Reset a channel to the state after a decoder reset. Zero history, no
+// previous gain, and the next frame must not interpolate LSFs.
+fn silk_chan_reset(ch as *SilkChan) as void {
+    _silk_zero(cast(*u8, ch), sizeof(SilkChan));
+    ch.log_gain = 0 - 1;
+    ch.first_reset = 1;
+}
+
+

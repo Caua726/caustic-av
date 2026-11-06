@@ -1,0 +1,392 @@
+// =======================================================
+// caustic-av/audio/opus/silk_nlsf.cst
+// Normalized LSF reconstruction, stabilization, conversion to LPC
+// coefficients, range limiting and prediction-gain limiting.
+//
+// Everything here follows RFC 6716 sections 4.2.7.5.3 to 4.2.7.5.8 in
+// fixed point, because section 4.2.7.5 says implementations SHOULD match
+// the fixed-point arithmetic exactly: the reconstruction feeds prediction
+// across frames, so a different rounding drifts. All intermediates are
+// i64; the widest product (Q17 or Q24 coefficient times a Q16 chirp or
+// Q31 reflection coefficient) stays below 2^63.
+//
+// The two convergence loops are bounded exactly as the specification says:
+// ten rounds of range limiting, then sixteen rounds of prediction-gain
+// limiting. The last gain round uses sc_Q16 = 0, which zeroes the filter
+// and guarantees a stable result.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "silk_tables.cst" as t;
+use "silk_tables_data.cst" as data;
+
+// floor(log2(n)) + 1 for n > 0, 0 otherwise (the ilog of section 1.1.4).
+fn silk_ilog(n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    let is i64 as v with mut = n;
+    let is i64 as r with mut = 0;
+    while (v > 0) { v = v >> 1; r = r + 1; }
+    return r;
+}
+
+fn _abs64(x as i64) as i64 {
+    if (x < 0) { return 0 - x; }
+    return x;
+}
+
+fn _clamp(v as i64, lo as i64, hi as i64) as i64 {
+    let is i64 as x with mut = v;
+    if (x < lo) { x = lo; }
+    if (x > hi) { x = hi; }
+    return x;
+}
+
+// ── section 4.2.7.5.4: stabilization ────────────────────────────────
+//
+// nlsf has `order` entries in Q15. delta is the Table 25 spacing for the
+// bandwidth, with order + 1 entries (the last one is the distance to
+// 32768). The function changes nlsf in place.
+fn silk_nlsf_stabilize(nlsf as *i64, order as i64, wb as i64) as void {
+    let is *u8 as blob with mut = data.SILK_TBL_LSF_MINSP_NBMB;
+    if (wb != 0) { blob = data.SILK_TBL_LSF_MINSP_WB; }
+
+    let is i64 as pass with mut = 0;
+    while (pass < 20) {
+        // Find the smallest violation, breaking ties by the lower index.
+        let is i64 as k with mut = 0 - 1;
+        let is i64 as mindiff with mut = 2147483647;
+        let is i64 as i with mut = 0;
+        while (i <= order) {
+            let is i64 as lo with mut = 0;
+            let is i64 as hi with mut = 32768;
+            if (i > 0)   { lo = nlsf[i - 1]; }
+            if (i < order) { hi = nlsf[i]; }
+            let is i64 as diff = (hi - lo) - t.silk_tbl_i(blob, i);
+            if (diff < mindiff) {
+                mindiff = diff;
+                k = i;
+            }
+            i = i + 1;
+        }
+        if (mindiff >= 0) { return; }
+
+        if (k == 0) {
+            nlsf[0] = t.silk_tbl_i(blob, 0);
+        } else if (k == order) {
+            nlsf[order - 1] = 32768 - t.silk_tbl_i(blob, order);
+        } else {
+            let is i64 as min_center with mut = t.silk_tbl_i(blob, k) >> 1;
+            let is i64 as max_center with mut = 32768 - (t.silk_tbl_i(blob, k) >> 1);
+            let is i64 as j with mut = 0;
+            while (j < k) {
+                min_center = min_center + t.silk_tbl_i(blob, j);
+                j = j + 1;
+            }
+            j = k + 1;
+            while (j <= order) {
+                max_center = max_center - t.silk_tbl_i(blob, j);
+                j = j + 1;
+            }
+            let is i64 as center with mut = (nlsf[k - 1] + nlsf[k] + 1) >> 1;
+            center = _clamp(center, min_center, max_center);
+            nlsf[k - 1] = center - (t.silk_tbl_i(blob, k) >> 1);
+            nlsf[k] = nlsf[k - 1] + t.silk_tbl_i(blob, k);
+        }
+        pass = pass + 1;
+    }
+
+    // Fallback: sort, push forward, then push backward.
+    let is i64 as i with mut = 1;
+    while (i < order) {
+        let is i64 as value = nlsf[i];
+        let is i64 as j with mut = i - 1;
+        while (j >= 0 && nlsf[j] > value) {
+            nlsf[j + 1] = nlsf[j];
+            j = j - 1;
+        }
+        nlsf[j + 1] = value;
+        i = i + 1;
+    }
+
+    if (nlsf[0] < t.silk_tbl_i(blob, 0)) {
+        nlsf[0] = t.silk_tbl_i(blob, 0);
+    }
+    i = 1;
+    while (i < order) {
+        let is i64 as v = nlsf[i - 1] + t.silk_tbl_i(blob, i);
+        if (nlsf[i] < v) { nlsf[i] = v; }
+        i = i + 1;
+    }
+    let is i64 as top = 32768 - t.silk_tbl_i(blob, order);
+    if (nlsf[order - 1] > top) { nlsf[order - 1] = top; }
+    i = order - 2;
+    while (i >= 0) {
+        let is i64 as v = nlsf[i + 1] - t.silk_tbl_i(blob, i + 1);
+        if (nlsf[i] > v) { nlsf[i] = v; }
+        i = i - 1;
+    }
+    // Q15 coefficients are in 0..32767 by definition; the backward pass
+    // already keeps them below 32768, so this only guards the top entry.
+    i = 0;
+    while (i < order) {
+        nlsf[i] = _clamp(nlsf[i], 0, 32767);
+        i = i + 1;
+    }
+}
+
+// ── section 4.2.7.5.3: reconstruction ───────────────────────────────
+//
+// i1 is the stage-1 index, idx[0..order-1] the stage-2 signed indices.
+// Writes nlsf[0..order-1] in Q15 and stabilizes it.
+fn silk_nlsf_reconstruct(i1 as i64, idx as *i64, nlsf as *i64,
+                         order as i64, wb as i64) as i64 {
+    if (i1 < 0 || i1 >= t.SILK_LSF_S1_N) { return errno.I_CORRUPT; }
+    if (order != 10 && order != 16) { return errno.I_BADPARAM; }
+
+    let is *u8 as cb with mut = data.SILK_TBL_LSF_CB_NBMB;
+    let is *u8 as sel with mut = data.SILK_TBL_LSF_PRED_SEL_NBMB;
+    let is *u8 as wA with mut = data.SILK_TBL_LSF_PRED_A;
+    let is *u8 as wB with mut = data.SILK_TBL_LSF_PRED_B;
+    let is i64 as sel_cols with mut = t.SILK_LSF_PREDSEL_NB_COLS;
+    let is i64 as qstep with mut = 11796;
+    if (wb != 0) {
+        cb = data.SILK_TBL_LSF_CB_WB;
+        sel = data.SILK_TBL_LSF_PRED_SEL_WB;
+        wA = data.SILK_TBL_LSF_PRED_C;
+        wB = data.SILK_TBL_LSF_PRED_D;
+        sel_cols = t.SILK_LSF_PREDSEL_WB_COLS;
+        qstep = 9830;
+    }
+
+    // Undo the backward prediction, from the last coefficient to the first.
+    let is [16]i64 as res;
+    let is i64 as k with mut = order - 1;
+    while (k >= 0) {
+        let is i64 as pred_Q10 with mut = 0;
+        if (k + 1 < order) {
+            let is i64 as which = t.silk_tbl2(sel, i1, k, sel_cols);
+            let is i64 as w with mut = 0;
+            if (which == 0) {
+                w = t.silk_tbl_i(wA, k);
+            } else {
+                w = t.silk_tbl_i(wB, k);
+            }
+            pred_Q10 = (res[k + 1] * w) >> 8;
+        }
+        let is i64 as v with mut = idx[k] << 10;
+        if (v > 0) { v = v - 102; }
+        else if (v < 0) { v = v + 102; }
+        res[k] = pred_Q10 + ((v * qstep) >> 16);
+        k = k - 1;
+    }
+
+    // Inverse harmonic mean weights and the final Q15 coefficients.
+    k = 0;
+    while (k < order) {
+        let is i64 as cur = t.silk_tbl_i(cb, i1 * order + k);
+        let is i64 as prev with mut = 0;
+        let is i64 as next with mut = 256;
+        if (k > 0) { prev = t.silk_tbl_i(cb, i1 * order + k - 1); }
+        if (k + 1 < order) { next = t.silk_tbl_i(cb, i1 * order + k + 1); }
+        let is i64 as d0 = cur - prev;
+        let is i64 as d1 = next - cur;
+        if (d0 <= 0 || d1 <= 0) { return errno.I_CORRUPT; }
+        let is i64 as w2 = ((1024 / d0) + (1024 / d1)) << 16;
+
+        let is i64 as i = silk_ilog(w2);
+        if (i < 9 || i > 31) { return errno.I_CORRUPT; }
+        let is i64 as f = (w2 >> (i - 8)) & 127;
+        let is i64 as y with mut = 0;
+        if ((i & 1) != 0) { y = 32768 >> ((32 - i) >> 1); }
+        else              { y = 46214 >> ((32 - i) >> 1); }
+        let is i64 as w = y + ((213 * f * y) >> 16);
+        if (w <= 0) { return errno.I_CORRUPT; }
+
+        let is i64 as v = (cur << 7) + ((res[k] << 14) / w);
+        nlsf[k] = _clamp(v, 0, 32767);
+        k = k + 1;
+    }
+
+    silk_nlsf_stabilize(nlsf, order, wb);
+    return errno.I_OK;
+}
+
+// ── section 4.2.7.5.6: NLSF to LPC ─────────────────────────────────
+//
+// Finds the coefficients of one half of P or Q. out[0..dd] receives the
+// Q16 polynomial; the recurrence is evaluated in place, as the reference
+// does, because each row only depends on the previous row.
+fn _nlsf_find_poly(out as *i64, c as *i64, dd as i64) as void {
+    out[0] = 65536;
+    out[1] = 0 - c[0];
+    let is i64 as k with mut = 1;
+    while (k < dd) {
+        let is i64 as ftmp = c[2 * k];
+        out[k + 1] = (out[k - 1] << 1) - ((ftmp * out[k] + 32768) >> 16);
+        let is i64 as j with mut = k;
+        while (j > 1) {
+            out[j] = out[j] + out[j - 2] - ((ftmp * out[j - 1] + 32768) >> 16);
+            j = j - 1;
+        }
+        out[1] = out[1] - ftmp;
+        k = k + 1;
+    }
+}
+
+// Bandwidth expansion used by both limiting loops (section 4.2.7.5.7).
+fn silk_bwexpand32(a as *i64, order as i64, sc0 as i64) as void {
+    let is i64 as sc with mut = sc0;
+    let is i64 as k with mut = 0;
+    while (k < order) {
+        a[k] = (a[k] * sc) >> 16;
+        sc = (sc0 * sc + 32768) >> 16;
+        k = k + 1;
+    }
+}
+
+// Inverse prediction gain / stability of a Q12 filter (section 4.2.7.5.8).
+// Returns 1 when stable, 0 when the filter must be expanded again.
+fn silk_lpc_stable(a12 as *i64, order as i64) as i64 {
+    let is i64 as dc with mut = 0;
+    let is [16]i64 as row;
+    let is [16]i64 as next;
+    let is i64 as k with mut = 0;
+    while (k < order) {
+        dc = dc + a12[k];
+        row[k] = a12[k] << 12;
+        k = k + 1;
+    }
+    // The specification says "> 4096"; both independent decoders use >=,
+    // so a DC response of exactly 4096 is treated as unstable. Recorded as
+    // UNCONFIRMED in silk.md.
+    if (dc >= 4096) { return 0; }
+
+    let is i64 as inv with mut = 1 << 30;
+    k = order - 1;
+    while (k > 0) {
+        if (_abs64(row[k]) > 16773022) { return 0; }
+        let is i64 as rc = (0 - row[k]) << 7;
+        let is i64 as div = (1 << 30) - ((rc * rc) >> 32);
+        inv = ((inv * div) >> 32) << 2;
+        if (inv < 107374) { return 0; }
+
+        let is i64 as b1 = silk_ilog(div);
+        let is i64 as b2 = b1 - 16;
+        if (b2 < 0 || b2 > 15) { return 0; }
+        let is i64 as den = div >> (b2 + 1);
+        if (den == 0) { return 0; }
+        let is i64 as invb2 = ((1 << 29) - 1) / den;
+        let is i64 as err = (1 << 29) - (((div << (15 - b2)) * invb2) >> 16);
+        let is i64 as gain = (invb2 << 16) + ((err * invb2) >> 13);
+
+        let is i64 as n with mut = 0;
+        while (n < k) {
+            let is i64 as num = row[n] - ((row[k - n - 1] * rc + (1 << 30)) >> 31);
+            next[n] = (num * gain + (1 << (b1 - 1))) >> b1;
+            n = n + 1;
+        }
+        n = 0;
+        while (n < k) {
+            row[n] = next[n];
+            n = n + 1;
+        }
+        k = k - 1;
+    }
+
+    if (_abs64(row[0]) > 16773022) { return 0; }
+    let is i64 as rc0 = (0 - row[0]) << 7;
+    let is i64 as div0 = (1 << 30) - ((rc0 * rc0) >> 32);
+    inv = ((inv * div0) >> 32) << 2;
+    if (inv < 107374) { return 0; }
+    return 1;
+}
+
+// Convert nlsf[0..order-1] (Q15) to a monic whitening filter in Q12.
+// Includes the ten-round range limit and the sixteen-round prediction-gain
+// limit of sections 4.2.7.5.7 and 4.2.7.5.8.
+fn silk_nlsf2a(nlsf as *i64, order as i64, a_q12 as *i64) as i64 {
+    let is i64 as dd = order >> 1;
+    let is [16]i64 as c;      // Q17, re-ordered
+    let is [9]i64 as p;       // Q16
+    let is [9]i64 as q;       // Q16
+    let is [16]i64 as a32;    // Q17, later Q12
+    let is *u8 as order_blob with mut = data.SILK_TBL_LSF_ORDER_NBMB;
+    if (order == 16) { order_blob = data.SILK_TBL_LSF_ORDER_WB; }
+
+    let is i64 as k with mut = 0;
+    while (k < order) {
+        let is i64 as n = nlsf[k];
+        let is i64 as idx = n >> 8;
+        let is i64 as f = n & 255;
+        if (idx < 0 || idx > 127) { return errno.I_CORRUPT; }
+        let is i64 as c0 = t.silk_tbl_i(data.SILK_TBL_COS, idx);
+        let is i64 as c1 = t.silk_tbl_i(data.SILK_TBL_COS, idx + 1);
+        let is i64 as ord = t.silk_tbl_i(order_blob, k);
+        if (ord < 0 || ord >= order) { return errno.I_CORRUPT; }
+        c[ord] = (c0 * 256 + (c1 - c0) * f + 4) >> 3;
+        k = k + 1;
+    }
+
+    _nlsf_find_poly(&p[0], &c[0], dd);
+    _nlsf_find_poly(&q[0], &c[1], dd);
+
+    k = 0;
+    while (k < dd) {
+        let is i64 as ptmp = p[k + 1] + p[k];
+        let is i64 as qtmp = q[k + 1] - q[k];
+        a32[k] = (0 - qtmp) - ptmp;
+        a32[order - k - 1] = qtmp - ptmp;
+        k = k + 1;
+    }
+
+    // Section 4.2.7.5.7: up to ten rounds of range limiting.
+    let is i64 as round with mut = 0;
+    while (round < 10) {
+        let is i64 as maxabs with mut = 0;
+        let is i64 as kmax with mut = 0;
+        k = 0;
+        while (k < order) {
+            let is i64 as x = _abs64(a32[k]);
+            if (x > maxabs) { maxabs = x; kmax = k; }
+            k = k + 1;
+        }
+        maxabs = (maxabs + 16) >> 5;
+        if (maxabs > 163838) { maxabs = 163838; }
+        if (maxabs <= 32767) { break; }
+
+        let is i64 as sc0 = 65470 - (((maxabs - 32767) << 14) / ((maxabs * (kmax + 1)) >> 2));
+        silk_bwexpand32(&a32[0], order, sc0);
+        round = round + 1;
+    }
+
+    if (round == 10) {
+        k = 0;
+        while (k < order) {
+            let is i64 as x = _clamp((a32[k] + 16) >> 5, 0 - 32768, 32767);
+            a_q12[k] = x;
+            a32[k] = x << 5;
+            k = k + 1;
+        }
+    } else {
+        k = 0;
+        while (k < order) {
+            a_q12[k] = _clamp((a32[k] + 16) >> 5, 0 - 32768, 32767);
+            k = k + 1;
+        }
+    }
+
+    // Section 4.2.7.5.8: up to sixteen rounds of prediction-gain limiting.
+    round = 0;
+    while (round < 16) {
+        if (silk_lpc_stable(a_q12, order) != 0) { return errno.I_OK; }
+        let is i64 as sc0 = 65536 - (2 << round);
+        silk_bwexpand32(&a32[0], order, sc0);
+        k = 0;
+        while (k < order) {
+            a_q12[k] = _clamp((a32[k] + 16) >> 5, 0 - 32768, 32767);
+            k = k + 1;
+        }
+        round = round + 1;
+    }
+    return errno.I_OK;
+}
