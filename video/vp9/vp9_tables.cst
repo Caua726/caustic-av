@@ -293,14 +293,17 @@ fn _bytes_copy(d as *u8, s as *u8, n as i64) as void {
 }
 
 fn vp9_probctx_zero(p as *Vp9ProbCtx) as void {
+    if (cast(i64, p) == 0) { return; }
     _bytes_zero(cast(*u8, p), sizeof(Vp9ProbCtx));
 }
 
 fn vp9_probctx_copy(d as *Vp9ProbCtx, s as *Vp9ProbCtx) as void {
+    if (cast(i64, d) == 0 || cast(i64, s) == 0) { return; }
     _bytes_copy(cast(*u8, d), cast(*u8, s), sizeof(Vp9ProbCtx));
 }
 
 fn vp9_counts_clear(c as *Vp9Counts) as void {
+    if (cast(i64, c) == 0) { return; }
     _bytes_zero(cast(*u8, c), sizeof(Vp9Counts));
 }
 
@@ -308,6 +311,7 @@ fn vp9_counts_clear(c as *Vp9Counts) as void {
 // Returns I_UNSUPPORTED while vp9_tables_data.cst is pending, in which case
 // the context is not usable for tile decoding.
 fn vp9_probctx_default(p as *Vp9ProbCtx) as i64 {
+    if (cast(i64, p) == 0) { return errno.I_BADPARAM; }
     if (tbl.VP9_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
     let is *u8 as base = tbl.VP9_TBL_DEFAULT_PROBS;
     let is i64 as o with mut = 0;
@@ -512,6 +516,7 @@ fn _state_lf_defaults(st as *Vp9State) as void {
 // intra-only frame is corrupt (libvpx calls this "uninitialized entropy
 // context").
 fn vp9_state_init(st as *Vp9State) as void {
+    if (cast(i64, st) == 0) { return; }
     _bytes_zero(cast(*u8, st), sizeof(Vp9State));
     _state_lf_defaults(st);
     if (tbl.VP9_TABLES_GENERATED == 0) { st.probs_pending = 1; }
@@ -524,6 +529,7 @@ fn vp9_state_init(st as *Vp9State) as void {
 // otherwise the working context is zeroed and marked pending, which keeps
 // header parsing possible but makes tile decoding refuse to run.
 fn vp9_state_setup_past_independence(st as *Vp9State) as void {
+    if (cast(i64, st) == 0) { return; }
     let is i64 as i with mut = 0;
     let is i64 as j with mut = 0;
     while (i < 8) {
@@ -549,6 +555,7 @@ fn vp9_state_setup_past_independence(st as *Vp9State) as void {
 
 // load_probs(ctx): every adaptive table except tx_probs and skip_prob.
 fn vp9_state_load_probs(st as *Vp9State, idx as i64) as i64 {
+    if (cast(i64, st) == 0) { return errno.I_BADPARAM; }
     if (idx < 0 || idx >= 4) { return errno.I_BADPARAM; }
     if (st.ctx_init[idx] == 0) { return errno.I_CORRUPT; }
 
@@ -594,6 +601,7 @@ fn vp9_state_load_probs(st as *Vp9State, idx as i64) as i64 {
 
 // load_probs2(ctx): tx_probs and skip_prob only.
 fn vp9_state_load_probs2(st as *Vp9State, idx as i64) as i64 {
+    if (cast(i64, st) == 0) { return errno.I_BADPARAM; }
     if (idx < 0 || idx >= 4) { return errno.I_BADPARAM; }
     if (st.ctx_init[idx] == 0) { return errno.I_CORRUPT; }
 
@@ -619,6 +627,7 @@ fn vp9_state_load_probs2(st as *Vp9State, idx as i64) as i64 {
 
 // save_probs(ctx): save every table, including tx_probs and skip_prob.
 fn vp9_state_save_probs(st as *Vp9State, idx as i64) as i64 {
+    if (cast(i64, st) == 0) { return errno.I_BADPARAM; }
     if (idx < 0 || idx >= 4) { return errno.I_BADPARAM; }
     vp9_probctx_copy(&st.ctxs[idx], &st.probs);
     st.ctx_init[idx] = 1;
@@ -626,6 +635,7 @@ fn vp9_state_save_probs(st as *Vp9State, idx as i64) as i64 {
 }
 
 fn vp9_state_clear_counts(st as *Vp9State) as void {
+    if (cast(i64, st) == 0) { return; }
     vp9_counts_clear(&st.counts);
 }
 
@@ -639,6 +649,7 @@ fn vp9_state_publish(st as *Vp9State, refresh_flags as i64,
                      width as i64, height as i64, profile as i64,
                      bit_depth as i64, ss_x as i64, ss_y as i64,
                      color_space as i64) as void {
+    if (cast(i64, st) == 0) { return; }
     let is i64 as i with mut = 0;
     while (i < 8) {
         if (((refresh_flags >> i) & 1) == 1) {
