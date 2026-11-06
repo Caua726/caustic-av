@@ -408,6 +408,10 @@ fn _md5_i420(h as *md5.Md5, f as *av.frame.Frame) as i64 {
     y = 0;
     while (y < ch) {
         md5.md5_update(h, f.u + y * f.stride_u, cw);
+        y = y + 1;
+    }
+    y = 0;
+    while (y < ch) {
         md5.md5_update(h, f.v + y * f.stride_v, cw);
         y = y + 1;
     }
