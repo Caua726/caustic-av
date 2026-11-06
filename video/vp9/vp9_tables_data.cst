@@ -1,0 +1,61 @@
+// =======================================================
+// caustic-av/video/vp9/vp9_tables_data.cst
+// Byte blobs for the VP9 probability tables.
+//
+// PENDING. The blobs below are empty and VP9_TABLES_GENERATED is 0, so the
+// probability-context reset in vp9_tables.cst reports I_UNSUPPORTED and the
+// decoder marks its context as unusable for tile decoding. The header
+// parser still reads and validates every syntax element, because the
+// compressed header's bit consumption does not depend on the probability
+// values; only the resulting context does.
+//
+// Generate the blobs from the specification text with
+//
+//   python3 tools/gen_vp9_tables.py --spec <path to clean.txt> \
+//       -o video/vp9/vp9_tables_data.cst
+//
+// The generator validates every table's declared size and value range and
+// then writes this file with VP9_TABLES_GENERATED = 1 and the three blobs.
+// Layout (documented in vp9.md, fixed together with the generator):
+//
+//   VP9_TBL_INV_MAP       inv_map_table[255]
+//   VP9_TBL_KF_PROBS      kf_partition_probs[16][3],
+//                         kf_y_mode_probs[10][10][9],
+//                         kf_uv_mode_probs[10][9]
+//   VP9_TBL_DEFAULT_PROBS default_partition_probs[16][3],
+//                         default_y_mode_probs[4][9],
+//                         default_uv_mode_probs[10][9],
+//                         default_skip_prob[3],
+//                         default_is_inter_prob[4],
+//                         default_comp_mode_prob[5],
+//                         default_comp_ref_prob[5],
+//                         default_single_ref_prob[5][2],
+//                         default_mv_sign_prob[2],
+//                         default_mv_bits_prob[2][10],
+//                         default_mv_class0_bit_prob[2],
+//                         default_tx_probs[4][2][3],
+//                         default_inter_mode_probs[7][3],
+//                         default_interp_filter_probs[4][2],
+//                         default_mv_joint_probs[3],
+//                         default_mv_class_probs[2][10],
+//                         default_mv_class0_fr_probs[2][2][3],
+//                         default_mv_class0_hp_prob[2],
+//                         default_mv_fr_probs[2][3],
+//                         default_mv_hp_prob[2],
+//                         default_coef_probs[4][2][2][6][6][3]
+//
+// Sizes: 255, 1038 and 2051 bytes. Values are written from specification
+// sections 6.3.5, 10.4 and 10.5; no value here is invented.
+// =======================================================
+
+// 0 until tools/gen_vp9_tables.py has produced the blobs.
+let is i64 as VP9_TABLES_GENERATED with imut = 0;
+
+// PENDING: inv_map_table[MAX_PROB], MAX_PROB = 255 (spec 6.3.5).
+let is *u8 as VP9_TBL_INV_MAP with imut = "";
+
+// PENDING: fixed intra-frame tables (spec 10.4).
+let is *u8 as VP9_TBL_KF_PROBS with imut = "";
+
+// PENDING: default probability tables (spec 10.5).
+let is *u8 as VP9_TBL_DEFAULT_PROBS with imut = "";
