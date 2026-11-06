@@ -17,6 +17,11 @@ tool. Bash is allowed only for git bookkeeping and plain file listing/reading.
 Check the code against the specification and the stage's written deliverables.
 Report what remains unverified; never claim runtime proof. A stage is WRITTEN
 when it is complete and you approve it by reading.
+Do not re-implement, simulate or execute project code, generators or tests by
+another route either (eval, Python, scripts, a hand-written runner). Find
+defects by reading and report them as read, not reproduced. Short scripts that
+only search or edit text, or compare a table literally against the spec text,
+are fine.
 
 # Reference implementations (research only)
 
