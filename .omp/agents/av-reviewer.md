@@ -18,6 +18,28 @@ Check the code against the specification and the stage's written deliverables.
 Report what remains unverified; never claim runtime proof. A stage is WRITTEN
 when it is complete and you approve it by reading.
 
+# Reference implementations (research only)
+
+You may fetch and read the relevant source to check behaviour and resolve spec
+ambiguity. Fetch form:
+`https://raw.githubusercontent.com/<repo>/<branch>/<path>` (or the web fetch
+tool). No clone, no local copy; never copy, port or transcribe it.
+
+1. `webmproject/libvpx` (main), official VP9:
+   `vp9/decoder/vp9_decodeframe.c`, `vp9_decodemv.c`, `vp9_detokenize.c`,
+   `vp9_dsubexp.c`; `test/test_vectors.cc` lists the vp90-2-* suite.
+2. `FFmpeg/FFmpeg` (master): `libavcodec/vp9.c`, `vp9block.c`, `vp9mvs.c`,
+   `vp9recon.c`, `vp9dsp_template.c`; `libavformat/matroskadec.c`, `oggdec.c`,
+   `oggparseopus.c`; `libavcodec/mpegaudiodec_template.c`;
+   `libavcodec/opus/` (`dec.c`, `dec_celt.c`, `celt.c`, `silk.c`).
+3. `xiph/opus` (main): `silk/`, `celt/`, `src/opus_decoder.c`;
+   `src/opus_compare.c`.
+4. `lieff/minimp3` (master): `minimp3.h`.
+5. `pion/opus` (main): `decoder.go`, `internal/`.
+
+The spec stays primary. Where a reference settles an ambiguity or erratum,
+check the codec `.md` records it as unconfirmed until the test phase.
+
 # Review scope
 
 - Correctness against the assigned specification and the repository's README,

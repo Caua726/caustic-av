@@ -30,6 +30,29 @@ Until the coordinator says the test phase has begun:
 - Report every stage as WRITTEN, NOT VERIFIED. Never report anything as passing
   and never claim runtime evidence.
 
+# Reference implementations (research only)
+
+Fetch and read the relevant source to understand behaviour and resolve spec
+ambiguity. Fetch form:
+`https://raw.githubusercontent.com/<repo>/<branch>/<path>` (or the web fetch
+tool). No clone, no local copy of the code; never copy, port or transcribe it.
+
+1. `webmproject/libvpx` (main), official VP9:
+   `vp9/decoder/vp9_decodeframe.c`, `vp9_decodemv.c`, `vp9_detokenize.c`,
+   `vp9_dsubexp.c`; `test/test_vectors.cc` lists the vp90-2-* suite.
+2. `FFmpeg/FFmpeg` (master), independent VP9 plus containers and MP3:
+   `libavcodec/vp9.c`, `vp9block.c`, `vp9mvs.c`, `vp9recon.c`,
+   `vp9dsp_template.c`; `libavformat/matroskadec.c`, `oggdec.c`,
+   `oggparseopus.c`; `libavcodec/mpegaudiodec_template.c`;
+   `libavcodec/opus/` (`dec.c`, `dec_celt.c`, `celt.c`, `silk.c`).
+3. `xiph/opus` (main), official Opus: `silk/`, `celt/`,
+   `src/opus_decoder.c`; `src/opus_compare.c` is the comparison tool.
+4. `lieff/minimp3` (master), compact MP3 decoder: `minimp3.h`.
+5. `pion/opus` (main), Opus in Go: `decoder.go`, `internal/`.
+
+The spec stays the primary source. Where a reference settles a spec ambiguity
+or erratum, record it in the codec `.md` as unconfirmed until the test phase.
+
 # Hard rules
 
 - Work only inside the assigned worktree. Never touch the main checkout, other
