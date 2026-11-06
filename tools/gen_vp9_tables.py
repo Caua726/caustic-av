@@ -87,7 +87,8 @@ KF_ORDER = ["kf_partition_probs", "kf_y_mode_probs", "kf_uv_mode_probs"]
 DEFAULT_ORDER = [name for name, _, _ in TABLES
                  if name.startswith("default_")]
 
-COMMENT = re.compile(r"//[^\n]*")
+LINE_COMMENT = re.compile(r"//[^\n]*")
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 def fail(message):
@@ -96,8 +97,14 @@ def fail(message):
 
 
 def strip_comments(text):
-    """Drop // comments so their digits are never read as table values."""
-    return COMMENT.sub("", text)
+    """Drop both comment forms so their digits are never read as values.
+
+    The default coefficient table is annotated with /* block Type 0 */ and
+    /* Coeff Band N */ comments; leaving those in would inject their numbers
+    into the value list.
+    """
+    text = BLOCK_COMMENT.sub("", text)
+    return LINE_COMMENT.sub("", text)
 
 
 def find_table_body(text, name):
