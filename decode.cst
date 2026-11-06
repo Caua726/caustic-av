@@ -294,15 +294,15 @@ fn _samples_to_ticks(d as *Decoder, count as i64, rate as i64) as i64 {
 // base, and *frame_len reports how far the packet cursor advances. Returns 0
 // or the parser's error, or I_UNSUPPORTED when the frame's rate/channels
 // disagree with the track the decoder was opened for.
-fn _mp3_prepare(d as *Decoder, pkt as *packet.Packet, off as i64,
+fn _mp3_prepare(d as *Decoder, data as *u8, data_len as i64, off as i64,
                 frame_len as *i64) as i64 {
-    if (off < 0 || off > pkt.len) { return errno.I_EOF; }
+    if (off < 0 || off > data_len) { return errno.I_EOF; }
     if (cast(i64, frame_len) == 0) { return errno.I_BADPARAM; }
-    let is i64 as avail = pkt.len - off;
+    let is i64 as avail = data_len - off;
     if (avail < 4) { return errno.I_EOF; }
 
     let is mp3.Mp3Header as h;
-    let is i64 as r with mut = mp3.mp3_header_parse(pkt.data + off, avail, &h);
+    let is i64 as r with mut = mp3.mp3_header_parse(data + off, avail, &h);
     if (r < 0) { return r; }
     if (h.frame_len > avail) { return errno.I_EOF; }
     if (h.side_info_offset < 0 || h.side_info_len < 0) {
@@ -311,7 +311,7 @@ fn _mp3_prepare(d as *Decoder, pkt as *packet.Packet, off as i64,
     if (h.side_info_end > h.frame_len) { return errno.I_CORRUPT; }
 
     let is mp3.Mp3SideInfo as side;
-    r = mp3.mp3_side_info_parse(pkt.data + off + h.side_info_offset,
+    r = mp3.mp3_side_info_parse(data + off + h.side_info_offset,
                                 h.side_info_len, h.version, h.channels, &side);
     if (r < 0) { return r; }
 
