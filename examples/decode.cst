@@ -744,9 +744,15 @@ fn _decode_packet(s as *Session, ti as i64,
             while (j < hash_count) {
                 let is i64 as hw with mut = io.write_all_fd(
                     io.STDOUT, &hashes[j][0], 32);
-                if (hw != 32) { return av.errno.I_EOF; }
+                if (hw != 32) {
+                    _err_track(s, ti, "stdout", av.errno.I_EOF);
+                    return av.errno.I_EOF;
+                }
                 hw = io.write_all_fd(io.STDOUT, "\n", 1);
-                if (hw != 1) { return av.errno.I_EOF; }
+                if (hw != 1) {
+                    _err_track(s, ti, "stdout", av.errno.I_EOF);
+                    return av.errno.I_EOF;
+                }
                 s.video_frames[ti] = s.video_frames[ti] + 1;
                 j = j + 1;
             }
@@ -935,7 +941,10 @@ fn _run(path as *u8, pcm_path as *u8, threads as i64) as i32 {
     }
 
     r = _sink_finish(&s);
-    if (r < 0) { return 1; }
+    if (r < 0) {
+        _err_status("pcm output", r);
+        return 1;
+    }
 
     if (cast(i64, s.pcm_path) != 0 && s.sink_track < 0) {
         io.write_str(io.STDERR,
