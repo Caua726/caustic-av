@@ -1,0 +1,557 @@
+// =======================================================
+// caustic-av/video/vp9/mvpred.cst
+// VP9 motion-vector prediction, from the VP9 Bitstream & Decoding Process
+// Specification section 6.5. It is pure bookkeeping over the mode-info grid
+// the block decoder owns: no bitstream is read here, no frame is allocated,
+// and nothing is stored between calls.
+//
+// Why this is not an entropy module
+// ---------------------------------
+// Section 6.5 is part of the syntax, not of the frame format: read_mv needs
+// the final MVs of the current block to know whether the high-precision bit
+// is present (6.4.19), and inter_block_mode_info needs find_mv_refs before it
+// decodes the inter mode. The caller therefore interleaves these calls with
+// the Boolean decoder; each call here is a pure function of the arrays the
+// caller already maintains.
+//
+// Neighbour arrays
+// ----------------
+// One entry per 8x8 mode-info block, row-major over [mi_rows][mi_cols]:
+//
+//   y_modes     YModes                  (0..MB_MODE_COUNT-1)
+//   ref_frames  RefFrames[..][0..1]     (INTRA_FRAME, or LAST/GOLDEN/ALTREF)
+//   mvs         Mvs[..][0..1][0..1]     row then column, 1/8 luma sample
+//   sub_mvs     SubMvs[..][0..1][0..3][0..1]
+//   prev_ref_frames, prev_mvs           the same two layouts for Prev* arrays
+//
+// The caller must zero these arrays (including Mvs/SubMvs for intra blocks)
+// before decoding a frame. Section 6.5 reads CandidateMv for both reference
+// lists before it decides which one to use, so an uninitialised entry would
+// change 6.5.8's mvsSame comparison even when that entry's reference frame
+// is intra. This matches the specification's arrays, which start each frame
+// cleared.
+//
+// Signedness and bounds
+// ---------------------
+// Motion-vector components are i32 in the caller's arrays and i64 in the
+// arithmetic here; every product, sum and negation is done in i64 so no step
+// depends on two's-complement wrap. Candidate positions are checked with
+// is_inside before any array is indexed, block indices are checked against
+// 0..3 (or -1 for the whole-block form), and reference frames against
+// LAST_FRAME..ALTREF_FRAME. A failure is a negative i64. Every argument is
+// validated before any output is written; a corrupt neighbour array
+// discovered part-way through a search leaves the candidate list partially
+// filled, and the caller must discard it.
+//
+// 6.5.12 lowers candidates with `deltaRow & 1`, the two's-complement low bit,
+// and then moves an odd value toward zero. -3 therefore becomes -2 and 3
+// becomes 2; that is the specification's arithmetic, not rounding to nearest.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "inter_tables.cst" as it;
+
+// ── caller-owned context ────────────────────────────────────────────
+//
+// mi_row/mi_col/mi_size are the current block (MiRow/MiCol/MiSize).
+// mi_col_start/mi_col_end are the current tile's column bounds
+// (MiColStart/MiColEnd): 6.5.2 allows a candidate above or below the tile but
+// never across its left or right edge.
+struct MvRefCtx {
+    mi_rows           as i64;
+    mi_cols           as i64;
+    mi_col_start      as i64;
+    mi_col_end        as i64;
+    mi_row            as i64;
+    mi_col            as i64;
+    mi_size           as i64;
+    use_prev_frame_mvs as i64;
+    ref_sign_bias     as *u8;    // [MAX_REF_FRAMES], index 1..3 used
+    y_modes           as *u8;    // [mi_rows][mi_cols]
+    ref_frames        as *u8;    // [mi_rows][mi_cols][2]
+    mvs               as *i32;   // [mi_rows][mi_cols][2][2]
+    sub_mvs           as *i32;   // [mi_rows][mi_cols][2][4][2]
+    prev_ref_frames   as *u8;    // used only when use_prev_frame_mvs is 1
+    prev_mvs          as *i32;   // used only when use_prev_frame_mvs is 1
+}
+
+// RefListMv[] and RefMvCount: at most two candidates, each a row/column pair
+// in 1/8 luma samples. The components are scalar fields rather than the
+// shared Mv pair because a struct field cannot name another module's struct
+// type; callers that want the pair type use inter_tables.cst's Mv.
+struct MvCandList {
+    count as i64;
+    row   as [2]i64;
+    col   as [2]i64;
+}
+
+// NearestMv, NearMv and BestMv for one reference list (6.5.12) or the
+// sub-8x8 neighbours 6.5.14 produces.
+struct MvSet {
+    nearest_row as i64;
+    nearest_col as i64;
+    near_row    as i64;
+    near_col    as i64;
+    best_row    as i64;
+    best_col    as i64;
+}
+
+// ── validation ──────────────────────────────────────────────────────
+
+fn mv_ctx_ok(ctx as *MvRefCtx) as i64 {
+    if (cast(i64, ctx) == 0) { return 0; }
+    if (ctx.mi_rows <= 0 || ctx.mi_rows > it.IT_MAX_MI) { return 0; }
+    if (ctx.mi_cols <= 0 || ctx.mi_cols > it.IT_MAX_MI) { return 0; }
+    if (it.it_block_ok(ctx.mi_size) == 0) { return 0; }
+    if (ctx.mi_row < 0 || ctx.mi_row >= ctx.mi_rows) { return 0; }
+    if (ctx.mi_col < 0 || ctx.mi_col >= ctx.mi_cols) { return 0; }
+    if (ctx.mi_col_start < 0 || ctx.mi_col_start > ctx.mi_cols) { return 0; }
+    if (ctx.mi_col_end < ctx.mi_col_start || ctx.mi_col_end > ctx.mi_cols) { return 0; }
+    if (ctx.mi_col < ctx.mi_col_start || ctx.mi_col >= ctx.mi_col_end) { return 0; }
+    // The current block must fit: mv_clamp_row/col subtract bh/bw from the
+    // frame extent, and a block hanging over the edge would invert the clamp.
+    let is i64 as bh = it.it_num_8x8_high(ctx.mi_size);
+    let is i64 as bw = it.it_num_8x8_wide(ctx.mi_size);
+    if (ctx.mi_row + bh > ctx.mi_rows) { return 0; }
+    if (ctx.mi_col + bw > ctx.mi_cols) { return 0; }
+    if (ctx.use_prev_frame_mvs != 0 && ctx.use_prev_frame_mvs != 1) { return 0; }
+    if (cast(i64, ctx.ref_sign_bias) == 0) { return 0; }
+    if (cast(i64, ctx.y_modes) == 0 || cast(i64, ctx.ref_frames) == 0) { return 0; }
+    if (cast(i64, ctx.mvs) == 0 || cast(i64, ctx.sub_mvs) == 0) { return 0; }
+    if (ctx.use_prev_frame_mvs == 1) {
+        if (cast(i64, ctx.prev_ref_frames) == 0) { return 0; }
+        if (cast(i64, ctx.prev_mvs) == 0) { return 0; }
+    }
+    return 1;
+}
+
+// Flat indices into the row-major arrays. Callers validate r/c first.
+fn mv_ref_index(ctx as *MvRefCtx, r as i64, c as i64, ref_list as i64) as i64 {
+    return (r * ctx.mi_cols + c) * 2 + ref_list;
+}
+
+fn mv_comp_index(ctx as *MvRefCtx, r as i64, c as i64, ref_list as i64) as i64 {
+    return ((r * ctx.mi_cols + c) * 2 + ref_list) * 2;
+}
+
+fn mv_sub_comp_index(ctx as *MvRefCtx, r as i64, c as i64, ref_list as i64,
+                     sub as i64) as i64 {
+    return (((r * ctx.mi_cols + c) * 2 + ref_list) * 4 + sub) * 2;
+}
+
+// ── 6.5.2 Is inside ─────────────────────────────────────────────────
+fn mv_inside(ctx as *MvRefCtx, candidate_r as i64, candidate_c as i64) as i64 {
+    if (candidate_r < 0 || candidate_r >= ctx.mi_rows) { return 0; }
+    if (candidate_c < ctx.mi_col_start || candidate_c >= ctx.mi_col_end) { return 0; }
+    return 1;
+}
+
+// ── 6.5.4 and 6.5.5 Clamp mv row / column ───────────────────────────
+//
+// Both work in 1/8 luma samples. The lower and upper bounds are the distance
+// from the block to the frame edge (in 1/8 samples) grown by `border`. The
+// block is known to fit inside the frame because mv_ctx_ok accepted it and
+// the caller validated MiSize against MiRows/MiCols.
+fn mv_clamp_row(ctx as *MvRefCtx, mvec as i64, border as i64) as i64 {
+    let is i64 as bh = it.it_num_8x8_high(ctx.mi_size);
+    let is i64 as to_top = 0 - ((ctx.mi_row * it.MI_SIZE) * 8);
+    let is i64 as to_bottom = ((ctx.mi_rows - bh - ctx.mi_row) * it.MI_SIZE) * 8;
+    return it.it_clip3(to_top - border, to_bottom + border, mvec);
+}
+
+fn mv_clamp_col(ctx as *MvRefCtx, mvec as i64, border as i64) as i64 {
+    let is i64 as bw = it.it_num_8x8_wide(ctx.mi_size);
+    let is i64 as to_left = 0 - ((ctx.mi_col * it.MI_SIZE) * 8);
+    let is i64 as to_right = ((ctx.mi_cols - bw - ctx.mi_col) * it.MI_SIZE) * 8;
+    return it.it_clip3(to_left - border, to_right + border, mvec);
+}
+
+// 6.5.3 Clamp mv ref: both components of both candidates, MV_BORDER.
+fn mv_clamp_ref(ctx as *MvRefCtx, list as *MvCandList) as void {
+    let is i64 as i with mut = 0;
+    while (i < it.MAX_MV_REF_CANDIDATES) {
+        list.row[i] = mv_clamp_row(ctx, list.row[i], it.MV_BORDER);
+        list.col[i] = mv_clamp_col(ctx, list.col[i], it.MV_BORDER);
+        i = i + 1;
+    }
+}
+
+// ── 6.5.6 Add mv ref list ───────────────────────────────────────────
+//
+// Duplicate suppression compares against RefListMv[0] only, as the
+// specification states; two equal candidates later in the list are still not
+// added once the count reaches two.
+fn mv_add_ref_list(list as *MvCandList, row as i64, col as i64) as void {
+    if (list.count >= it.MAX_MV_REF_CANDIDATES) { return; }
+    if (list.count > 0) {
+        if (list.row[0] == row && list.col[0] == col) { return; }
+    }
+    list.row[list.count] = row;
+    list.col[list.count] = col;
+    list.count = list.count + 1;
+}
+
+// 6.5.9 Scale mv: negate both components when the sign biases differ.
+fn mv_scale_mv(ctx as *MvRefCtx, cand_frame as i64, ref_frame as i64,
+               cand_row as i64, cand_col as i64,
+               out_row as *i64, out_col as *i64) as void {
+    if (cast(i64, ctx.ref_sign_bias[cand_frame]) !=
+        cast(i64, ctx.ref_sign_bias[ref_frame])) {
+        *out_row = 0 - cand_row;
+        *out_col = 0 - cand_col;
+    } else {
+        *out_row = cand_row;
+        *out_col = cand_col;
+    }
+}
+
+// ── 6.5.10 Get block mv ─────────────────────────────────────────────
+//
+// use_prev selects PrevMvs/PrevRefFrames (the motion field of the previous
+// frame) over Mvs/RefFrames. r/c must already satisfy mv_inside.
+fn mv_get_block_mv(ctx as *MvRefCtx, r as i64, c as i64, ref_list as i64,
+                   use_prev as i64, out_row as *i64, out_col as *i64,
+                   out_frame as *i64) as i64 {
+    if (r < 0 || r >= ctx.mi_rows || c < 0 || c >= ctx.mi_cols) {
+        return errno.I_BADPARAM;
+    }
+    if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
+    if (use_prev != 0 && use_prev != 1) { return errno.I_BADPARAM; }
+    if (cast(i64, out_row) == 0 || cast(i64, out_col) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out_frame) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as mvi = mv_comp_index(ctx, r, c, ref_list);
+    let is i64 as ri = mv_ref_index(ctx, r, c, ref_list);
+    let is i64 as frame with mut = 0;
+    if (use_prev == 1) {
+        *out_row = cast(i64, ctx.prev_mvs[mvi]);
+        *out_col = cast(i64, ctx.prev_mvs[mvi + 1]);
+        frame = cast(i64, ctx.prev_ref_frames[ri]);
+    } else {
+        *out_row = cast(i64, ctx.mvs[mvi]);
+        *out_col = cast(i64, ctx.mvs[mvi + 1]);
+        frame = cast(i64, ctx.ref_frames[ri]);
+    }
+    // The stored reference frame becomes an index into ref_sign_bias in
+    // 6.5.9; anything outside INTRA_FRAME..ALTREF_FRAME is a corrupt mode-info
+    // grid, not a frame this code can scale.
+    if (frame < it.INTRA_FRAME || frame > it.ALTREF_FRAME) { return errno.I_CORRUPT; }
+    *out_frame = frame;
+    return errno.I_OK;
+}
+
+// ── 6.5.11 Get sub block mv ─────────────────────────────────────────
+//
+// idx_n_column_to_subblock[block][deltaCol == 0], or 3 when block is -1
+// (the whole-block call from inter_block_mode_info). SubMvs holds the four
+// 4x4 vectors of the luma block.
+fn mv_get_sub_block_mv(ctx as *MvRefCtx, r as i64, c as i64, ref_list as i64,
+                       delta_col as i64, block as i64,
+                       out_row as *i64, out_col as *i64) as i64 {
+    if (r < 0 || r >= ctx.mi_rows || c < 0 || c >= ctx.mi_cols) {
+        return errno.I_BADPARAM;
+    }
+    if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
+    if (block < -1 || block > 3) { return errno.I_BADPARAM; }
+    if (cast(i64, out_row) == 0 || cast(i64, out_col) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as idx with mut = 0;
+    let is i64 as col_zero with mut = 0;
+    if (delta_col == 0) { col_zero = 1; }
+    let is i64 as rc = it.it_subblock_idx(block, col_zero, &idx);
+    if (rc < 0) { return rc; }
+
+    let is i64 as base = mv_sub_comp_index(ctx, r, c, ref_list, idx);
+    *out_row = cast(i64, ctx.sub_mvs[base]);
+    *out_col = cast(i64, ctx.sub_mvs[base + 1]);
+    return errno.I_OK;
+}
+
+// ── 6.5.7 If same ref frame add mv ──────────────────────────────────
+fn mv_if_same_ref(ctx as *MvRefCtx, r as i64, c as i64, ref_frame as i64,
+                  use_prev as i64, list as *MvCandList) as i64 {
+    let is i64 as row with mut = 0;
+    let is i64 as col with mut = 0;
+    let is i64 as frame with mut = 0;
+    let is i64 as j with mut = 0;
+    while (j < 2) {
+        let is i64 as rc = mv_get_block_mv(ctx, r, c, j, use_prev,
+                                           &row, &col, &frame);
+        if (rc < 0) { return rc; }
+        if (frame == ref_frame) {
+            mv_add_ref_list(list, row, col);
+            return errno.I_OK;
+        }
+        j = j + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── 6.5.8 If diff ref frame add mv ──────────────────────────────────
+//
+// Both candidates are loaded before the tests: mvsSame is the comparison of
+// the two stored vectors regardless of their reference frames, and the second
+// candidate is only scaled and added when it is not identical to the first.
+fn mv_if_diff_ref(ctx as *MvRefCtx, r as i64, c as i64, ref_frame as i64,
+                  use_prev as i64, list as *MvCandList) as i64 {
+    let is i64 as row0 with mut = 0;
+    let is i64 as col0 with mut = 0;
+    let is i64 as frame0 with mut = 0;
+    let is i64 as row1 with mut = 0;
+    let is i64 as col1 with mut = 0;
+    let is i64 as frame1 with mut = 0;
+    let is i64 as rc with mut = mv_get_block_mv(ctx, r, c, 0, use_prev,
+                                       &row0, &col0, &frame0);
+    if (rc < 0) { return rc; }
+    rc = mv_get_block_mv(ctx, r, c, 1, use_prev, &row1, &col1, &frame1);
+    if (rc < 0) { return rc; }
+
+    let is i64 as same with mut = 0;
+    if (row0 == row1 && col0 == col1) { same = 1; }
+
+    let is i64 as srow with mut = 0;
+    let is i64 as scol with mut = 0;
+    if (frame0 > it.INTRA_FRAME && frame0 != ref_frame) {
+        mv_scale_mv(ctx, frame0, ref_frame, row0, col0, &srow, &scol);
+        mv_add_ref_list(list, srow, scol);
+    }
+    if (frame1 > it.INTRA_FRAME && frame1 != ref_frame && same == 0) {
+        mv_scale_mv(ctx, frame1, ref_frame, row1, col1, &srow, &scol);
+        mv_add_ref_list(list, srow, scol);
+    }
+    return errno.I_OK;
+}
+
+// ── 6.5.1 Find mv refs ──────────────────────────────────────────────
+//
+// ref_frame is the reference being predicted (LAST/GOLDEN/ALTREF), block is
+// the 4x4 index inside the luma block or -1 for the whole-block call.
+// The function fills list (always two entries, count says how many are real),
+// reports the mode context, and clamps both candidates with MV_BORDER.
+fn mv_find_refs(ctx as *MvRefCtx, ref_frame as i64, block as i64,
+                list as *MvCandList, mode_ctx as *i64) as i64 {
+    if (mv_ctx_ok(ctx) == 0) { return errno.I_BADPARAM; }
+    if (ref_frame < it.LAST_FRAME || ref_frame > it.ALTREF_FRAME) {
+        return errno.I_BADPARAM;
+    }
+    if (block < -1 || block > 3) { return errno.I_BADPARAM; }
+    if (cast(i64, list) == 0 || cast(i64, mode_ctx) == 0) { return errno.I_BADPARAM; }
+
+    list.count = 0;
+    list.row[0] = 0;
+    list.col[0] = 0;
+    list.row[1] = 0;
+    list.col[1] = 0;
+
+    let is i64 as different with mut = 0;
+    let is i64 as counter with mut = 0;
+
+    let is [16]i64 as search;
+    let is i64 as rc with mut = it.it_mv_ref_load(ctx.mi_size, cast(*i64, &search));
+    if (rc < 0) { return rc; }
+
+    // The nearest two neighbours also contribute to the mode context, and
+    // use the sub-8x8 vectors when the reference matches.
+    let is i64 as i with mut = 0;
+    while (i < 2) {
+        let is i64 as cr = ctx.mi_row + search[i * 2];
+        let is i64 as cc = ctx.mi_col + search[i * 2 + 1];
+        if (mv_inside(ctx, cr, cc) == 1) {
+            different = 1;
+            let is i64 as mode = cast(i64, ctx.y_modes[cr * ctx.mi_cols + cc]);
+            let is i64 as m2 with mut = 0;
+            rc = it.it_mode2_counter(mode, &m2);
+            if (rc < 0) { return rc; }
+            counter = counter + m2;
+
+            let is i64 as j with mut = 0;
+            while (j < 2) {
+                let is i64 as ri = mv_ref_index(ctx, cr, cc, j);
+                if (cast(i64, ctx.ref_frames[ri]) == ref_frame) {
+                    let is i64 as srow with mut = 0;
+                    let is i64 as scol with mut = 0;
+                    rc = mv_get_sub_block_mv(ctx, cr, cc, j, search[i * 2 + 1],
+                                             block, &srow, &scol);
+                    if (rc < 0) { return rc; }
+                    mv_add_ref_list(list, srow, scol);
+                    break;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // The remaining six neighbours add only same-reference vectors.
+    i = 2;
+    while (i < it.MVREF_NEIGHBOURS) {
+        let is i64 as cr = ctx.mi_row + search[i * 2];
+        let is i64 as cc = ctx.mi_col + search[i * 2 + 1];
+        if (mv_inside(ctx, cr, cc) == 1) {
+            different = 1;
+            rc = mv_if_same_ref(ctx, cr, cc, ref_frame, 0, list);
+            if (rc < 0) { return rc; }
+        }
+        i = i + 1;
+    }
+
+    if (ctx.use_prev_frame_mvs == 1) {
+        rc = mv_if_same_ref(ctx, ctx.mi_row, ctx.mi_col, ref_frame, 1, list);
+        if (rc < 0) { return rc; }
+    }
+
+    // Still short of two: any inter vector from another reference, scaled by
+    // the sign bias of the difference.
+    if (different == 1) {
+        i = 0;
+        while (i < it.MVREF_NEIGHBOURS) {
+            let is i64 as cr = ctx.mi_row + search[i * 2];
+            let is i64 as cc = ctx.mi_col + search[i * 2 + 1];
+            if (mv_inside(ctx, cr, cc) == 1) {
+                rc = mv_if_diff_ref(ctx, cr, cc, ref_frame, 0, list);
+                if (rc < 0) { return rc; }
+            }
+            i = i + 1;
+        }
+    }
+    if (ctx.use_prev_frame_mvs == 1) {
+        rc = mv_if_diff_ref(ctx, ctx.mi_row, ctx.mi_col, ref_frame, 1, list);
+        if (rc < 0) { return rc; }
+    }
+
+    let is i64 as mctx with mut = 0;
+    rc = it.it_counter_to_context(counter, &mctx);
+    if (rc < 0) { return rc; }
+    *mode_ctx = mctx;
+
+    mv_clamp_ref(ctx, list);
+    return errno.I_OK;
+}
+
+// ── 6.5.13 Use mv hp ────────────────────────────────────────────────
+fn mv_use_hp(delta_row as i64, delta_col as i64) as i64 {
+    if ((it.it_abs(delta_row) >> 3) < it.COMPANDED_MVREF_THRESH &&
+        (it.it_abs(delta_col) >> 3) < it.COMPANDED_MVREF_THRESH) {
+        return 1;
+    }
+    return 0;
+}
+
+// ── 6.5.12 Find best ref mvs ────────────────────────────────────────
+//
+// Lowers each candidate to whole-sample-odd precision when the frame does not
+// allow high precision (or the candidate is too large to keep it), then
+// clamps with BORDERINPIXELS - INTERP_EXTEND in 1/8 samples. NearestMv and
+// BestMv are candidate 0; NearMv is candidate 1.
+fn mv_find_best_ref_mvs(ctx as *MvRefCtx, allow_hp as i64, list as *MvCandList,
+                        out as *MvSet) as i64 {
+    if (mv_ctx_ok(ctx) == 0) { return errno.I_BADPARAM; }
+    if (allow_hp != 0 && allow_hp != 1) { return errno.I_BADPARAM; }
+    if (cast(i64, list) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (list.count > it.MAX_MV_REF_CANDIDATES) { return errno.I_BADPARAM; }
+
+    let is i64 as border = (it.BORDERINPIXELS - it.INTERP_EXTEND) << 3;
+    let is i64 as i with mut = 0;
+    while (i < it.MAX_MV_REF_CANDIDATES) {
+        let is i64 as drow with mut = list.row[i];
+        let is i64 as dcol with mut = list.col[i];
+        if (allow_hp == 0 || mv_use_hp(drow, dcol) == 0) {
+            if ((drow & 1) != 0) {
+                if (drow > 0) { drow = drow - 1; } else { drow = drow + 1; }
+            }
+            if ((dcol & 1) != 0) {
+                if (dcol > 0) { dcol = dcol - 1; } else { dcol = dcol + 1; }
+            }
+        }
+        list.row[i] = mv_clamp_row(ctx, drow, border);
+        list.col[i] = mv_clamp_col(ctx, dcol, border);
+        i = i + 1;
+    }
+
+    out.nearest_row = list.row[0];
+    out.nearest_col = list.col[0];
+    out.near_row = list.row[1];
+    out.near_col = list.col[1];
+    out.best_row = list.row[0];
+    out.best_col = list.col[0];
+    return errno.I_OK;
+}
+
+// ── 6.5.14 Append sub8x8 mvs ────────────────────────────────────────
+//
+// Builds NearestMv/NearMv for one 4x4 sub-block of a sub-8x8 luma block.
+// block_mvs is the current block's BlockMvs for all reference lists, laid out
+// [refList][4][2]; ref_frame is ref_frame[refList] of the current block.
+// find_mv_refs runs again with this 4x4 index, so mode_ctx is reported too.
+fn mv_append_sub8x8_mvs(ctx as *MvRefCtx, ref_frame as i64, block as i64,
+                        ref_list as i64, block_mvs as *i32,
+                        out as *MvSet, mode_ctx as *i64) as i64 {
+    if (mv_ctx_ok(ctx) == 0) { return errno.I_BADPARAM; }
+    if (ref_frame < it.LAST_FRAME || ref_frame > it.ALTREF_FRAME) {
+        return errno.I_BADPARAM;
+    }
+    if (block < 0 || block > 3) { return errno.I_BADPARAM; }
+    if (ref_list < 0 || ref_list > 1) { return errno.I_BADPARAM; }
+    if (cast(i64, block_mvs) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, out) == 0 || cast(i64, mode_ctx) == 0) { return errno.I_BADPARAM; }
+
+    let is MvCandList as list;
+    let is i64 as rc = mv_find_refs(ctx, ref_frame, block, &list, mode_ctx);
+    if (rc < 0) { return rc; }
+
+    // Two slots, filled in the specification's order.
+    let is [2]i64 as srow;
+    let is [2]i64 as scol;
+    let is i64 as dst with mut = 0;
+
+    if (block == 0) {
+        srow[0] = list.row[0];
+        scol[0] = list.col[0];
+        srow[1] = list.row[1];
+        scol[1] = list.col[1];
+        dst = 2;
+    } else if (block <= 2) {
+        srow[0] = cast(i64, block_mvs[(ref_list * 4 + 0) * 2]);
+        scol[0] = cast(i64, block_mvs[(ref_list * 4 + 0) * 2 + 1]);
+        dst = 1;
+    } else {
+        srow[0] = cast(i64, block_mvs[(ref_list * 4 + 2) * 2]);
+        scol[0] = cast(i64, block_mvs[(ref_list * 4 + 2) * 2 + 1]);
+        dst = 1;
+        let is i64 as idx with mut = 1;
+        while (idx >= 0 && dst < 2) {
+            let is i64 as br = cast(i64, block_mvs[(ref_list * 4 + idx) * 2]);
+            let is i64 as bc = cast(i64, block_mvs[(ref_list * 4 + idx) * 2 + 1]);
+            if (br != srow[0] || bc != scol[0]) {
+                srow[dst] = br;
+                scol[dst] = bc;
+                dst = dst + 1;
+            }
+            idx = idx - 1;
+        }
+    }
+
+    // Then the reference-list candidates that differ from the first slot.
+    let is i64 as n with mut = 0;
+    while (n < it.MAX_MV_REF_CANDIDATES && dst < 2) {
+        if (list.row[n] != srow[0] || list.col[n] != scol[0]) {
+            srow[dst] = list.row[n];
+            scol[dst] = list.col[n];
+            dst = dst + 1;
+        }
+        n = n + 1;
+    }
+    if (dst < 2) {
+        srow[dst] = 0;
+        scol[dst] = 0;
+        dst = dst + 1;
+    }
+
+    out.nearest_row = srow[0];
+    out.nearest_col = scol[0];
+    out.near_row = srow[1];
+    out.near_col = scol[1];
+    out.best_row = srow[0];
+    out.best_col = scol[0];
+    return errno.I_OK;
+}
