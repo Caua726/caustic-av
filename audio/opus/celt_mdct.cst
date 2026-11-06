@@ -39,82 +39,77 @@ let is f64 as CELT_PI with imut = 3.141592653589793;
 let is i64 as CELT_COMB_MINPERIOD with imut = 15;
 let is f64 as CELT_DEEMPH with imut = 0.8500061035;
 
-// One inverse MDCT block. `x` holds the coefficients with element stride
+// One inverse MDCT block, the same transform as libopus clt_mdct_backward.
+// `x` holds the coefficients with element stride
 // `stride` (short blocks are interleaved in the frame spectrum), `n` is the
 // number of coefficients, `out` receives n samples and `ola` points at the
 // 120-sample tail from the previous block. `w` is the 120-sample taper.
 fn celt_imdct_block(x as *f64, stride as i64, n as i64, out as *f64,
                     ola as *f64, w as *f64) as i64 {
     if (n <= 0 || n > 960 || (n & 1) != 0) { return errno.I_BADPARAM; }
-    let is i64 as half = n >> 1;
     let is i64 as ov with mut = 120;
     if (ov > n) { ov = n; }
-    let is i64 as m_lo with mut = half - ov;
-    if (m_lo < 0) { m_lo = 0; }
-    let is [960]f64 as ubuf;
-    let is i64 as ulen = n - m_lo;
+    let is i64 as half_ov = ov >> 1;
+
+    // DCT-IV of the block: v[m] = sum over k of x[k] cos(pi/n (m+1/2)(k+1/2)).
+    let is [960]f64 as v;
     let is i64 as i with mut = 0;
-    while (i < ulen) {
-        ubuf[i] = 0.0;
+    while (i < n) {
+        v[i] = 0.0;
         i = i + 1;
     }
-
-    // DCT-IV row for m in [m_lo, n). Each coefficient advances a rotation,
-    // so only one sine and one cosine are evaluated per k.
     let is f64 as pin = CELT_PI / cast(f64, n);
     let is i64 as k with mut = 0;
     while (k < n) {
         let is f64 as xk = x[k * stride];
         if (xk != 0.0) {
             let is f64 as kf = cast(f64, k) + 0.5;
-            let is f64 as ang = pin * (cast(f64, m_lo) + 0.5) * kf;
             let is f64 as step = pin * kf;
+            let is f64 as ang = 0.5 * step;
             let is f64 as c with mut = fm.cos(ang);
             let is f64 as s with mut = fm.sin(ang);
             let is f64 as cd = fm.cos(step);
             let is f64 as sd = fm.sin(step);
-            let is i64 as j with mut = 0;
-            while (j < ulen) {
-                ubuf[j] = ubuf[j] + xk * c;
+            let is i64 as m with mut = 0;
+            while (m < n) {
+                v[m] = v[m] + xk * c;
                 let is f64 as nx = c * cd - s * sd;
-                let is f64 as ny = s * cd + c * sd;
+                s = s * cd + c * sd;
                 c = nx;
-                s = ny;
-                j = j + 1;
+                m = m + 1;
             }
         }
         k = k + 1;
     }
 
-    // Output samples [0, n): windowed first 120 (mixed with the tail), flat
-    // after that. The MDCT scale of RFC 4.3.7 is 1/2.
-    let is i64 as t with mut = 0;
-    while (t < n) {
-        let is i64 as mm = _celt_imdct_map(t + half, n);
-        let is i64 as idx with mut = 0;
-        let is i64 as sg with mut = 1;
-        if (mm < 0) { idx = 0 - mm - 1; sg = -1; } else { idx = mm; }
-        if (idx < m_lo || idx >= n) { return errno.I_CORRUPT; }
-        let is f64 as v = 0.5 * cast(f64, sg) * ubuf[idx - m_lo];
-        if (t < ov) {
-            out[t] = w[t] * v + ola[t];
-        } else {
-            out[t] = v;
-        }
-        t = t + 1;
+    // clt_mdct_backward's output is this DCT-IV reversed and negated.
+    i = 0;
+    while (i < (n >> 1)) {
+        let is f64 as tmp = v[i];
+        v[i] = 0.0 - v[n - 1 - i];
+        v[n - 1 - i] = 0.0 - tmp;
+        i = i + 1;
     }
 
-    // Tail for the next block: the windowed falling edge.
-    t = 0;
-    while (t < ov) {
-        let is i64 as mm = _celt_imdct_map(n + t + half, n);
-        let is i64 as idx with mut = 0;
-        let is i64 as sg with mut = 1;
-        if (mm < 0) { idx = 0 - mm - 1; sg = -1; } else { idx = mm; }
-        if (idx < m_lo || idx >= n) { return errno.I_CORRUPT; }
-        let is f64 as v = 0.5 * cast(f64, sg) * ubuf[idx - m_lo];
-        ola[t] = w[ov - 1 - t] * v;
+    // The window folds the end of the previous block (ola) with the start of
+    // this one; v[half_ov ..] needs no window until the next fold.
+    i = 0;
+    while (i < half_ov) {
+        let is f64 as x1 = v[half_ov - 1 - i];
+        let is f64 as x2 = ola[i];
+        out[i] = w[ov - 1 - i] * x2 - w[i] * x1;
+        out[ov - 1 - i] = w[i] * x2 + w[ov - 1 - i] * x1;
+        i = i + 1;
+    }
+    let is i64 as t with mut = ov;
+    while (t < n) {
+        out[t] = v[t - half_ov];
         t = t + 1;
+    }
+    i = 0;
+    while (i < half_ov) {
+        ola[i] = v[n - half_ov + i];
+        i = i + 1;
     }
     return errno.I_OK;
 }
@@ -260,7 +255,8 @@ fn celt_deemphasis_write(d as *st.CeltDec, c as i64, n as i64, channels as i64,
     while (i < n) {
         let is f64 as tmp = base[i] + mem;
         mem = CELT_DEEMPH * tmp;
-        pcm[i * channels + c] = tmp;
+        // The synthesis works at the 32768 signal scale; PCM leaves at +-1.
+        pcm[i * channels + c] = tmp / 32768.0;
         i = i + 1;
     }
     d.preemph[c] = mem;
