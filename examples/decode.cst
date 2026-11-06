@@ -388,23 +388,19 @@ fn _md5_i420(h as *md5.Md5, f as *av.frame.Frame) as i64 {
     return av.errno.I_OK;
 }
 
-fn _emit_video(s as *Session, ti as i64, out as *av.decode.Output) as i64 {
+// Compute one frame's I420 MD5 into a 33-byte hex buffer. The bytes are held
+// with the packet until the packet drains, because a VP9 I_NOMEM makes the
+// caller send the whole packet again; emitting immediately would duplicate
+// the frames decoded before the shortfall.
+fn _video_hash(out as *av.decode.Output, dst as *u8) as i64 {
     let is md5.Md5 as h;
     md5.md5_init(&h);
     let is i64 as r = _md5_i420(&h, &out.video);
     if (r < 0) { return r; }
 
     let is [16]u8 as digest;
-    let is [33]u8 as hex;
     md5.md5_final(&h, &digest[0]);
-    md5.md5_hex(&digest[0], &hex[0]);
-
-    let is i64 as w with mut = io.write_all_fd(io.STDOUT, &hex[0], 32);
-    if (w != 32) { return av.errno.I_EOF; }
-    w = io.write_all_fd(io.STDOUT, "\n", 1);
-    if (w != 1) { return av.errno.I_EOF; }
-
-    s.video_frames[ti] = s.video_frames[ti] + 1;
+    md5.md5_hex(&digest[0], dst);
     return av.errno.I_OK;
 }
 
@@ -644,6 +640,11 @@ fn _decode_packet(s as *Session, ti as i64,
     let is *av.decode.Decoder as dec = s.decs[ti];
     if (cast(i64, dec) == 0) { return av.errno.I_BADPARAM; }
 
+    // One packet yields at most eight displayed VP9 frames. Their hashes wait
+    // here until the packet has drained without a resend.
+    let is [8][33]u8 as hashes;
+    let is i64 as hash_count with mut = 0;
+
     let is i64 as retries with mut = 0;
     let is i64 as packet_done with mut = 0;
     while (packet_done == 0) {
@@ -687,7 +688,12 @@ fn _decode_packet(s as *Session, ti as i64,
             } else {
                 let is i64 as er with mut = av.errno.I_OK;
                 if (out.kind == av.decode.OUTPUT_VIDEO) {
-                    er = _emit_video(s, ti, &out);
+                    if (hash_count >= 8) {
+                        er = av.errno.I_DIMS;
+                    } else {
+                        er = _video_hash(&out, &hashes[hash_count][0]);
+                        if (er == av.errno.I_OK) { hash_count = hash_count + 1; }
+                    }
                 } else if (out.kind == av.decode.OUTPUT_AUDIO) {
                     er = _emit_audio(s, ti, &out);
                 } else {
@@ -700,7 +706,21 @@ fn _decode_packet(s as *Session, ti as i64,
             }
         }
 
-        if (resend == 0) { packet_done = 1; }
+        if (resend == 0) {
+            let is i64 as j with mut = 0;
+            while (j < hash_count) {
+                let is i64 as hw with mut = io.write_all_fd(
+                    io.STDOUT, &hashes[j][0], 32);
+                if (hw != 32) { return av.errno.I_EOF; }
+                hw = io.write_all_fd(io.STDOUT, "\n", 1);
+                if (hw != 1) { return av.errno.I_EOF; }
+                s.video_frames[ti] = s.video_frames[ti] + 1;
+                j = j + 1;
+            }
+            packet_done = 1;
+        } else {
+            hash_count = 0;
+        }
     }
     return av.errno.I_OK;
 }

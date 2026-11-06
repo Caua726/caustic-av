@@ -45,7 +45,9 @@ pcm: 144000 samples/ch written, 144000 decoded (Ogg Opus final-granule trim chec
 
 - **Video:** one bare lowercase MD5 per displayed frame, in the order the
   decoder returns frames (presentation order hint `order`, with show-existing
-  outputs included). No prefix, so the stream is directly diffable against a
+  outputs included). A packet's hashes are held until that packet drains, so a
+  recoverable VP9 `I_NOMEM` and resend cannot duplicate frames that were
+  already hashed. No prefix, so the stream is directly diffable against a
   libvpx `.md5` file for a single-video-track input. A file with more than one
   decodable video track emits the hashes in decode order without a label;
   track selection is not part of this example.
@@ -234,3 +236,9 @@ would require, all **NOT RUN**:
 5. The example does not print timestamps or durations. It could, from
    `Output.pts`/`duration` and the track timebase, without changing the
    payload streams.
+6. A VP9 `I_NOMEM` after a superframe has already returned some frames makes
+   the caller resend the packet. The duplicate hashes are dropped, but the
+   decoder re-runs the leading slices; the hub's own note says the reference
+   state is tainted by an error, so this path is only expected on a
+   resolution-changing key frame where the shortfall is found before the first
+   displayed output.
