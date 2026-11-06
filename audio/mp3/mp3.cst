@@ -75,7 +75,7 @@ struct Mp3Granule {
     subblock_gain        as [3]i64;
     region0_count        as i64;
     region1_count        as i64;
-    preflag              as i64;   // MPEG-1 only
+    preflag              as i64;   // MPEG-1 only; MPEG-2 derives it
     scalefac_scale       as i64;
     count1table_select   as i64;
 }

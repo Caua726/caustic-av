@@ -103,7 +103,9 @@ any leftover or short bits. Fields:
   `window_switching_flag` 1, then either
   `block_type` 2 / `mixed_block_flag` 1 / two `table_select` 5 each /
   three `subblock_gain` 3 each, or three `table_select` 5 each /
-  `region0_count` 4 / `region1_count` 3. MPEG-1 adds `preflag` 1.
+  `region0_count` 4 / `region1_count` 3. MPEG-1 adds `preflag` 1;
+  MPEG-2/2.5 does not transmit it and derives it from
+  `scalefac_compress` (the 500..511 non-intensity range sets it).
   `scalefac_scale` and `count1table_select` are always present.
 
 When `window_switching_flag` is set, the standard supplies

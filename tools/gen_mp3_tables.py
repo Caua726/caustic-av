@@ -292,7 +292,8 @@ HEADER = """// =======================================================
 // string literal.  Huffman entries are x,y,hlen,hcod quadruples in
 // x-major, y-minor order.  Tables 16-23 and 24-31 share their codeword
 // tables.  Table 0 is the all-zero table and has no codewords; tables 4
-// and 14 are unused.
+// and 14 are unused.  Count1 entries are symbol,hlen,hcod triples.  The
+// MPEG-1 slen and MPEG-2/2.5 LSF partition arrays follow Table 16.
 //
 // The scalefactor-band blobs store 22 long and 13 short bands per row in
 // the order 44.1, 48, 32, 22.05, 24, 16, 11.025, 12, 8 kHz.  The published
