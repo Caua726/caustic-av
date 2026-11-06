@@ -522,6 +522,12 @@ The seven findings from the 7d integration review and their resolution:
 
 ### Other notes
 
+- **7d depends on the pending 7c fix.** `celt_decode_with_range` is the
+  7c CELT body moved behind the shared range, not a second copy. It
+  therefore inherits the 7c REJECT items (stale `tell` gating, the
+  per-channel post-filter advance, LOG2_FRAC_TABLE and quant maxbits).
+  7d changes no CELT decode logic; it must rebase onto the approved 7c fix
+  before it can be verified.
 - **The second Opus header is consumed without a magic check.** `ogg.cst`
   advances past the OpusTags packet and does not verify its `OpusTags`
   magic; a malformed comment packet is accepted by the demuxer.
