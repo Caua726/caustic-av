@@ -64,9 +64,12 @@ let is i64 as BLK_INVALID with imut = 0 - 1;
 
 // ── block geometry helpers not carried by recon_tables.cst ──────────
 
-// subsize_lookup[partition][bsize] (section 10.2). Only square block sizes
-// reach decode_partition; the rectangular cases are included because the
-// table defines them and a caller may ask.
+// subsize_lookup[partition][bsize] (section 10.2). The partition tree only
+// asks about square source sizes (BLOCK_8X8..BLOCK_64X64; it starts at
+// BLOCK_64X64 and every split subsize is square). The rectangular source
+// rows the table also defines are not produced by the tree and return
+// BLK_INVALID here. The rectangular *results* of PART_HORZ/PART_VERT on a
+// square size are returned normally.
 fn blk_subsize(part as i64, bs as i64) as i64 {
     if (part < PART_NONE || part > PART_SPLIT) { return BLK_INVALID; }
     if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
@@ -1377,6 +1380,9 @@ fn _inter_block_mode_info(b as *Vp9Blk, br as *vb.Vp9Bool,
     while (j < 2) {
         if (mi.ref_frame[j] > it.INTRA_FRAME) {
             let is mvp.MvCandList as list;
+            // mv_find_refs requires a non-null mode-context output, but the
+            // block's inter-mode context is computed once by _inter_mode_ctx
+            // below; this scratch result is intentionally not consumed.
             let is i64 as mctx with mut = 0;
             st = mvp.mv_find_refs(&mc, mi.ref_frame[j], -1, &list, &mctx);
             if (st < 0) { return st; }

@@ -32,6 +32,14 @@
 // bounds and is used by a block is a conformance violation and is reported
 // as I_CORRUPT here rather than being scaled into garbage.
 //
+// Current use: decode.cst calls vp9_scale_ratio_ok only. inter.cst
+// implements the same 8.5.2.3 arithmetic in inter_mv_scale/inter_scale_ok,
+// so the setup/base/frac/start/mv/last/clip/end queries and
+// vp9_scale_any_ratio_ok are a spec-shaped reference API that the production
+// path does not call. rewiring inter.cst onto this module is a code change
+// with output risk, so the duplicate is documented rather than aliased for
+// now; see the "scale.cst status" section of refs.md.
+//
 // Nothing in this file has been compiled or run; see video/vp9/refs.md.
 // =======================================================
 

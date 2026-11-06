@@ -339,10 +339,18 @@ the separate `more_coefs` probability. That agrees with the rule above, but
 the spec paragraph that would settle it is missing, so the rule stays
 UNCONFIRMED until an authoritative erratum is consulted.
 
-## 8. Integration notes for stage 3 (header state)
+## 8. Integration notes (header state)
 
 The module deliberately does **not** parse or own frame-header state. The
-header layer must drive it in this order.
+header layer drives it in this order. In the merged decoder that layer is
+`header.cst`, which keeps probabilities in the `vp9_tables.cst` u8/byte
+layout and therefore calls `vp9_state_clear_counts` and
+`vp9_state_setup_past_independence`; `adapt.cst`'s `clear_counts` and
+`setup_past_independence_probs` are **not** used in production. They remain
+a standalone API for a caller that keeps `Vp9Probs`/`Vp9Counts` in this
+module's i64 layout, which is what `adapt_bridge.cst` does around
+`refresh_probs`. Do not delete them without first deciding whether the
+layout-parity API is wanted.
 
 **At sequence/decoder start.** Call `vp9_trees_init(&trees)` once; the trees
 do not change. Keep one `Vp9Probs cur`, one `Vp9Counts counts` and one
@@ -365,9 +373,10 @@ frame_context_idx = 0
 
 `defaults` must be a fully initialised `Vp9Probs` holding the §10.5 default
 probability tables (coefficient and non-coefficient). Those tables are not in
-this module and are not yet written anywhere in this worktree: **pending**,
-owned by the table/header layer. Until they exist, no caller can perform a
-legal `setup_past_independence`.
+this module; the production copies live in `vp9_tables_data.cst` and are
+still **pending** (`VP9_TABLES_GENERATED = 0`), owned by the table/header
+layer. Until they exist, no caller can perform a legal
+`setup_past_independence`.
 
 `setup_past_independence` itself still owes the non-probability resets
 (FeatureData/FeatureEnabled, `segmentation_abs_or_delta_update`,
