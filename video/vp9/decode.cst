@@ -399,6 +399,7 @@ struct Vp9Decoder {
     pkt as hd.Vp9Superframe;
     pkt_index as i64;      // next slice to decode, 0..pkt.count
     pkt_active as i64;     // 1 between send and the final receive
+    hdr_parsed as i64;     // 1 when d.hdr is the frame an I_NOMEM interrupted
 
     // adapt_bridge.cst scratch: one working probability set, the counts of
     // this frame, one import slot for a saved context and the §9.3 trees.
@@ -704,8 +705,14 @@ fn _out_from_slot(out as *Vp9Output, v as *refs.Vp9RefView, order as i64) as voi
 // output buffer to exist beside the eight reference slots.
 fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
                  out as *Vp9Output) as i64 {
-    let is i64 as st with mut = hd.vp9_header_parse(&d.state, &d.hdr, data, len);
-    if (st < 0) { return st; }
+    // Parsing changes the persistent state (LastShowFrame, the loaded
+    // probabilities), so the frame an I_NOMEM interrupted is not parsed again.
+    let is i64 as st with mut = errno.I_OK;
+    if (d.hdr_parsed == 0) {
+        st = hd.vp9_header_parse(&d.state, &d.hdr, data, len);
+        if (st < 0) { return st; }
+    }
+    d.hdr_parsed = 0;
     let is *hd.Vp9Header as h = &d.hdr;
 
     // Section 8.9: output a stored reference. Nothing is decoded, no tile is
@@ -1003,6 +1010,14 @@ fn vp9_decoder_receive(d as *Vp9Decoder, out as *Vp9Output) as i64 {
     while (d.pkt_active == 1 && d.pkt_index < d.pkt.count) {
         let is i64 as i = d.pkt_index;
         let is i64 as st = _decode_slice(d, d.pkt.ptr[i], d.pkt.len[i], out);
+        // A shortfall leaves this frame next, with the packet still armed: the
+        // caller adds memory and calls receive again. Sending the packet anew
+        // would decode the frames before this one a second time.
+        if (st == errno.I_NOMEM) {
+            d.hdr_parsed = 1;
+            frame.frame_free(&out.frame);
+            return st;
+        }
         d.pkt_index = i + 1;
         if (st < 0) {
             d.pkt_active = 0;

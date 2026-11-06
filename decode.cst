@@ -463,6 +463,7 @@ fn decode_send(d as *Decoder, pkt as *packet.Packet) as i64 {
 fn _receive_vp9(d as *Decoder, out as *Output) as i64 {
     let is vp9.Vp9Output as vo;
     let is i64 as r = vp9.vp9_decoder_receive(&d.vp9_dec, &vo);
+    if (r == errno.I_NOMEM) { return r; }   // still armed: grow, receive again
     if (r < 0) {
         d.pending = 0;
         return r;

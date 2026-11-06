@@ -450,10 +450,7 @@ fn _md5_i420(h as *md5.Md5, f as *av.frame.Frame) as i64 {
     return av.errno.I_OK;
 }
 
-// Compute one frame's I420 MD5 into a 33-byte hex buffer. The bytes are held
-// with the packet until the packet drains, because a VP9 I_NOMEM makes the
-// caller send the whole packet again; emitting immediately would duplicate
-// the frames decoded before the shortfall.
+// Compute one frame's I420 MD5 into a 33-byte hex buffer.
 fn _video_hash(out as *av.decode.Output, dst as *u8) as i64 {
     let is md5.Md5 as h;
     md5.md5_init(&h);
@@ -782,8 +779,6 @@ fn _decode_packet(s as *Session, ti as i64,
                         _err_track(s, ti, "VP9 buffer growth", av.errno.I_DIMS);
                         return av.errno.I_DIMS;
                     }
-                    resend = 1;
-                    drained = 1;
                 } else {
                     _err_track(s, ti, "decode", r);
                     return r;
