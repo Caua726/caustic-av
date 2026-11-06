@@ -345,7 +345,6 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
         return st;
     }
     let is blk.Vp9Blk as b;
-    _zero(cast(*u8, &b), sizeof(blk.Vp9Blk));
     b.h = h;
     b.st = &d.state;
     b.fr = out;
