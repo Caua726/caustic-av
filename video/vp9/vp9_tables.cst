@@ -307,6 +307,24 @@ fn vp9_counts_clear(c as *Vp9Counts) as void {
     _bytes_zero(cast(*u8, c), sizeof(Vp9Counts));
 }
 
+// Add `s` into `d`. The tile-threaded decoder gives every worker its own
+// Vp9Counts (so no two threads write the same counter word of section
+// 9.3.4) and sums them here, in worker order, after the join. Every field
+// of Vp9Counts is an array of i64 and every array size is a multiple of 8,
+// so the struct is a contiguous run of i64 with no padding and the sum is
+// exactly the sum of every counter.
+fn vp9_counts_accumulate(d as *Vp9Counts, s as *Vp9Counts) as void {
+    if (cast(i64, d) == 0 || cast(i64, s) == 0) { return; }
+    let is i64 as words = sizeof(Vp9Counts) / 8;
+    let is *i64 as dw = cast(*i64, d);
+    let is *i64 as sw = cast(*i64, s);
+    let is i64 as i with mut = 0;
+    while (i < words) {
+        dw[i] = dw[i] + sw[i];
+        i = i + 1;
+    }
+}
+
 // Load the default probability tables (section 10.5) into one context.
 // Returns I_UNSUPPORTED while vp9_tables_data.cst is pending, in which case
 // the context is not usable for tile decoding.

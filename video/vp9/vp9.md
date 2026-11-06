@@ -31,7 +31,8 @@ guessing would be worse than refusing: `vp9_header_parse` returns
 | `video/vp9/vp9_tables.cst` | Dimensions and constants, fixed lookup tables, `Vp9ProbCtx`, `Vp9Counts`, `Vp9State`, and the probability-context operations (defaults, load, load2, save, clear, publish). |
 | `video/vp9/vp9_tables_data.cst` | The probability blobs. **Generated** by `tools/gen_vp9_tables.py`; currently pending (see below). |
 | `video/vp9/header.cst` | Annex B superframe split, the uncompressed header, the compressed header, and the tile size table. |
-| `video/vp9/tile.cst` | Tile byte ranges and the per-tile Boolean decoder, one per tile, over the partition tree. |
+| `video/vp9/tile.cst` | Tile byte ranges and the per-tile Boolean decoder, one per tile, over the partition tree; the sequential raster walk and the optional tile-column split. |
+| `video/vp9/threads.cst` | Optional tile threading: the caller-owned worker pool, per-worker context carve, the column split, spawn/join and the deterministic error pick. See `threads.md`. |
 | `video/vp9/block.cst` | Partition tree, intra and inter mode info (6.4.4-6.4.20), motion-vector syntax, inter prediction calls, residual orchestration (6.4.21). |
 | `video/vp9/residual.cst`, `residual_tables.cst` | Token decode, coefficient contexts, dequantisation (8.6, 9.3.4) and the scan/band tables. |
 | `video/vp9/transforms.cst` | Inverse transforms of 8.7 and residual addition. |
@@ -750,9 +751,16 @@ notes; none changes valid-stream output or memory safety.
   written**: the coordinator removed the test phase and instructed that no
   new test suites or oracle scripts be added. `tests/run.cst` is untouched.
   No stage 4-6 tests were added for the same reason.
-- Multi-threaded tile decoding, row-mt and lossless encoder support are not
-  part of this stage. The SIMD kernels live in `dsp/` from stage 9 on; see
-  the Stage 9 section below and `dsp/vp9_dsp.md`.
+- Row-mt (superblock-row jobs inside a tile), work stealing and a threaded
+  loop filter are not part of the decoder. Multi-threaded tile decoding
+  exists only as optional tile-column threading (stage 9b, `threads.cst`
+  and `threads.md`); it is off by default and, under the
+  above-contexts-across-tile-rows reading recorded as UNCONFIRMED in
+  `threads.md`, bit-identical to the sequential walk (single-tile-row
+  frames need no such assumption). It was written without any measurement.
+  The SIMD kernels live in `dsp/` from stage 9 on; see the Stage 9 section
+  below and `dsp/vp9_dsp.md`. Lossless encoder support remains outside the
+  decoder stages.
 
 ### Stage 9 scope (written after this note's stages)
 
@@ -765,15 +773,24 @@ transforms, the 8-tap interp filter and the loop filter stay scalar, and no
 AVX2 kernel exists because caustic's assembler has no AVX mnemonics; the
 reasons and the pending list are in `dsp/vp9_dsp.md`. Nothing was measured.
 
+The thread half is **stage 9b** and lives in `threads.cst`/`threads.md`:
+one worker per tile column for all tile rows, shared above contexts
+(column-disjoint), private left contexts, coefficient buffers, scratch and
+counts, sequential adaptation and loop filter after the join. Tile rows are
+never split across workers, per the section 2 note that a tile depends on
+the tile above. It was written with no fps measurement. Nothing here
+changes the bitstream semantics documented in this note.
+
 ### Stage 10 scope (not this stage)
 
 Stage 10 owns the decode example and the public `decode` hub. The threaded
-path is the separate stage 9 slice: the hot kernels are already isolated in
-`block.cst`, `residual.cst`, `transforms.cst`, `predict.cst`, `inter.cst` and
-`loopfilter.cst`; a threaded path must either keep the above/left context
-lifetimes of 7.4 per tile row or serialise them, and must sum the
-per-tile counts before `vp9_adapt_frame`. None of that changes the
-bitstream semantics documented here.
+path is the separate stage 9b slice (`threads.cst`/`threads.md`): the hot
+kernels are already isolated in `block.cst`, `residual.cst`,
+`transforms.cst`, `predict.cst`, `inter.cst` and `loopfilter.cst`; a
+threaded path must either keep the above/left context lifetimes of 7.4 per
+tile row or serialise them, and must sum the per-tile counts before
+`vp9_adapt_frame`. None of that changes the bitstream semantics documented
+here.
 
 - **Stage 10 (`examples/decode.cst`):** the `.webm`/`.ogg`/`.opus`/`.mp3`
   decode example and the public `decode` hub. That layer maps
