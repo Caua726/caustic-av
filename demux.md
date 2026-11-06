@@ -33,7 +33,10 @@ demux_track(d, i)              *codec.Track, or null out of range
 ```
 
 `Demux`, `Track`, `Packet` and every other structure are caller-owned. The
-library opens no file, allocates nothing, and copies no packet byte.
+library opens no file, allocates nothing, and copies no packet byte. A `Demux`
+embeds the Matroska, Ogg and MP3 demuxer states at once (the Ogg assembly
+buffer alone is 64 KiB), so it belongs in caller storage rather than a small
+stack; Caustic has no untagged union to overlay the three.
 
 ## Sniffing table
 
@@ -118,10 +121,11 @@ Notes:
 unknown CodecID keeps `TRACK_SUBTITLE`. That is deliberate: the codec table
 says what the payload is, the container says what the track is for.
 
-An audio SamplingFrequency is a float. It is truncated to whole Hz; a
-non-finite value is `I_CORRUPT` and one above 2^62 Hz is `I_DIMS`, so no later
-sample-count arithmetic can overflow. Matroska already rejects a non-finite or
-non-positive frequency for a track with an Audio master.
+An audio SamplingFrequency is a float. It is truncated to whole Hz. Matroska
+already rejects a non-finite or non-positive frequency for a track with an
+Audio master; the conversion repeats the guard, treating NaN as `I_CORRUPT`
+and a value above 2^62 Hz as `I_DIMS`, so no later sample-count arithmetic can
+overflow.
 
 For `A_OPUS`, the output rate is always 48000 Hz, the rate RFC 7845 defines for
 Opus, regardless of the container's SamplingFrequency. Channels and pre-skip
