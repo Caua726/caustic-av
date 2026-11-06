@@ -557,6 +557,8 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
     en.celt_energy_update(d, start, end, transient);
 
     if (rc.opus_range_tell(r) > len * 8) { return errno.I_CORRUPT; }
+    // The final range seeds the next frame's folding and anti-collapse noise.
+    d.rng = r.rng;
     return n;
 }
 
