@@ -7,6 +7,7 @@ author "Cauã Alvarenga Neves"
 //   caustic-mk run test        every suite at the default optimization level
 //   caustic-mk run test-opt    the same suites through the optimizing backend
 //   caustic-mk build run       the test runner
+//   caustic-mk build decode    the decode example CLI
 //   caustic-mk run clean       build artifacts, cache and test binaries
 //
 // The runner is Caustic, not a shell script: it resolves `caustic` from PATH,
@@ -21,6 +22,14 @@ env_default "OPT" "-O1"
 target "run" {
     src "tests/run.cst"
     out "build/run"
+}
+
+// The example CLI. It imports the hub only; the merged hub, MP3 decoder and
+// VP9 thread API are the implementation it calls. No external dependency is
+// linked or embedded.
+target "decode" {
+    src "examples/decode.cst"
+    out "build/decode"
 }
 
 // ── Scripts ──────────────────────────────────────────────────────────
