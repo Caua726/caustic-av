@@ -429,10 +429,15 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
 
     // A zero-length frame means DTX or a lost frame (Section 3.2.1). This
     // decoder has no concealment, so refuse the whole packet before any
-    // frame advances the codec state.
+    // frame advances the codec state. A standalone CELT frame with one byte
+    // is the same PLC case in celt_decode (it rejects len <= 1), so it is
+    // refused here too instead of failing after earlier frames advanced.
     let is i64 as i with mut = 0;
     while (i < p.frame_count) {
         if (p.frames[i].len < 1) { return errno.I_UNSUPPORTED; }
+        if (p.mode == opus_packet.OPUS_MODE_CELT && p.frames[i].len < 2) {
+            return errno.I_UNSUPPORTED;
+        }
         i = i + 1;
     }
 

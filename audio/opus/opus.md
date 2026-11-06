@@ -522,12 +522,12 @@ The seven findings from the 7d integration review and their resolution:
 
 ### Other notes
 
-- **7d depends on the pending 7c fix.** `celt_decode_with_range` is the
-  7c CELT body moved behind the shared range, not a second copy. It
-  therefore inherits the 7c REJECT items (stale `tell` gating, the
-  per-channel post-filter advance, LOG2_FRAC_TABLE and quant maxbits).
-  7d changes no CELT decode logic; it must rebase onto the approved 7c fix
-  before it can be verified.
+- **CELT slice adopted at `ad7f387`.** `celt_decode_with_range` is the
+  fixed CELT body; 7d adds only the shared-range pointer guard and the
+  silence accounting recorded as `celt.md` pending note 10. The 7c REJECT
+  items are fixed on that branch. The 7d integration re-check confirms the
+  fixed body uses `r.len*8`, the stale-`tell` gates, the `start==0`
+  post-filter gate and the per-frame post-filter advance.
 - **The second Opus header is consumed without a magic check.** `ogg.cst`
   advances past the OpusTags packet and does not verify its `OpusTags`
   magic; a malformed comment packet is accepted by the demuxer.
@@ -586,6 +586,24 @@ live in `silk.md`; these are the integration-relevant references:
 - 18: mid-only side history: libopus and RFC 4.2.8 keep the previous side
   sample for the first unmix sample; FFmpeg flushes the side frame and
   uses zero. This decoder follows libopus/RFC.
+
+### CELT slice pending items
+
+The CELT slice is adopted at `ad7f387`. Its PENDING review notes live in
+`celt.md`; the integration-relevant ones:
+
+- 1: noise seed/magnitude divergence; folded, noise and anti-collapse
+  bands are not bit-identical to the reference.
+- 4: dead Haar on the decoder's scratch X (correct; performance only).
+- 5: pointer-to-integer arithmetic assuming an 8-byte f64.
+- 9: provenance wording for the integer helpers whose arithmetic defines
+  the format.
+- 10: empty-slice accounting — 7d applies the reference `nbits_total`
+  adjustment so a silent empty slice returns frames instead of failing the
+  final budget check.
+- 11: the generated table header says the RFC "names" all three tables,
+  while U6 records that `eMeans` is only referred to; reconcile the wording
+  when the generator is next edited.
 
 ## Scope gaps
 

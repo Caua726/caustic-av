@@ -259,13 +259,17 @@ celt.celt_decode_with_range(&d, &r, pcm, pcm_cap)     // frames or <0
   the same position, sharing the front cursor, the raw-bit cursor and the
   slice. A zeroed or uninitialised range has `rng == 0`, which
   `opus_range_tell` reports as `I_CORRUPT`; the entry returns that error
-  instead of decoding garbage.
+  instead of decoding garbage. `r.ptr` must be non-null when `r.len > 0`
+  (`I_BADPARAM`), and `r.len` must be 0..1275.
 - CELT neither re-initialises `r`, nor rewinds it, nor changes `r.len`. The
   caller may narrow `r.len` before the call (the packet layer does this to
   move the raw-bit reader past a redundant-CELT tail); CELT uses whatever
   slice remains. The frame budget is `r.len * 8` bits for every gate
   (`tell`, `tell_frac`, final energy, anti-collapse), and the final tell
-  must stay within it.
+  must stay within it. A silent frame, including an empty slice, uses the
+  reference accounting: the decoder advances `nbits_total` so the final
+  tell is exactly `r.len * 8`, which lets an empty slice return a silent
+  frame instead of failing the budget check.
 - The redundant-CELT header and the redundant-frame trimming that precede
   this call belong to the packet layer; CELT starts at the byte where the
   high band starts.
@@ -443,6 +447,20 @@ where stated.
    transcribed" below is too strong for those helpers; the U6 licence
    wording should cover them as well as the three data blobs. The wording is
    not settled here.
+10. **Empty-slice accounting (resolved in 7d).** The range contract says an
+    empty slice makes `tell >= total_bits`, so the frame decodes as silence,
+    but the final `opus_range_tell(r) > r.len*8` check would reject it
+    unless the range's `nbits_total` is adjusted. The 7d integration adopts
+    the reference accounting: when `silence != 0`, it advances
+    `nbits_total` so the tell becomes exactly `r.len*8` before synthesis.
+    That is the recorded choice; a silent empty slice now returns frames.
+11. **Generated header wording vs U6 for `eMeans`.** The generated
+    `celt_tables_data.cst` header (and the generator docstring) says the RFC
+    "names" all three data tables, while U6 records that the RFC only refers
+    to the mean band energy without naming or printing it;
+    `e_prob_model` and the caps are named only in the reference. Reconcile
+    the header wording when the generator is next edited; the values are
+    unaffected.
 
 Other low-severity notes carried over, no effect on valid-stream parsing or
 memory safety:

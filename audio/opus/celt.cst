@@ -304,6 +304,7 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
     if (d.channels < 1 || d.channels > 2) { return errno.I_BADPARAM; }
     let is i64 as len = r.len;
     if (len < 0 || len > 1275) { return errno.I_CORRUPT; }
+    if (len > 0 && cast(i64, r.ptr) == 0) { return errno.I_BADPARAM; }
     let is i64 as C = d.stream_channels;
     let is i64 as CC = d.channels;
     let is i64 as lm = d.lm;
@@ -323,6 +324,15 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
         silence = 1;
     } else if (tell == 1) {
         silence = rc.opus_range_bit_logp(r, 15);
+    }
+    if (silence != 0) {
+        // Reference accounting: pretend every remaining bit was read, so
+        // the final tell check and any caller accounting see a full frame.
+        // This is what lets an empty slice decode as silence instead of
+        // failing the budget check below.
+        let is i64 as now = rc.opus_range_tell(r);
+        if (now < 0) { return now; }
+        r.nbits_total = r.nbits_total + (total_bits - now);
     }
     let is i64 as M = 1 << lm;
 
