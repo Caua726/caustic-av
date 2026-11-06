@@ -30,6 +30,7 @@ vp9_decoder_decode          vp9_superframe_split, then per slice:
     reject inter / show_existing / pending blobs / non-8-bit
     frame_size + frame_alloc_coded + zero the coded surface
     _work_carve             carve arrays, vp9_coef_ctx_init
+    zero PrevSegmentIds     intra / error-resilient / size change (7.2, 7.2.6)
     tile_decode_all
       blk_clear_above       once per frame (7.4.1)
       per tile: vp9_bool_init
@@ -43,7 +44,7 @@ vp9_decoder_decode          vp9_superframe_split, then per slice:
                             tx_add_residual; nonzero-context update
         vp9_bool_exit
     _loop_filter            lf_frame_init + lf_filter_frame (8.8)
-    _update_seg_map         PrevSegmentIds (8.1 step 3)
+    _update_seg_map         PrevSegmentIds copy (8.1 step 3)
     vp9_state_publish       reference metadata (8.10)
     vp9_state_save_probs    when refresh_frame_context == 1
 ```
@@ -57,6 +58,14 @@ surfaces and the frame order.
 - `Vp9Decoder` holds the persistent `Vp9State`, the parsed `Vp9Header`, and
   pointers to the caller's work block. The caller allocates the decoder and
   keeps it for the stream's lifetime.
+- `vp9_decoder_init` must precede `vp9_decoder_bind` and
+  `vp9_decoder_decode`: it zeroes the object and installs the persistent
+  state, and `vp9_decoder_decode` cannot tell an uninitialised decoder from
+  an initialised one. `vp9_decoder_bind` only requires a non-null pointer
+  and a positive capacity; a block that is too small, misaligned or has no
+  room for a later frame's layout is accepted there and rejected by
+  `_work_carve` at the first decode (`I_NOMEM` with `work_need`, or
+  `I_BADPARAM` for a misaligned base).
 - The work block is caller-owned and must stay the same block across frames
   because it holds both the per-frame arrays and `PrevSegmentIds`.
   `vp9_work_size(width, height)` gives
@@ -185,13 +194,21 @@ been confirmed by a decoded frame yet.
    output (`out->width == 0`). Reference encoders put hidden altref frames
    before the shown frame; stage 6 owns a proper display queue. UNCONFIRMED
    until a multi-slice superframe is decoded.
-6. **PrevSegmentIds on resolution change.** Section 8.1 step 3 updates
-   `PrevSegmentIds` only when segmentation is enabled and the map is
-   updated. When `seg_map_clear` is set (first frame or a size change) this
-   driver zeroes the previous map, so a later segmentation-predicted inter
-   block cannot read a stale map from another resolution. The spec does not
-   spell this out; libvpx resets the map on a new frame size. Stage 5
-   target.
+6. **PrevSegmentIds clears.** Section 8.1 step 3 updates `PrevSegmentIds`
+   only when segmentation is enabled and the map is updated. Section 7.2's
+   `setup_past_independence` also zeroes the whole map whenever
+   `FrameIsIntra == 1 || error_resilient_mode == 1`, before any tile reads
+   it (6.4.14), and section 7.2.6 zeroes it again when the frame size is
+   first seen or changes. `_decode_slice` applies both clears after the
+   work block is carved and before `tile_decode_all`, because an
+   error-resilient inter frame reads the map through `get_segment_id` while
+   its tiles are decoded; `_update_seg_map` then performs only the step 3
+   copy. The final map is the specification's: a copy of this frame's
+   `SegmentIds` when the map is updated, otherwise zero for any intra or
+   error-resilient frame, with no stale ids surviving a resolution change.
+   Stage 4 itself never reads the map (inter frames are rejected); stage 5
+   consumes it through `get_segment_id`. UNCONFIRMED until a
+   segmentation-predicted inter frame is decoded.
 7. **Per-tile `exit_bool`.** Each tile's trailing padding is checked to be
    zero (9.2.3). The reference decoders do not perform this check; a
    non-conforming encoder that leaves non-zero padding would be rejected
@@ -208,28 +225,70 @@ been confirmed by a decoded frame yet.
 
 ## Pending review notes (documentation / naming / minor robustness)
 
+- **Inter skip rule keys on the frame, not the block.**
+  `block.cst:634` turns a block into a skip block when
+  `b.h.frame_is_intra == 0 && bs >= BLOCK_8X8 && eob == 0`. Section 6.4.4
+  keys that rule on the block's `is_inter`, not on the frame type: an intra
+  block inside an inter frame must keep its coded skip value. The branch is
+  unreachable in stage 4 (inter frames are rejected before a tile is
+  parsed); stage 5 must replace `frame_is_intra` with the block's decoded
+  `is_inter` before it enables inter frames.
+- **`blk_subsize` comment corrected.** The comment above
+  `block.cst:blk_subsize` claimed the rectangular source-size rows of
+  `subsize_lookup` were handled. The function has always returned
+  `BLK_INVALID` for a source size outside `BLOCK_4X4..BLOCK_64X64`; the
+  comment now states that, and that the rectangular results of
+  `PART_HORZ`/`PART_VERT` on square sizes are returned normally. No code
+  change.
+- `tile.cst:64-65` defines `t_max_cols_log2`/`t_max_rows_log2` locally
+  instead of importing `VP9_MAX_TILE_COLS_LOG2`/`VP9_MAX_TILE_ROWS_LOG2`
+  from `vp9_tables.cst`; the two values (6 and 2) are duplicated. The
+  constants exist in the tables module and the local copies are only to
+  avoid a dependency for two numbers.
+- `frame_need`/`work_need` are stale on success and after
+  `vp9_decoder_free`. A decode only writes them when it finds the surface
+  or the work block short, so a successful decode leaves the previous
+  shortfall in place. They are "last rejected requirement" reports, not
+  current requirements; stage 6's accessor should say so, or the driver
+  could clear them at the start of each decode. They are plain public
+  fields today.
+- **Zero-coefficient transform skip is an optimisation.** `block.cst`
+  calls `tx_2d`/`tx_add_residual` only when `nonzero == 1`. An all-zero
+  dequantized block adds nothing to the prediction, so skipping the
+  inverse transform produces the same samples as running it; the
+  per-4x4 nonzero contexts are still written with 0 and `dq` is not read
+  on the skipped path. Documented so a later reader does not mistake the
+  branch for a syntax shortcut.
+- **Init and bind contract.** `vp9_decoder_init` must precede
+  `vp9_decoder_bind` and `vp9_decoder_decode`; `vp9_decoder_decode` can
+  only check that the work pointer is non-null, not that the persistent
+  state was installed. `vp9_decoder_bind` accepts any non-null block with a
+  positive capacity and leaves alignment and the per-frame size to
+  `_work_carve` (`I_BADPARAM` for a misaligned base, `I_NOMEM` plus
+  `work_need` when a later frame's layout does not fit). Both points are
+  restated under "Ownership and sizes".
 - `Vp9Work` is a private layout struct: its field order is the on-disk
   work layout. A reviewer may prefer a version/magic word or an explicit
   `vp9_work_layout` out-parameter API instead of `_work_carve` computing
   the total on a null base.
 - `_update_seg_map` writes `w->prev_seg_ids` in place. Stage 5 may want the
-  map double-buffered so a frame rejected after the tiles cannot half-update
-  it; today the update happens only after a successful tile decode and
-  filter, so the map is consistent with the published reference metadata.
+  map double-buffered: the section 7.2/7.2.6 clear happens before the tiles,
+  so a tile decode that fails after the clear leaves the map zeroed while
+  the rest of the persistent state is tainted. The step 3 copy happens after
+  a successful tile decode and filter but before the `refresh_frame_context`
+  save, so a save error returns out of a frame whose map has already been
+  replaced. Both cases are recoverable only through a key/intra-only frame,
+  which is the documented taint rule.
 - `_work_carve` uses plain `i64` sums after capping dimensions at 8192; the
   largest total is under 1 GiB, so no overflow check is needed, but the
   invariant is only stated in a comment.
 - `blk_log2` returns `BLK_INVALID` for counts other than 1/2/4/8/16; every
   caller checks. A reviewer may prefer distinct error codes.
-- `tile.cst` defines `t_max_cols_log2`/`t_max_rows_log2` locally instead of
-  importing `VP9_MAX_TILE_COLS_LOG2`/`VP9_MAX_TILE_ROWS_LOG2` from
-  `vp9_tables.cst`; the constants exist there and the local copies are only
-  to avoid a dependency for two numbers.
 - The `i64 -> i32` copy before `tx_2d` exists because `residual.cst` returns
   dequantized coefficients as `i64` while `transforms.cst` takes `i32`.
   residual.md guarantees the value is within signed 16-bit.
 - `frame_need`/`work_need` are plain public fields rather than accessor
-  functions; stage 6 can wrap them.
+  functions; stage 6 can wrap them (see the staleness note above).
 
 ## Reference implementations read
 
