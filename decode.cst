@@ -639,12 +639,18 @@ fn _receive_mp3(d as *Decoder, out as *Output) as i64 {
         }
 
         let is i64 as dur = _samples_to_ticks(d, count, rate);
-        if (dur < 0) { return dur; }
+        if (dur < 0) {
+            d.pending = 0;
+            return dur;
+        }
 
         let is i64 as sr = samples.samples_init(&out.audio,
             samples.SAMPLE_FMT_S16, rate, ch, count,
             cast(*u8, &d.pcm[0]), DECODE_PCM_VALUES * 2);
-        if (sr < 0) { return sr; }
+        if (sr < 0) {
+            d.pending = 0;
+            return sr;
+        }
 
         out.kind = OUTPUT_AUDIO;
         out.pts = frame_pts;
