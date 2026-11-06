@@ -2,13 +2,12 @@
 
 **Audio and video containers and codecs for [Caustic](https://github.com/Caua726/Caustic), written from the specifications: the job FFmpeg and GStreamer do for C, with neither of them inside.**
 
-![status](https://img.shields.io/badge/status-VP9%20and%20MP3%20working%2C%20Opus%20broken-yellow)
+![status](https://img.shields.io/badge/status-VP9%2C%20MP3%20and%20Opus%20decoding-green)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 > **Decoders only, no encoders.** VP9 Profile 0 matches the official libvpx
-> vectors and MP3 matches FFmpeg in a short comparison. **Opus compiles and runs
-> but its output is wrong**: it does not match FFmpeg in any mode. See
-> [Status](#status).
+> vectors. MP3 and Opus match the reference closely in short comparisons, but
+> have not been through their full conformance checks. See [Status](#status).
 
 ## What it is
 
@@ -65,7 +64,7 @@ headers and MP4/WAV demuxing are not written.
 
 | Codec | Decode | Encode | State and written limits |
 |---|---|---|---|
-| Opus | broken | no | output wrong (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
+| Opus | yes | no | CELT matches libopus; SILK and hybrid are close (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
 | MP3 | yes | no | matches FFmpeg in a short comparison. Layer III only (MPEG-1, MPEG-2 and MPEG-2.5); CBR and VBR; ID3v2.2/2.3/2.4 and ID3v1 skipping; Xing/Info and VBRI metadata; sync scan; free format refused |
 | PCM | no | no | planned |
 | FLAC | no | no | planned |
@@ -344,7 +343,9 @@ Results below use `caustic -O2 examples/decode.cst -o build/decode`.
 | VP9 Profile 0 | **works**: all 331 vectors with an official `.md5` pass frame by frame with 1 thread; 265 of them re-run with 4 threads also pass | libvpx `.md5` files |
 | VP9 on real video | first minute of a 720p video, 1800/1800 frames | FFmpeg `framemd5` |
 | MP3 | **works**: maximum sample difference of 1 on MPEG-1 stereo and mono, MPEG-2 and MPEG-2.5 | FFmpeg PCM, short generated files |
-| Opus | **broken**: SILK, CELT and hybrid all decode without error but the audio is wrong (SNR below 0 dB) | FFmpeg PCM, short generated files |
+| Opus CELT | **works**: maximum sample difference of 1 | libopus through FFmpeg, short generated file |
+| Opus on real audio | 8 s from a real WebM track: same sample count, no offset, 49 dB SNR, not bit-exact | libopus through FFmpeg |
+| Opus SILK, hybrid | parsing and synthesis correct; differs from libopus at high frequencies because the resampler is our own (RFC 6716 section 4.2.9 leaves it free): 30-50 dB, lower near the band edge | libopus through FFmpeg, short generated files |
 | Matroska/WebM | exercised by every VP9 vector | same vectors |
 
 Speed on that 720p video (low bitrate): 72 fps with 1 thread, 87 fps with 4, on a
@@ -353,7 +354,9 @@ will be slower.
 
 Not checked yet:
 
-- The RFC 6716 vectors through `opus_compare`; pointless until Opus is fixed.
+- The RFC 6716 vectors through `opus_compare`.
+- SILK at NB and MB is 0.5 to 0.7 ms later than libopus, which the RFC allows
+  for SILK-only frames.
 - MP3 beyond the four short files above: real music, free-running VBR, ID3 and
   sync recovery. The MP3 output keeps the encoder delay, so it is compared
   after alignment.
