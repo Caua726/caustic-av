@@ -30,6 +30,7 @@
 
 use "../../core/errno.cst" as errno;
 use "silk_tables.cst" as t;
+use "silk_resample_data.cst" as rsd;
 
 let is f64 as SILK_PI      with imut = 3.141592653589793;
 let is f64 as SILK_TWO_PI  with imut = 6.283185307179586;
@@ -158,6 +159,34 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
     rs.L = L;
     rs.M = M;
     rs.taps = t.SILK_RS_TAPS;
+
+    // To 48 kHz the filter is the generated minimum-phase one.
+    if (out_rate == 48000) {
+        let is *u8 as blob with mut = rsd.SILK_RS48_WB;
+        if (in_rate == 8000)  { blob = rsd.SILK_RS48_NB; }
+        if (in_rate == 12000) { blob = rsd.SILK_RS48_MB; }
+        let is i64 as pos with mut = 0;
+        let is i64 as pz with mut = 0;
+        while (pz < L) {
+            let is i64 as jz with mut = 0;
+            while (jz < rs.taps) {
+                let is i64 as neg with mut = 0;
+                if (cast(i64, blob[pos]) == 45) { neg = 1; pos = pos + 1; }
+                let is i64 as v with mut = 0;
+                while (cast(i64, blob[pos]) >= 48 && cast(i64, blob[pos]) <= 57) {
+                    v = v * 10 + cast(i64, blob[pos]) - 48;
+                    pos = pos + 1;
+                }
+                if (cast(i64, blob[pos]) == 44) { pos = pos + 1; }
+                if (neg != 0) { v = 0 - v; }
+                rs.coef[pz][jz] = cast(f64, v) / 1073741824.0;
+                jz = jz + 1;
+            }
+            pz = pz + 1;
+        }
+        rs.ready = 1;
+        return errno.I_OK;
+    }
 
     let is f64 as ratio = cast(f64, out_rate) / cast(f64, in_rate);
     // cutoff = min(1, ratio). h(u) = cutoff*sinc(cutoff*u) has its
