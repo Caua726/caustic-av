@@ -271,7 +271,7 @@ fn _prob_out(w as *ad.Vp9Probs, r as *t.Vp9ProbCtx) as i64 {
         j = 0;
         while (j < 2) {
             k = 0;
-            while (k < 3) {
+            while (k < i) {
                 if (w.tx_probs[i][j][k] < 1 || w.tx_probs[i][j][k] > 255) { return errno.I_CORRUPT; }
                 r.tx[i][j][k] = cast(u8, w.tx_probs[i][j][k]);
                 k = k + 1;
@@ -367,11 +367,16 @@ fn _prob_out(w as *ad.Vp9Probs, r as *t.Vp9ProbCtx) as i64 {
                     let is i64 as ctx with mut = 0;
                     while (ctx < 6) {
                         let is i64 as node with mut = 0;
-                        while (node < 3) {
-                            let is i64 as v = w.coef_probs[i][j][k][band][ctx][node];
-                            if (v < 1 || v > 255) { return errno.I_CORRUPT; }
-                            r.coef[i][j][k][band][ctx][node] = cast(u8, v);
-                            node = node + 1;
+                        // Band 0 has only three previous-coefficient
+                        // contexts; [0][3..5] are the specification's unused
+                        // zeros and adaptation never touches them.
+                        if (!(band == 0 && ctx >= 3)) {
+                            while (node < 3) {
+                                let is i64 as v = w.coef_probs[i][j][k][band][ctx][node];
+                                if (v < 1 || v > 255) { return errno.I_CORRUPT; }
+                                r.coef[i][j][k][band][ctx][node] = cast(u8, v);
+                                node = node + 1;
+                            }
                         }
                         ctx = ctx + 1;
                     }

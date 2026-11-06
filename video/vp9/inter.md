@@ -415,6 +415,18 @@ valid-stream output or memory safety. None was applied in this fix round.
   `mv_get_sub_block_mv` and `mv_find_refs`, while the rest of the tree
   spells negative constants as `0 - 1`. A style pass should make the two
   spellings agree.
+- **Stage 5 integration change (applied in this branch).** `MiRows`/`MiCols`
+  are `ceil(height/8)`/`ceil(width/8)`, so a partition at the right or
+  bottom edge can produce a block whose top-left is inside the mode-info grid
+  but whose body overhangs it (1080p and 720p both do). `inter_frame_ok` and
+  `mvpred.mv_ctx_ok` therefore accept such a block (start inside, overhang
+  allowed) where this slice required it to fit, and
+  `inter_predict_taps`/`inter_predict_block` let the written region extend
+  into the caller's 64-sample padding band instead of rejecting
+  `x + w > MiCols*8`. `mv_clamp_row`/`mv_clamp_col` then see the negative
+  distance to the overhung edge that 6.5.4/6.5.5 print. The write stays
+  inside the caller's allocation; `decode.cst` provides the band. This is
+  documented at each function and is not a change to valid-stream output.
 - `inter_block_pred` checks `ref.stride >= last_x + 1` but neither it nor its
   callers verify that the buffer holds `last_y + 1` rows of that stride. The
   contract is the caller's (a reference plane is a full frame plane); a

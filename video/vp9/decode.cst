@@ -223,6 +223,44 @@ fn vp9_work_size(width as i64, height as i64) as i64 {
     return w.need;
 }
 
+// Coded grid for a visible size: MiCols*8 x MiRows*8 rounded up to 64, plus
+// one 64-sample band for the overhanging blocks of 6.4.21/8.5.1.
+fn _coded_dims(width as i64, height as i64,
+               out_w as *i64, out_h as *i64) as i64 {
+    if (cast(i64, out_w) == 0 || cast(i64, out_h) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (width <= 0 || height <= 0) { return errno.I_DIMS; }
+    if (width > frame.FRAME_MAX_DIM || height > frame.FRAME_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    let is i64 as mi_cols = (width + 7) >> 3;
+    let is i64 as mi_rows = (height + 7) >> 3;
+    if (mi_cols <= 0 || mi_rows <= 0) { return errno.I_DIMS; }
+    if (mi_cols > VP9_MAX_MI || mi_rows > VP9_MAX_MI) { return errno.I_DIMS; }
+    let is i64 as maxx = mi_cols * 8;
+    let is i64 as maxy = mi_rows * 8;
+    let is i64 as coded_w = (((maxx + 63) >> 6) << 6) + 64;
+    let is i64 as coded_h = (((maxy + 63) >> 6) << 6) + 64;
+    if (coded_w > frame.FRAME_MAX_DIM || coded_h > frame.FRAME_MAX_DIM) {
+        return errno.I_DIMS;
+    }
+    *out_w = coded_w;
+    *out_h = coded_h;
+    return errno.I_OK;
+}
+
+// Bytes one pool buffer needs for a visible width x height frame, i.e. the
+// value vp9_decoder_decode reports in frame_need. Returns a positive byte
+// count or a negative code.
+fn vp9_frame_size(width as i64, height as i64) as i64 {
+    let is i64 as cw with mut = 0;
+    let is i64 as ch with mut = 0;
+    let is i64 as st = _coded_dims(width, height, &cw, &ch);
+    if (st < 0) { return st; }
+    return frame.frame_size(cw, ch);
+}
+
 // ── decoder object ──────────────────────────────────────────────────
 
 struct Vp9Decoder {
@@ -316,6 +354,20 @@ fn vp9_decoder_add_buffer(d as *Vp9Decoder, mem as *u8, cap as i64) as i64 {
     return errno.I_OK;
 }
 
+// Index of a registered buffer that no reference slot names, or -1 when the
+// pool is empty. At most eight slots can name buffers, so with nine
+// registered at least one index is free; this is the index a caller passes to
+// vp9_decoder_replace_buffer after I_NOMEM.
+fn vp9_decoder_free_buffer(d as *Vp9Decoder) as i64 {
+    if (cast(i64, d) == 0) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i < d.pool_count) {
+        if (refs.vp9_refs_buffer_in_use(&d.refs, i) == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
 // Replace one registered buffer, for a caller that must grow a free buffer
 // after a resolution increase. A buffer still named by a reference slot
 // cannot be replaced: its pixels are live.
@@ -341,8 +393,11 @@ fn vp9_decoder_reset_refs(d as *Vp9Decoder) as i64 {
 }
 
 // Drop the views; the caller keeps ownership of the work and pixel blocks.
+// Reference slots are invalidated too, so a decoder cannot be used again
+// with stale slot metadata.
 fn vp9_decoder_free(d as *Vp9Decoder) as void {
     if (cast(i64, d) == 0) { return; }
+    refs.vp9_refs_reset(&d.state, &d.refs);
     d.work = cast(*u8, 0);
     d.work_cap = 0;
     d.work_need = 0;
@@ -515,13 +570,10 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
 
     // Coded surface: MiCols*8 x MiRows*8 rounded to 64, plus one 64-sample
     // band for the overhanging blocks of 6.4.21/8.5.1.
-    let is i64 as maxx = h.mi_cols * 8;
-    let is i64 as maxy = h.mi_rows * 8;
-    let is i64 as coded_w = (((maxx + 63) >> 6) << 6) + 64;
-    let is i64 as coded_h = (((maxy + 63) >> 6) << 6) + 64;
-    if (coded_w > frame.FRAME_MAX_DIM || coded_h > frame.FRAME_MAX_DIM) {
-        return errno.I_DIMS;
-    }
+    let is i64 as coded_w with mut = 0;
+    let is i64 as coded_h with mut = 0;
+    st = _coded_dims(h.width, h.height, &coded_w, &coded_h);
+    if (st < 0) { return st; }
     let is i64 as fsz = frame.frame_size(coded_w, coded_h);
     if (fsz < 0) { return fsz; }
 
@@ -548,8 +600,12 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
 
     // setup_past_independence clears PrevSegmentIds for the whole frame
     // before any block is decoded (section 7.2); the header cannot do it
-    // because the work block is bound per frame.
-    if (h.frame_is_intra == 1 || h.error_resilient_mode == 1) {
+    // because the work block is bound per frame. A resolution change also
+    // makes the old map's dimensions wrong for 6.4.14's indexing, so the
+    // current grid is cleared as well (7.2.6's map clear); the previous map
+    // is otherwise kept for temporal prediction.
+    if (h.frame_is_intra == 1 || h.error_resilient_mode == 1
+        || h.seg_map_clear == 1) {
         _zero(w.prev_seg_ids, h.mi_cols * h.mi_rows);
     }
 

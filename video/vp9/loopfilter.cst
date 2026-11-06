@@ -502,6 +502,7 @@ fn lf_filter_plane(lf as *LfFrame, blk as *LfBlockInfo, plane as i64,
         || cast(i64, blk.ref_frames) == 0 || cast(i64, blk.y_modes) == 0) {
         return errno.I_BADPARAM;
     }
+    if (blk.ref_stride < 1 || blk.ref_stride > 2) { return errno.I_BADPARAM; }
 
     let is i64 as subx with mut = 0;
     if (plane > 0) { subx = lf.sub_x; }
