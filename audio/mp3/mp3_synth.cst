@@ -79,11 +79,6 @@ fn _zero(p as *u8, n as i64) as void {
     while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
 }
 
-fn _abs_f64(x as f64) as f64 {
-    if (x < 0.0) { return 0.0 - x; }
-    return x;
-}
-
 // Build the analytic windows, IMDCT cos matrices, synthesis matrix, Table
 // 3-B.3 window and alias reduction constants. Called once per decoder.
 fn syn_init(s as *Mp3Synth) as i64 {
