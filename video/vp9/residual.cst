@@ -1,0 +1,552 @@
+// =======================================================
+// caustic-av/video/vp9/residual.cst
+// VP9 residual and coefficient decoding: the tokens() syntax of section
+// 6.4.24 with get_scan (6.4.25) and read_coef (6.4.26), the semantics of
+// 7.4.15-7.4.17, the syntax-element counting of 9.3.4, and the
+// dequantization functions of 8.6.1 used by the reconstruct step of 8.6.2.
+//
+// What this file does not do: predict, inverse transform, or write samples.
+// It turns one transform block of one plane into dequantized coefficients
+// (or into raw Tokens, if the caller wants them) and reports the block's
+// "nonzero" flag. Block geometry (get_plane_block_size, the per-4x4 block
+// loop and the Above/Left context write-back) belongs to block.cst, which
+// owns the coordinates and the per-plane context arrays.
+//
+// Profile 0 only, like the rest of this decoder: BitDepth is 8, so
+// read_coef never reads the high_bit elements of DCT_VAL_CATEGORY6 and the
+// quantizer lookups use row 0.
+//
+// Ownership and aliasing:
+//   - nothing here allocates. The token cache is 1 KiB of stack.
+//   - tokens, out and the context arrays are caller memory; their sizes are
+//     in the comments of each function.
+//   - vp9_dequant may be called with out equal to tokens: it reads an
+//     element before writing the same index, and index 0 is handled first.
+//
+// Tables: every value comes from residual_tables.cst, which reads the blobs
+// of residual_tables_data.cst. While those blobs are pending (the committed
+// placeholder) vp9_tokens_decode and vp9_dequant return I_UNSUPPORTED.
+//
+// Errors are negative i64 codes: I_BADPARAM for caller mistakes, I_CORRUPT
+// for malformed data (a truncated Boolean stream, a zero probability, a
+// scan position outside the block, Dequant outside signed 16-bit as
+// section 8.6.2 requires of a conforming stream), I_UNSUPPORTED while the
+// tables are pending.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "bool.cst" as vb;
+use "vp9_tables.cst" as t;
+use "residual_tables.cst" as rt;
+
+// ── inputs shared with the rest of the decoder ──────────────────────
+
+// Quantizer values of the current block (sections 6.2.10 and 8.6.1).
+// qindex is get_qindex(): base_q_idx, or the segmentation alternative
+// already resolved by the caller. The three deltas are the header's
+// delta_q_y_dc, delta_q_uv_dc and delta_q_uv_ac, verbatim. The lookups clip
+// qindex+delta to 0..255 themselves.
+struct Vp9Quant {
+    qindex      as i64;
+    y_dc_delta  as i64;
+    uv_dc_delta as i64;
+    uv_ac_delta as i64;
+}
+
+// The AboveNonzeroContext / LeftNonzeroContext arrays of section 6.4.21 at
+// 4x4 granularity, one plane-major block of entries per plane:
+//
+//   above[plane * above_stride + x4]     above holds 3*above_stride bytes
+//   left [plane * left_stride  + y4]     left  holds 3*left_stride  bytes
+//
+// The caller owns both byte arrays. vp9_coef_ctx_init records the strides
+// and the per-plane limits (max_x, max_y, in 4x4 units) the context
+// derivation clips against; vp9_coef_ctx_clear zeroes the arrays at a tile
+// (or tile row) boundary. Entries are 0 or 1; any other value only ever
+// means "nonzero" here.
+struct Vp9CoefCtx {
+    above        as *u8;
+    left         as *u8;
+    above_stride as i64;
+    left_stride  as i64;
+    max_x        as [3]i64;
+    max_y        as [3]i64;
+}
+
+// ── context arrays ──────────────────────────────────────────────────
+
+// Prepare the context arrays for a frame. above_stride must be at least
+// 2*mi_cols and left_stride at least 2*mi_rows, so that the widest plane
+// fits; each plane's limit is then (2*MiCols)>>sx and (2*MiRows)>>sy as
+// section 9.3.2 defines them. ss_x and ss_y are the chroma subsampling
+// (0 or 1; profile 0 is 1, 1). Returns I_NOMEM if a stride is too small.
+fn vp9_coef_ctx_init(cc as *Vp9CoefCtx, above as *u8, above_stride as i64,
+                     left as *u8, left_stride as i64,
+                     mi_cols as i64, mi_rows as i64,
+                     ss_x as i64, ss_y as i64) as i64 {
+    if (cast(i64, cc) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, above) == 0 || cast(i64, left) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (mi_cols <= 0 || mi_rows <= 0) { return errno.I_BADPARAM; }
+    if (ss_x < 0 || ss_x > 1 || ss_y < 0 || ss_y > 1) {
+        return errno.I_BADPARAM;
+    }
+    if (above_stride < 2 * mi_cols || left_stride < 2 * mi_rows) {
+        return errno.I_NOMEM;
+    }
+
+    cc.above = above;
+    cc.above_stride = above_stride;
+    cc.left = left;
+    cc.left_stride = left_stride;
+    cc.max_x[0] = 2 * mi_cols;
+    cc.max_y[0] = 2 * mi_rows;
+    cc.max_x[1] = (2 * mi_cols) >> ss_x;
+    cc.max_y[1] = (2 * mi_rows) >> ss_y;
+    cc.max_x[2] = cc.max_x[1];
+    cc.max_y[2] = cc.max_y[1];
+    return errno.I_OK;
+}
+
+// Zero the three planes of both arrays.
+fn vp9_coef_ctx_clear(cc as *Vp9CoefCtx) as i64 {
+    if (cast(i64, cc) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, cc.above) == 0 || cast(i64, cc.left) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (cc.above_stride <= 0 || cc.left_stride <= 0) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as n with mut = 3 * cc.above_stride;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        cc.above[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    n = 3 * cc.left_stride;
+    i = 0;
+    while (i < n) {
+        cc.left[i] = cast(u8, 0);
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── transform type ──────────────────────────────────────────────────
+
+// get_scan's TxType derivation (section 6.4.25), without the scan itself:
+// chroma and 32x32 are always DCT_DCT, a lossless or inter 4x4 block is
+// DCT_DCT, and every other case maps the block's mode through
+// mode2txfm_map. `mode` is y_mode for a transform block of at least 8x8 and
+// sub_modes[blockIdx] for the 4x4 transform blocks of a sub-8x8 block; only
+// intra blocks use that value, because an inter 4x4 block is DCT_DCT.
+fn vp9_tx_type(plane as i64, tx_sz as i64, lossless as i64,
+               is_inter as i64, mode as i64) as i64 {
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (tx_sz < 0 || tx_sz > t.VP9_TX_32X32) { return errno.I_BADPARAM; }
+    if (lossless != 0 && lossless != 1) { return errno.I_BADPARAM; }
+    if (is_inter != 0 && is_inter != 1) { return errno.I_BADPARAM; }
+    if (plane > 0 || tx_sz == t.VP9_TX_32X32) {
+        return rt.VP9_TX_TYPE_DCT_DCT;
+    }
+    if (tx_sz == t.VP9_TX_4X4 && (lossless == 1 || is_inter == 1)) {
+        return rt.VP9_TX_TYPE_DCT_DCT;
+    }
+    if (mode < 0 || mode >= 14) { return errno.I_BADPARAM; }
+    return rt.vp9_mode2txfm(mode);
+}
+
+// ── coefficient context derivation (section 9.3.2) ──────────────────
+
+// One coefficient probability. Index checks cover the table dimensions the
+// specification fixes; a value outside 1..255 is corrupt input, because a
+// coded probability is never 0.
+fn _coef_prob(p as *t.Vp9ProbCtx, tx_sz as i64, plane as i64,
+              is_inter as i64, band as i64, ctx as i64, node as i64) as i64 {
+    if (tx_sz < 0 || tx_sz >= t.VP9_TX_SIZES) { return errno.I_CORRUPT; }
+    if (band < 0 || band >= t.VP9_COEF_BANDS) { return errno.I_CORRUPT; }
+    if (ctx < 0 || ctx >= t.VP9_PREV_COEF_CONTEXTS) { return errno.I_CORRUPT; }
+    if (node < 0 || node >= t.VP9_UNCONSTRAINED_NODES) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as pt with mut = 0;
+    if (plane > 0) { pt = 1; }
+    let is i64 as v = cast(i64, p.coef[tx_sz][pt][is_inter][band][ctx][node]);
+    if (v < 1 || v > 255) { return errno.I_CORRUPT; }
+    return v;
+}
+
+// ctx at c == 0: OR of the AboveNonzeroContext entries covered by the
+// transform block, plus the same for the left, both clipped to the plane.
+fn _ctx_first(cc as *Vp9CoefCtx, plane as i64, tx_sz as i64,
+              start_x as i64, start_y as i64) as i64 {
+    let is i64 as numpts = 1 << tx_sz;
+    let is i64 as x4 = start_x >> 2;
+    let is i64 as y4 = start_y >> 2;
+    let is i64 as above with mut = 0;
+    let is i64 as left with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < numpts) {
+        if (x4 + i < cc.max_x[plane]) {
+            if (cc.above[plane * cc.above_stride + x4 + i] != 0) {
+                above = 1;
+            }
+        }
+        if (y4 + i < cc.max_y[plane]) {
+            if (cc.left[plane * cc.left_stride + y4 + i] != 0) {
+                left = 1;
+            }
+        }
+        i = i + 1;
+    }
+    return above + left;
+}
+
+// ctx at c > 0: the two raster neighbours of pos through TokenCache. The
+// transform type picks which neighbour is used twice, as 9.3.2 specifies.
+fn _ctx_next(pos as i64, tx_sz as i64, tx_type as i64,
+             cache as *u8) as i64 {
+    let is i64 as n = 4 << tx_sz;
+    let is i64 as seg_eob = 16 << (tx_sz << 1);
+    if (pos < 0 || pos >= seg_eob) { return errno.I_CORRUPT; }
+    let is i64 as i = pos / n;
+    let is i64 as j = pos % n;
+    let is i64 as nb0 with mut = 0;
+    let is i64 as nb1 with mut = 0;
+    if (i > 0 && j > 0) {
+        let is i64 as a = (i - 1) * n + j;
+        let is i64 as a2 = i * n + j - 1;
+        if (tx_type == rt.VP9_TX_TYPE_DCT_ADST) {
+            nb0 = a;
+            nb1 = a;
+        } else if (tx_type == rt.VP9_TX_TYPE_ADST_DCT) {
+            nb0 = a2;
+            nb1 = a2;
+        } else {
+            nb0 = a;
+            nb1 = a2;
+        }
+    } else if (i > 0) {
+        nb0 = (i - 1) * n + j;
+        nb1 = nb0;
+    } else {
+        nb0 = i * n + j - 1;
+        nb1 = nb0;
+    }
+    if (nb0 < 0 || nb0 >= seg_eob || nb1 < 0 || nb1 >= seg_eob) {
+        return errno.I_CORRUPT;
+    }
+    return (1 + cast(i64, cache[nb0]) + cast(i64, cache[nb1])) >> 1;
+}
+
+// pareto(node, prob): the probability of a token-tree node above the first
+// two. Section 9.3.2 derives it from coef_probs[...][Min(2, 1+node)].
+fn _token_prob(p as *t.Vp9ProbCtx, tx_sz as i64, plane as i64,
+               is_inter as i64, band as i64, ctx as i64,
+               node as i64) as i64 {
+    if (node < 0) { return errno.I_CORRUPT; }
+    let is i64 as idx with mut = 2;
+    if (node == 0) { idx = 1; }
+    let is i64 as base = _coef_prob(p, tx_sz, plane, is_inter, band, ctx, idx);
+    if (base < 0) { return base; }
+    if (node < 2) { return base; }
+    let is i64 as col = node - 2;
+    if (col >= rt.VP9_RES_PARETO_COLS) { return errno.I_CORRUPT; }
+    let is i64 as x = (base - 1) / 2;
+    let is i64 as lo = rt.vp9_pareto(x, col);
+    if (lo < 0) { return lo; }
+    let is i64 as prob with mut = 0;
+    if ((base & 1) != 0) {
+        prob = lo;
+    } else {
+        let is i64 as hi = rt.vp9_pareto(x + 1, col);
+        if (hi < 0) { return hi; }
+        prob = (lo + hi) >> 1;
+    }
+    if (prob < 1 || prob > 255) { return errno.I_CORRUPT; }
+    return prob;
+}
+
+// Decode one token through token_tree (section 9.3.2). The tree is finite
+// and its internal nodes increase, but the loop also counts steps so a
+// corrupt table cannot spin forever.
+fn _token_decode(br as *vb.Vp9Bool, p as *t.Vp9ProbCtx, tx_sz as i64,
+                 plane as i64, is_inter as i64, band as i64,
+                 ctx as i64) as i64 {
+    let is i64 as n with mut = 0;
+    let is i64 as steps with mut = 0;
+    while (1) {
+        let is i64 as node = n >> 1;
+        let is i64 as prob = _token_prob(p, tx_sz, plane, is_inter, band,
+                                         ctx, node);
+        if (prob < 0) { return prob; }
+        let is i64 as bit = vb.vp9_bool_read(br, prob);
+        if (bit < 0) { return bit; }
+        let is i64 as nxt with mut = 0;
+        let is i64 as r = rt.vp9_token_tree(n + bit, &nxt);
+        if (r < 0) { return r; }
+        if (nxt <= 0) {
+            let is i64 as token = 0 - nxt;
+            if (token >= rt.VP9_TOKEN_COUNT) { return errno.I_CORRUPT; }
+            return token;
+        }
+        if (nxt > rt.VP9_RES_TREE_LEN - 2) { return errno.I_CORRUPT; }
+        n = nxt;
+        steps = steps + 1;
+        if (steps > 20) { return errno.I_CORRUPT; }
+    }
+}
+
+// read_coef (section 6.4.26) for the token just decoded. BitDepth is 8, so
+// the high_bit loop of DCT_VAL_CATEGORY6 runs zero times and is not written.
+fn _read_coef(br as *vb.Vp9Bool, token as i64) as i64 {
+    let is i64 as cat = rt.vp9_extra_bits(token, 0);
+    if (cat < 0) { return cat; }
+    let is i64 as num_extra = rt.vp9_extra_bits(token, 1);
+    if (num_extra < 0) { return num_extra; }
+    let is i64 as coef with mut = rt.vp9_extra_bits(token, 2);
+    if (coef < 0) { return coef; }
+    if (num_extra > rt.VP9_RES_CAT_COLS) { return errno.I_CORRUPT; }
+    if (num_extra > 0 && (cat < 1 || cat >= rt.VP9_RES_CAT_ROWS)) {
+        return errno.I_CORRUPT;
+    }
+    let is i64 as e with mut = 0;
+    while (e < num_extra) {
+        let is i64 as pp = rt.vp9_cat_prob(cat, e);
+        if (pp < 0) { return pp; }
+        let is i64 as bit = vb.vp9_bool_read(br, pp);
+        if (bit < 0) { return bit; }
+        coef = coef + (bit << (num_extra - 1 - e));
+        e = e + 1;
+    }
+    return coef;
+}
+
+// ── tokens (section 6.4.24) ─────────────────────────────────────────
+
+// Decode one transform block into raw Tokens.
+//
+//   plane      0..2
+//   tx_sz      TX_4X4..TX_32X32
+//   tx_type    TxType for the scan and neighbour selection; ignored (forced
+//              to DCT_DCT) for chroma and 32x32, as get_scan does
+//   is_inter   0 or 1, selects the coefficient probability set
+//   start_x/y  plane sample coordinates of the block's top-left corner
+//   cc         context arrays, prepared by vp9_coef_ctx_init
+//   tokens     caller array of at least 1024 i64; the block's n0*n0
+//              entries (n0 = 4 << tx_sz) are written in raster order
+//   nonzero    out: 0 when the first more_coefs was 0, else 1
+//
+// Returns I_OK, or a negative code. counts_token and counts_more_coefs are
+// updated at every read, as section 9.3.4 requires; the caller must not
+// count them again.
+fn vp9_tokens_decode(br as *vb.Vp9Bool, p as *t.Vp9ProbCtx,
+                     counts as *t.Vp9Counts, plane as i64, tx_sz as i64,
+                     tx_type as i64, is_inter as i64,
+                     start_x as i64, start_y as i64,
+                     cc as *Vp9CoefCtx, tokens as *i64,
+                     nonzero as *i64) as i64 {
+    if (cast(i64, br) == 0 || cast(i64, p) == 0 || cast(i64, counts) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (cast(i64, cc) == 0 || cast(i64, tokens) == 0
+        || cast(i64, nonzero) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (tx_sz < 0 || tx_sz > t.VP9_TX_32X32) { return errno.I_BADPARAM; }
+    if (tx_type < 0 || tx_type > rt.VP9_TX_TYPE_ADST_ADST) {
+        return errno.I_BADPARAM;
+    }
+    if (is_inter != 0 && is_inter != 1) { return errno.I_BADPARAM; }
+    if (start_x < 0 || start_y < 0) { return errno.I_BADPARAM; }
+    if (cast(i64, cc.above) == 0 || cast(i64, cc.left) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (cc.above_stride <= 0 || cc.left_stride <= 0) {
+        return errno.I_BADPARAM;
+    }
+    if (cc.max_x[plane] <= 0 || cc.max_x[plane] > cc.above_stride) {
+        return errno.I_BADPARAM;
+    }
+    if (cc.max_y[plane] <= 0 || cc.max_y[plane] > cc.left_stride) {
+        return errno.I_BADPARAM;
+    }
+    if ((start_x >> 2) >= cc.max_x[plane]
+        || (start_y >> 2) >= cc.max_y[plane]) {
+        return errno.I_BADPARAM;
+    }
+    if (rt.vp9_residual_tables_ready() == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as tx with mut = tx_type;
+    if (plane > 0 || tx_sz == t.VP9_TX_32X32) {
+        tx = rt.VP9_TX_TYPE_DCT_DCT;
+    }
+    let is i64 as seg_eob = 16 << (tx_sz << 1);
+    let is i64 as kind = rt.vp9_scan_kind(tx_sz, tx);
+    if (kind < 0) { return kind; }
+
+    let is i64 as pt with mut = 0;
+    if (plane > 0) { pt = 1; }
+    nonzero[0] = 0;
+
+    // TokenCache (9.3.2). The scan orders never read a neighbour that has
+    // not been decoded yet, but the cache is cleared so a corrupt scan
+    // table cannot make the context depend on a previous block.
+    let is [1024]u8 as cache;
+    let is i64 as z with mut = 0;
+    while (z < seg_eob) {
+        cache[z] = cast(u8, 0);
+        z = z + 1;
+    }
+
+    let is i64 as c with mut = 0;
+    let is i64 as check_eob with mut = 1;
+    while (c < seg_eob) {
+        let is i64 as pos = rt.vp9_scan_index(kind, c);
+        if (pos < 0) { return pos; }
+        if (pos >= seg_eob) { return errno.I_CORRUPT; }
+        let is i64 as band = rt.vp9_coef_band(tx_sz, c);
+        if (band < 0) { return band; }
+
+        let is i64 as ctx with mut = 0;
+        if (c == 0) {
+            ctx = _ctx_first(cc, plane, tx_sz, start_x, start_y);
+        } else {
+            ctx = _ctx_next(pos, tx_sz, tx, &cache[0]);
+        }
+        if (ctx < 0) { return ctx; }
+        if (ctx >= t.VP9_PREV_COEF_CONTEXTS) { return errno.I_CORRUPT; }
+
+        if (check_eob != 0) {
+            let is i64 as pp = _coef_prob(p, tx_sz, plane, is_inter, band,
+                                          ctx, 0);
+            if (pp < 0) { return pp; }
+            let is i64 as more = vb.vp9_bool_read(br, pp);
+            if (more < 0) { return more; }
+            if (more != 0) {
+                counts.more_coefs[tx_sz][pt][is_inter][band][ctx][1] = counts.more_coefs[tx_sz][pt][is_inter][band][ctx][1] + 1;
+            } else {
+                counts.more_coefs[tx_sz][pt][is_inter][band][ctx][0] = counts.more_coefs[tx_sz][pt][is_inter][band][ctx][0] + 1;
+                break;
+            }
+        }
+
+        let is i64 as token = _token_decode(br, p, tx_sz, plane, is_inter,
+                                            band, ctx);
+        if (token < 0) { return token; }
+        let is i64 as energy = rt.vp9_energy_class(token);
+        if (energy < 0) { return energy; }
+        cache[pos] = cast(u8, energy);
+        let is i64 as min2 with mut = 2;
+        if (token < 2) { min2 = token; }
+        counts.token[tx_sz][pt][is_inter][band][ctx][min2] = counts.token[tx_sz][pt][is_inter][band][ctx][min2] + 1;
+
+        if (token == rt.VP9_TOKEN_ZERO) {
+            tokens[pos] = 0;
+            check_eob = 0;
+        } else {
+            let is i64 as coef = _read_coef(br, token);
+            if (coef < 0) { return coef; }
+            let is i64 as sign = vb.vp9_bool_read_literal(br, 1);
+            if (sign < 0) { return sign; }
+            if (sign == 1) { tokens[pos] = 0 - coef; }
+            else { tokens[pos] = coef; }
+            check_eob = 1;
+        }
+        c = c + 1;
+    }
+
+    // Positions the loop did not reach are zero (section 6.4.24).
+    let is i64 as k with mut = c;
+    while (k < seg_eob) {
+        let is i64 as q = rt.vp9_scan_index(kind, k);
+        if (q < 0) { return q; }
+        tokens[q] = 0;
+        k = k + 1;
+    }
+
+    if (c > 0) { nonzero[0] = 1; }
+    return errno.I_OK;
+}
+
+// ── dequantization (sections 8.6.1 and 8.6.2) ───────────────────────
+
+// Dequantize one transform block.
+//
+//   tokens  n0*n0 entries in raster order (n0 = 4 << tx_sz), signed
+//   out     caller array of at least 1024 i64; n0*n0 entries are written,
+//           and out may be the same array as tokens
+//
+// Every coefficient is Tokens * quant / dqDenom with the DC quantizer at
+// raster index 0 and the AC quantizer elsewhere; dqDenom is 2 for 32x32 and
+// 1 otherwise. The division is by a positive power of two, and Caustic's
+// integer division truncates toward zero, which is what the two reference
+// decoders produce (they divide the magnitude and apply the sign after the
+// division). Section 8.6.2 requires the result to fit a signed 16-bit
+// integer for BitDepth 8; a larger value means the stream is not
+// conforming, so it is reported as I_CORRUPT rather than truncated.
+fn vp9_dequant(tokens as *i64, tx_sz as i64, plane as i64,
+               q as *Vp9Quant, out as *i64) as i64 {
+    if (cast(i64, tokens) == 0 || cast(i64, out) == 0
+        || cast(i64, q) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (tx_sz < 0 || tx_sz > t.VP9_TX_32X32) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (q.qindex < 0 || q.qindex > 255) { return errno.I_BADPARAM; }
+    if (rt.vp9_residual_tables_ready() == 0) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as dc with mut = 0;
+    let is i64 as ac with mut = 0;
+    if (plane == 0) {
+        dc = rt.vp9_dc_q(q.qindex + q.y_dc_delta);
+        ac = rt.vp9_ac_q(q.qindex);
+    } else {
+        dc = rt.vp9_dc_q(q.qindex + q.uv_dc_delta);
+        ac = rt.vp9_ac_q(q.qindex + q.uv_ac_delta);
+    }
+    if (dc < 0) { return dc; }
+    if (ac < 0) { return ac; }
+
+    let is i64 as denom with mut = 1;
+    if (tx_sz == t.VP9_TX_32X32) { denom = 2; }
+    let is i64 as n0 = 4 << tx_sz;
+    let is i64 as total = n0 * n0;
+
+    // Index 0 first, so out may alias tokens.
+    let is i64 as d0 = (tokens[0] * dc) / denom;
+    if (d0 < 0 - 32768 || d0 > 32767) { return errno.I_CORRUPT; }
+    out[0] = d0;
+
+    let is i64 as i with mut = 1;
+    while (i < total) {
+        let is i64 as v = (tokens[i] * ac) / denom;
+        if (v < 0 - 32768 || v > 32767) { return errno.I_CORRUPT; }
+        out[i] = v;
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// ── one call for one transform block ────────────────────────────────
+
+// Decode and dequantize in one step: the residual() call the block decoder
+// makes for every transform block of every plane. `out` is the caller's
+// 1024-element i64 buffer; the block's n0*n0 entries come back in raster
+// order and the raw Tokens of the block are not preserved. `nonzero` is the
+// value residual() writes into the Above and Left nonzero contexts for the
+// block's 4x4 columns and rows.
+fn vp9_residual_decode(br as *vb.Vp9Bool, p as *t.Vp9ProbCtx,
+                       counts as *t.Vp9Counts, q as *Vp9Quant,
+                       plane as i64, tx_sz as i64, tx_type as i64,
+                       is_inter as i64, start_x as i64, start_y as i64,
+                       cc as *Vp9CoefCtx, out as *i64,
+                       nonzero as *i64) as i64 {
+    let is i64 as r = vp9_tokens_decode(br, p, counts, plane, tx_sz, tx_type,
+                                        is_inter, start_x, start_y, cc,
+                                        out, nonzero);
+    if (r < 0) { return r; }
+    return vp9_dequant(out, tx_sz, plane, q, out);
+}

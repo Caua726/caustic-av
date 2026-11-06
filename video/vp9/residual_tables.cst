@@ -1,0 +1,270 @@
+// =======================================================
+// caustic-av/video/vp9/residual_tables.cst
+// The residual tables of the VP9 specification and the accessors the
+// residual decoder uses.
+//
+// Fixed values (scan orders 10.1, coefficient bands 10.1, token tree and
+// energy classes 9.3.2, extra bits and category probabilities 6.4.24,
+// pareto table 10.3, mode-to-transform map 10.2, quantizer lookups 8.6.1)
+// are not written here as arrays: the language has no array initialisers.
+// They live in residual_tables_data.cst as byte blobs produced by
+// tools/gen_vp9_residual_tables.py from the specification text, exactly as
+// the stage-3 probability tables do. Until that file is generated the blobs
+// are empty and every accessor below returns I_UNSUPPORTED; nothing here
+// otherwise touches memory outside a blob.
+//
+// Widths: scans and quantizer lookups are 16-bit little-endian values
+// (a 32x32 scan index reaches 1023 and ac_q reaches 1828); bands, energy
+// classes, extra bits, category probabilities and pareto values are one
+// byte; the token tree is one signed byte.
+//
+// Every accessor returns a non-negative value on success and a negative
+// status otherwise, so a value of 0 (a legal scan index, band or token) is
+// never confused with an error. The one signed table, the token tree, uses
+// vp9_token_tree() with an output parameter instead.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "vp9_tables.cst" as t;
+use "residual_tables_data.cst" as rd;
+
+// ── blob layout (fixed with tools/gen_vp9_residual_tables.py) ───────
+
+// Scan orders, 16-bit elements, in the order the specification prints them.
+let is i64 as VP9_RES_SCAN_DEFAULT_4X4  with imut = 0;
+let is i64 as VP9_RES_SCAN_COL_4X4      with imut = 16;
+let is i64 as VP9_RES_SCAN_ROW_4X4      with imut = 32;
+let is i64 as VP9_RES_SCAN_DEFAULT_8X8  with imut = 48;
+let is i64 as VP9_RES_SCAN_COL_8X8      with imut = 112;
+let is i64 as VP9_RES_SCAN_ROW_8X8      with imut = 176;
+let is i64 as VP9_RES_SCAN_DEFAULT_16X16 with imut = 240;
+let is i64 as VP9_RES_SCAN_COL_16X16    with imut = 496;
+let is i64 as VP9_RES_SCAN_ROW_16X16    with imut = 752;
+let is i64 as VP9_RES_SCAN_DEFAULT_32X32 with imut = 1008;
+
+let is i64 as VP9_RES_SCAN_ELEMS      with imut = 2032;
+let is i64 as VP9_RES_BAND_ELEMS      with imut = 1040;
+
+// Byte offsets inside VP9_TBL_RES_TOKENS.
+let is i64 as VP9_RES_TOK_TREE        with imut = 0;     // 20
+let is i64 as VP9_RES_TOK_ENERGY      with imut = 20;    // 12
+let is i64 as VP9_RES_TOK_EXTRA       with imut = 32;    // 33
+let is i64 as VP9_RES_TOK_CAT         with imut = 65;    // 98
+let is i64 as VP9_RES_TOK_PARETO      with imut = 163;   // 1024
+let is i64 as VP9_RES_TOK_TXFM        with imut = 1187;  // 14
+
+// Elements per table.
+let is i64 as VP9_RES_TREE_LEN        with imut = 20;
+let is i64 as VP9_RES_PARETO_ROWS     with imut = 128;
+let is i64 as VP9_RES_PARETO_COLS     with imut = 8;
+let is i64 as VP9_RES_EXTRA_COLS      with imut = 3;
+let is i64 as VP9_RES_CAT_ROWS        with imut = 7;
+let is i64 as VP9_RES_CAT_COLS        with imut = 14;
+let is i64 as VP9_RES_MODE_COUNT      with imut = 14;
+let is i64 as VP9_RES_MAX_COEFS       with imut = 1024;
+
+// ── scan kinds and transform types ──────────────────────────────────
+
+// get_scan() selects one of ten orders (section 6.4.25). The numbering is
+// a group of three per transform size (default, column, row) except 32x32,
+// which always uses the default scan.
+let is i64 as VP9_SCAN_DEFAULT_4X4   with imut = 0;
+let is i64 as VP9_SCAN_COL_4X4       with imut = 1;
+let is i64 as VP9_SCAN_ROW_4X4       with imut = 2;
+let is i64 as VP9_SCAN_DEFAULT_8X8   with imut = 3;
+let is i64 as VP9_SCAN_COL_8X8       with imut = 4;
+let is i64 as VP9_SCAN_ROW_8X8       with imut = 5;
+let is i64 as VP9_SCAN_DEFAULT_16X16 with imut = 6;
+let is i64 as VP9_SCAN_COL_16X16     with imut = 7;
+let is i64 as VP9_SCAN_ROW_16X16     with imut = 8;
+let is i64 as VP9_SCAN_DEFAULT_32X32 with imut = 9;
+
+// TxType (section 6.4.25 / 10.2). The numeric order is the one the
+// specification's mode2txfm_map prints.
+let is i64 as VP9_TX_TYPE_DCT_DCT    with imut = 0;
+let is i64 as VP9_TX_TYPE_ADST_DCT   with imut = 1;
+let is i64 as VP9_TX_TYPE_DCT_ADST   with imut = 2;
+let is i64 as VP9_TX_TYPE_ADST_ADST  with imut = 3;
+
+// Token values of section 7.4.16.
+let is i64 as VP9_TOKEN_ZERO         with imut = 0;
+let is i64 as VP9_TOKEN_COUNT        with imut = 11;
+
+// ── blob helpers ────────────────────────────────────────────────────
+
+fn _u8_at(base as *u8, off as i64) as i64 {
+    return cast(i64, base[off]);
+}
+
+// One signed byte, two's complement (the token tree stores -10..18).
+fn _i8_at(base as *u8, off as i64) as i64 {
+    let is i64 as v with mut = cast(i64, base[off]);
+    if (v >= 128) { v = v - 256; }
+    return v;
+}
+
+// One 16-bit little-endian value at byte offset off.
+fn _u16_at(base as *u8, off as i64) as i64 {
+    return cast(i64, base[off]) | (cast(i64, base[off + 1]) << 8);
+}
+
+// 1 once tools/gen_vp9_residual_tables.py has written the blobs.
+fn vp9_residual_tables_ready() as i64 {
+    return rd.VP9_RESIDUAL_TABLES_GENERATED;
+}
+
+// ── scans and bands ─────────────────────────────────────────────────
+
+fn vp9_scan_kind(tx_sz as i64, tx_type as i64) as i64 {
+    if (tx_sz < 0 || tx_sz > t.VP9_TX_32X32) { return errno.I_BADPARAM; }
+    if (tx_sz == t.VP9_TX_32X32) { return VP9_SCAN_DEFAULT_32X32; }
+    if (tx_type < 0 || tx_type > VP9_TX_TYPE_ADST_ADST) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as base = tx_sz * 3;
+    if (tx_type == VP9_TX_TYPE_ADST_DCT) { return base + 2; }
+    if (tx_type == VP9_TX_TYPE_DCT_ADST) { return base + 1; }
+    return base;
+}
+
+fn vp9_scan_len(kind as i64) as i64 {
+    if (kind < 0 || kind > VP9_SCAN_DEFAULT_32X32) {
+        return errno.I_BADPARAM;
+    }
+    if (kind <= VP9_SCAN_ROW_4X4) { return 16; }
+    if (kind <= VP9_SCAN_ROW_8X8) { return 64; }
+    if (kind <= VP9_SCAN_ROW_16X16) { return 256; }
+    return 1024;
+}
+
+// Element offset of a scan inside VP9_TBL_RES_SCAN.
+fn _scan_off(kind as i64) as i64 {
+    if (kind == VP9_SCAN_DEFAULT_4X4) { return VP9_RES_SCAN_DEFAULT_4X4; }
+    if (kind == VP9_SCAN_COL_4X4) { return VP9_RES_SCAN_COL_4X4; }
+    if (kind == VP9_SCAN_ROW_4X4) { return VP9_RES_SCAN_ROW_4X4; }
+    if (kind == VP9_SCAN_DEFAULT_8X8) { return VP9_RES_SCAN_DEFAULT_8X8; }
+    if (kind == VP9_SCAN_COL_8X8) { return VP9_RES_SCAN_COL_8X8; }
+    if (kind == VP9_SCAN_ROW_8X8) { return VP9_RES_SCAN_ROW_8X8; }
+    if (kind == VP9_SCAN_DEFAULT_16X16) {
+        return VP9_RES_SCAN_DEFAULT_16X16;
+    }
+    if (kind == VP9_SCAN_COL_16X16) { return VP9_RES_SCAN_COL_16X16; }
+    if (kind == VP9_SCAN_ROW_16X16) { return VP9_RES_SCAN_ROW_16X16; }
+    return VP9_RES_SCAN_DEFAULT_32X32;
+}
+
+// scan[c]: the raster position of the c-th coefficient in scan order.
+fn vp9_scan_index(kind as i64, c as i64) as i64 {
+    let is i64 as len = vp9_scan_len(kind);
+    if (len < 0) { return len; }
+    if (c < 0 || c >= len) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as off = _scan_off(kind) + c;
+    if (off < 0 || off >= VP9_RES_SCAN_ELEMS) { return errno.I_CORRUPT; }
+    return _u16_at(rd.VP9_TBL_RES_SCAN, 2 * off);
+}
+
+// coefband for scan index c: coefband_4x4 for 4x4, coefband_8x8plus above.
+fn vp9_coef_band(tx_sz as i64, c as i64) as i64 {
+    if (tx_sz < 0 || tx_sz > t.VP9_TX_32X32) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as off with mut = 0;
+    if (tx_sz == t.VP9_TX_4X4) {
+        if (c < 0 || c >= 16) { return errno.I_BADPARAM; }
+        off = c;
+    } else {
+        if (c < 0 || c >= VP9_RES_MAX_COEFS) { return errno.I_BADPARAM; }
+        off = 16 + c;
+    }
+    if (off < 0 || off >= VP9_RES_BAND_ELEMS) { return errno.I_CORRUPT; }
+    let is i64 as band = _u8_at(rd.VP9_TBL_RES_BAND, off);
+    if (band < 0 || band >= t.VP9_COEF_BANDS) { return errno.I_CORRUPT; }
+    return band;
+}
+
+// ── token tables ────────────────────────────────────────────────────
+
+// energy_class[token], the value stored in TokenCache (sections 6.4.24 and
+// 10.1).
+fn vp9_energy_class(token as i64) as i64 {
+    if (token < 0 || token >= VP9_TOKEN_COUNT) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as v = _u8_at(rd.VP9_TBL_RES_TOKENS,
+                             VP9_RES_TOK_ENERGY + token);
+    if (v < 0 || v >= t.VP9_PREV_COEF_CONTEXTS) { return errno.I_CORRUPT; }
+    return v;
+}
+
+// token_tree[n]: a positive value is the next node, a value <= 0 is the
+// negated token (section 9.3.2). Negative values are real output, so the
+// status is returned separately.
+fn vp9_token_tree(n as i64, out as *i64) as i64 {
+    if (cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (n < 0 || n >= VP9_RES_TREE_LEN) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    out[0] = _i8_at(rd.VP9_TBL_RES_TOKENS, VP9_RES_TOK_TREE + n);
+    return errno.I_OK;
+}
+
+// extra_bits[token][col]: col 0 is the category, 1 the number of extra
+// bits, 2 the value the extra bits are added to (section 6.4.24).
+fn vp9_extra_bits(token as i64, col as i64) as i64 {
+    if (token < 0 || token >= VP9_TOKEN_COUNT) { return errno.I_BADPARAM; }
+    if (col < 0 || col >= VP9_RES_EXTRA_COLS) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    return _u8_at(rd.VP9_TBL_RES_TOKENS,
+                  VP9_RES_TOK_EXTRA + token * VP9_RES_EXTRA_COLS + col);
+}
+
+// cat_probs[cat][e], the probability of one extra coefficient bit.
+fn vp9_cat_prob(cat as i64, e as i64) as i64 {
+    if (cat < 1 || cat >= VP9_RES_CAT_ROWS) { return errno.I_BADPARAM; }
+    if (e < 0 || e >= VP9_RES_CAT_COLS) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as v = _u8_at(rd.VP9_TBL_RES_TOKENS,
+                             VP9_RES_TOK_CAT + cat * VP9_RES_CAT_COLS + e);
+    if (v < 1 || v > 255) { return errno.I_CORRUPT; }
+    return v;
+}
+
+// pareto_table[row][col] (section 10.3).
+fn vp9_pareto(row as i64, col as i64) as i64 {
+    if (row < 0 || row >= VP9_RES_PARETO_ROWS) { return errno.I_BADPARAM; }
+    if (col < 0 || col >= VP9_RES_PARETO_COLS) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as v = _u8_at(rd.VP9_TBL_RES_TOKENS,
+                             VP9_RES_TOK_PARETO
+                             + row * VP9_RES_PARETO_COLS + col);
+    if (v < 0 || v > 255) { return errno.I_CORRUPT; }
+    return v;
+}
+
+// mode2txfm_map[mode] (section 10.2).
+fn vp9_mode2txfm(mode as i64) as i64 {
+    if (mode < 0 || mode >= VP9_RES_MODE_COUNT) { return errno.I_BADPARAM; }
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as v = _u8_at(rd.VP9_TBL_RES_TOKENS,
+                             VP9_RES_TOK_TXFM + mode);
+    if (v < 0 || v > VP9_TX_TYPE_ADST_ADST) { return errno.I_CORRUPT; }
+    return v;
+}
+
+// ── quantizer lookups (section 8.6.1) ───────────────────────────────
+
+// dc_q(b) for BitDepth 8: dc_qlookup[0][Clip3(0, 255, b)].
+fn vp9_dc_q(b as i64) as i64 {
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as i with mut = b;
+    if (i < 0) { i = 0; }
+    if (i > 255) { i = 255; }
+    return _u16_at(rd.VP9_TBL_RES_QUANT, 2 * i);
+}
+
+// ac_q(b) for BitDepth 8: ac_qlookup[0][Clip3(0, 255, b)].
+fn vp9_ac_q(b as i64) as i64 {
+    if (rd.VP9_RESIDUAL_TABLES_GENERATED == 0) { return errno.I_UNSUPPORTED; }
+    let is i64 as i with mut = b;
+    if (i < 0) { i = 0; }
+    if (i > 255) { i = 255; }
+    return _u16_at(rd.VP9_TBL_RES_QUANT, 2 * (256 + i));
+}

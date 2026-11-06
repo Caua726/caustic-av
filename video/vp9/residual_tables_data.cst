@@ -1,0 +1,72 @@
+// =======================================================
+// caustic-av/video/vp9/residual_tables_data.cst
+// Byte blobs for the VP9 residual tables: scan orders, coefficient bands,
+// the token tables and the profile-0 quantizer lookups.
+//
+// PENDING. The blobs below are empty and VP9_RESIDUAL_TABLES_GENERATED is 0,
+// so vp9_residual_tables_ready() reports 0 and every accessor in
+// residual_tables.cst returns I_UNSUPPORTED. Tile decoding must not run
+// until the blobs exist. The header parser (stage 3) is unaffected.
+//
+// Generate the blobs from the specification text with
+//
+//   python3 tools/gen_vp9_residual_tables.py --spec <path to clean.txt> \
+//       -o video/vp9/residual_tables_data.cst
+//
+// The generator validates every table's declared size and value range,
+// checks that each scan order is a permutation of its transform size, and
+// writes this file with VP9_RESIDUAL_TABLES_GENERATED = 1.
+//
+// Layout (fixed; residual_tables.cst unpacks it in the same order):
+//
+//   VP9_TBL_RES_SCAN     10 scans, each element a 16-bit little-endian
+//                        value, concatenated in this order:
+//                          default_scan_4x4      16
+//                          col_scan_4x4          16
+//                          row_scan_4x4          16
+//                          default_scan_8x8      64
+//                          col_scan_8x8          64
+//                          row_scan_8x8          64
+//                          default_scan_16x16   256
+//                          col_scan_16x16       256
+//                          row_scan_16x16       256
+//                          default_scan_32x32  1024
+//                        = 2032 elements, 4064 bytes
+//   VP9_TBL_RES_BAND     coefband_4x4        16 one-byte values
+//                        coefband_8x8plus  1024 one-byte values
+//                        = 1040 bytes
+//   VP9_TBL_RES_TOKENS   token_tree            20 signed bytes (two's
+//                                              complement, -10..18)
+//                        energy_class          12
+//                        extra_bits            33   (11 tokens x 3)
+//                        cat_probs             98   (7 cats x 14)
+//                        pareto_table        1024   (128 rows x 8)
+//                        mode2txfm_map         14
+//                        = 1201 bytes
+//   VP9_TBL_RES_QUANT    dc_qlookup row 0    256 16-bit little-endian
+//                        ac_qlookup row 0    256 16-bit little-endian
+//                        = 512 elements, 1024 bytes
+//
+// Values are written from specification sections 6.2.7, 6.4.24, 6.4.25,
+// 8.6.1, 9.3.2, 10.1, 10.2, 10.3 and 10.5; no value here is invented.
+// Only the first qlookup row is emitted because the decoder accepts profile
+// 0 only, where BitDepth is 8 and (BitDepth-8)>>1 is 0.
+// =======================================================
+
+// 0 until tools/gen_vp9_residual_tables.py has produced the blobs.
+let is i64 as VP9_RESIDUAL_TABLES_GENERATED with imut = 0;
+
+// PENDING: scan orders (spec 10.1), 2032 16-bit values.
+let is *u8 as VP9_TBL_RES_SCAN with imut = "";
+
+// PENDING: coefficient band maps (spec 10.1), 1040 bytes.
+let is *u8 as VP9_TBL_RES_BAND with imut = "";
+
+// PENDING: token tree, energy classes, extra bits, category probabilities,
+// pareto table and mode-to-transform map (spec 9.3.2, 10.2, 10.3),
+// 1201 bytes.
+let is *u8 as VP9_TBL_RES_TOKENS with imut = "";
+
+// PENDING: dc_qlookup[0] then ac_qlookup[0] (spec 8.6.1), 512 16-bit
+// values.
+let is *u8 as VP9_TBL_RES_QUANT with imut = "";

@@ -13,12 +13,9 @@
 //
 // Block/transform geometry
 // ------------------------
-// The helpers below are the tables of specification section 10.2. They are
-// written here, as conditionals over the 13 block sizes, because
-// recon_tables.cst's recon_num_8x8_wide/high and recon_max_txsize do not
-// match section 10.2 for every size (see decode.md, "Temporary local
-// tables"). When that is fixed, these can be replaced by the recon helpers
-// and recon_uv_tx_size.
+// recon_tables.cst carries the section 10.2 tables (8x8 and 4x4 units,
+// max_txsize_lookup) and get_uv_tx_size. This module adds only the
+// partition subsize table and a log2 of a count, derived from those tables.
 //
 // Coefficient contexts
 // --------------------
@@ -26,20 +23,18 @@
 // sized for the whole frame by decode.cst; this module clears them at the
 // points section 7.4.1/7.4.2 specify (above once per frame, left once per
 // 8x8 row) and updates them after every transform block of section 6.4.21.
+// Writes past the plane's 4x4 limits are dropped: every read clamps to the
+// same limits, so the dropped entries are never observed.
 //
 // Partial blocks at the frame edge
 // --------------------------------
-// A partition is allowed to produce a block that starts inside the coded
-// frame and ends past MiCols*8 / MiRows*8. Section 6.4.21 still decodes every
-// transform block whose top-left corner is inside the plane, and section
-// 8.5.1 clamps the above/left samples it reads to maxX/maxY. pred_intra
-// rejects such a block because it requires the whole block inside max_x /
-// max_y, so _predict_clipped builds the same above/left arrays with the
-// section 8.5.1 clamps, calls pred_intra on a temporary plane, and copies
-// only the on-screen part into the frame. That keeps writes inside the
-// caller's surface and the prediction identical to the specification. This
-// fallback goes away with the pred_intra interface fix recorded in
-// decode.md.
+// A partition may produce a block that starts inside the coded frame and
+// ends past MiCols*8 / MiRows*8. Section 6.4.21 decodes every transform
+// block whose top-left corner is inside the plane, and 8.5.1 clamps the
+// above/left samples it reads to maxX/maxY while writing the whole block.
+// pred_intra implements exactly that, so the caller's planes must carry at
+// least size-1 padded samples right and below (decode.cst rounds the coded
+// size up to 64 and adds one 64-sample band).
 // =======================================================
 
 use "../../core/errno.cst" as errno;
@@ -60,142 +55,7 @@ let is i64 as PART_SPLIT with imut = 3;
 
 let is i64 as BLK_INVALID with imut = 0 - 1;
 
-// Temporary prediction plane: a 32x32 block plus one row/column of edges,
-// with room for the 2*size above row (64 entries) after aboveRow[-1].
-let is i64 as BLK_TMP_STRIDE with imut = 65;
-let is i64 as BLK_TMP_BYTES  with imut = 33 * 65;
-
-// ── section 10.2 block geometry ─────────────────────────────────────
-
-// num_8x8_blocks_wide_lookup.
-fn blk_num8_wide(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs == rt.BLOCK_4X4 || bs == rt.BLOCK_4X8 || bs == rt.BLOCK_8X4
-        || bs == rt.BLOCK_8X8 || bs == rt.BLOCK_8X16) { return 1; }
-    if (bs == rt.BLOCK_16X8 || bs == rt.BLOCK_16X16 || bs == rt.BLOCK_16X32) {
-        return 2;
-    }
-    if (bs == rt.BLOCK_32X16 || bs == rt.BLOCK_32X32 || bs == rt.BLOCK_32X64) {
-        return 4;
-    }
-    return 8;
-}
-
-// num_8x8_blocks_high_lookup.
-fn blk_num8_high(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs == rt.BLOCK_4X4 || bs == rt.BLOCK_4X8 || bs == rt.BLOCK_8X4
-        || bs == rt.BLOCK_8X8) { return 1; }
-    if (bs == rt.BLOCK_8X16 || bs == rt.BLOCK_16X16
-        || bs == rt.BLOCK_32X16) { return 2; }
-    if (bs == rt.BLOCK_16X8) { return 1; }
-    if (bs == rt.BLOCK_16X32 || bs == rt.BLOCK_32X32
-        || bs == rt.BLOCK_64X32) { return 4; }
-    if (bs == rt.BLOCK_32X64) { return 8; }
-    return 8;   // BLOCK_64X64
-}
-
-// num_4x4_blocks_wide_lookup.
-fn blk_num4_wide(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs == rt.BLOCK_4X4 || bs == rt.BLOCK_4X8) { return 1; }
-    if (bs == rt.BLOCK_8X4 || bs == rt.BLOCK_8X8 || bs == rt.BLOCK_8X16) {
-        return 2;
-    }
-    if (bs == rt.BLOCK_16X8 || bs == rt.BLOCK_16X16 || bs == rt.BLOCK_16X32) {
-        return 4;
-    }
-    if (bs == rt.BLOCK_32X16 || bs == rt.BLOCK_32X32 || bs == rt.BLOCK_32X64) {
-        return 8;
-    }
-    return 16;
-}
-
-// num_4x4_blocks_high_lookup.
-fn blk_num4_high(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs == rt.BLOCK_4X4 || bs == rt.BLOCK_8X4) { return 1; }
-    if (bs == rt.BLOCK_4X8 || bs == rt.BLOCK_8X8 || bs == rt.BLOCK_16X8) {
-        return 2;
-    }
-    if (bs == rt.BLOCK_8X16 || bs == rt.BLOCK_16X16 || bs == rt.BLOCK_32X16) {
-        return 4;
-    }
-    if (bs == rt.BLOCK_16X32 || bs == rt.BLOCK_32X32 || bs == rt.BLOCK_64X32) {
-        return 8;
-    }
-    return 16;
-}
-
-// b_width_log2_lookup (in 4x4 units).
-fn blk_bw_log2(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs == rt.BLOCK_4X4 || bs == rt.BLOCK_4X8) { return 0; }
-    if (bs == rt.BLOCK_8X4 || bs == rt.BLOCK_8X8 || bs == rt.BLOCK_8X16) {
-        return 1;
-    }
-    if (bs == rt.BLOCK_16X8 || bs == rt.BLOCK_16X16 || bs == rt.BLOCK_16X32) {
-        return 2;
-    }
-    if (bs == rt.BLOCK_32X16 || bs == rt.BLOCK_32X32 || bs == rt.BLOCK_32X64) {
-        return 3;
-    }
-    return 4;
-}
-
-// b_height_log2_lookup (in 4x4 units).
-fn blk_bh_log2(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs == rt.BLOCK_4X4 || bs == rt.BLOCK_8X4) { return 0; }
-    if (bs == rt.BLOCK_4X8 || bs == rt.BLOCK_8X8 || bs == rt.BLOCK_16X8) {
-        return 1;
-    }
-    if (bs == rt.BLOCK_8X16 || bs == rt.BLOCK_16X16 || bs == rt.BLOCK_32X16) {
-        return 2;
-    }
-    if (bs == rt.BLOCK_16X32 || bs == rt.BLOCK_32X32 || bs == rt.BLOCK_64X32) {
-        return 3;
-    }
-    return 4;
-}
-
-// mi_width_log2_lookup (in 8x8 units).
-fn blk_mi_width_log2(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs <= rt.BLOCK_8X16) { return 0; }
-    if (bs <= rt.BLOCK_16X32) { return 1; }
-    if (bs <= rt.BLOCK_32X64) { return 2; }
-    return 3;
-}
-
-// mi_height_log2_lookup (in 8x8 units).
-fn blk_mi_height_log2(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs <= rt.BLOCK_8X8) { return 0; }
-    if (bs == rt.BLOCK_8X16 || bs == rt.BLOCK_16X16
-        || bs == rt.BLOCK_32X16) { return 1; }
-    if (bs == rt.BLOCK_16X32 || bs == rt.BLOCK_32X32
-        || bs == rt.BLOCK_64X32) { return 2; }
-    return 3;
-}
-
-// size_group_lookup.
-fn blk_size_group(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs <= rt.BLOCK_8X4) { return 0; }
-    if (bs <= rt.BLOCK_16X8) { return 1; }
-    if (bs <= rt.BLOCK_32X16) { return 2; }
-    return 3;
-}
-
-// max_txsize_lookup.
-fn blk_max_tx(bs as i64) as i64 {
-    if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return BLK_INVALID; }
-    if (bs <= rt.BLOCK_8X4) { return rt.TX_4X4; }
-    if (bs <= rt.BLOCK_16X8) { return rt.TX_8X8; }
-    if (bs <= rt.BLOCK_32X16) { return rt.TX_16X16; }
-    return rt.TX_32X32;
-}
+// ── block geometry helpers not carried by recon_tables.cst ──────────
 
 // subsize_lookup[partition][bsize] (section 10.2). Only square block sizes
 // reach decode_partition; the rectangular cases are included because the
@@ -225,29 +85,30 @@ fn blk_subsize(part as i64, bs as i64) as i64 {
     return BLK_INVALID;
 }
 
-// get_plane_block_size (section 6.4.23) for the frame's subsampling. The
-// luma block is already the residual() bsize, i.e. at least BLOCK_8X8.
-fn blk_plane_size(bs as i64, subx as i64, suby as i64) as i64 {
-    if (bs < rt.BLOCK_8X8) { return BLK_INVALID; }
-    let is i64 as w with mut = blk_num4_wide(bs);
-    let is i64 as h with mut = blk_num4_high(bs);
-    if (w <= 0 || h <= 0) { return BLK_INVALID; }
-    w = w >> subx;
-    h = h >> suby;
-    if (w < 1) { w = 1; }
-    if (h < 1) { h = 1; }
-    return rt.recon_block_from_units(w, h);
+// log2 of a 4x4/8x8 count (1, 2, 4, 8, 16). b_width_log2/b_height_log2 and
+// mi_width_log2 are derived from the spec tables in recon_tables.cst, so no
+// second copy of those tables is carried here.
+fn blk_log2(v as i64) as i64 {
+    if (v == 1) { return 0; }
+    if (v == 2) { return 1; }
+    if (v == 4) { return 2; }
+    if (v == 8) { return 3; }
+    if (v == 16) { return 4; }
+    return BLK_INVALID;
 }
 
-// get_uv_tx_size (section 6.4.22), computed with the local max_txsize table.
-fn blk_uv_tx_size(bs as i64, tx_sz as i64, subx as i64, suby as i64) as i64 {
-    if (bs < rt.BLOCK_8X8) { return rt.TX_4X4; }
-    let is i64 as pbs = blk_plane_size(bs, subx, suby);
-    if (pbs < 0) { return pbs; }
-    let is i64 as mx = blk_max_tx(pbs);
-    if (mx < 0) { return mx; }
-    if (tx_sz < mx) { return tx_sz; }
-    return mx;
+// get_plane_block_size (section 6.4.23) for the frame's subsampling. The
+// luma block is already residual()'s bsize, i.e. at least BLOCK_8X8.
+fn blk_plane_size(bs as i64, subx as i64, suby as i64) as i64 {
+    if (bs < rt.BLOCK_8X8) { return BLK_INVALID; }
+    let is i64 as w = rt.recon_num_4x4_wide(bs);
+    let is i64 as h = rt.recon_num_4x4_high(bs);
+    if (w < 1 || h < 1) { return BLK_INVALID; }
+    let is i64 as pw with mut = w >> subx;
+    let is i64 as ph with mut = h >> suby;
+    if (pw < 1) { pw = 1; }
+    if (ph < 1) { ph = 1; }
+    return rt.recon_block_from_units(pw, ph);
 }
 
 // ── frame-level block context ───────────────────────────────────────
@@ -290,7 +151,6 @@ struct Vp9Blk {
 
     cc as *res.Vp9CoefCtx;
     coef as *i64;
-    tmp as *u8;
 }
 
 fn _zero(p as *u8, n as i64) as void {
@@ -395,7 +255,7 @@ fn _read_segment_id(br as *vb.Vp9Bool, probs as *u8) as i64 {
 // section 9.3.2. Counts are updated at the point the syntax element is read.
 fn _read_tx_size(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64,
                  bs as i64, allow_select as i64) as i64 {
-    let is i64 as max_tx = blk_max_tx(bs);
+    let is i64 as max_tx = rt.recon_max_txsize(bs);
     if (max_tx < 0) { return errno.I_CORRUPT; }
     if (max_tx > rt.TX_32X32) { return errno.I_CORRUPT; }
 
@@ -514,8 +374,8 @@ fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
         sm[2] = cast(u8, ym);
         sm[3] = cast(u8, ym);
     } else {
-        let is i64 as n4w = blk_num4_wide(bs);
-        let is i64 as n4h = blk_num4_high(bs);
+        let is i64 as n4w = rt.recon_num_4x4_wide(bs);
+        let is i64 as n4h = rt.recon_num_4x4_high(bs);
         if (n4w < 1 || n4h < 1) { return errno.I_CORRUPT; }
         let is i64 as idy with mut = 0;
         while (idy < 2) {
@@ -568,119 +428,6 @@ fn _mode_info(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
 
 // ── prediction ──────────────────────────────────────────────────────
 
-// Section 8.5.1 prediction for a transform block that ends past maxX/maxY.
-// The above/left arrays are built with the specification's Min(maxX,..)
-// clamps, placed in the temporary plane `tmp` (aboveRow[-1] at [0],
-// aboveRow[i] at [1+i], leftCol[i] at [(1+i)*BLK_TMP_STRIDE]), and pred_intra
-// is invoked on that plane at (1,1) so the prediction arithmetic stays in
-// predict.cst. Only samples in 0..max_x-1 x 0..max_y-1 are copied back.
-fn _predict_clipped(plane as *u8, stride as i64, x as i64, y as i64,
-                    tx_sz as i64, mode as i64, have_left as i64,
-                    have_above as i64, not_right as i64,
-                    max_x as i64, max_y as i64, tmp as *u8) as i64 {
-    if (cast(i64, plane) == 0 || cast(i64, tmp) == 0) { return errno.I_BADPARAM; }
-    if (tx_sz < rt.TX_4X4 || tx_sz > rt.TX_32X32) { return errno.I_BADPARAM; }
-    if (max_x <= 0 || max_y <= 0) { return errno.I_BADPARAM; }
-    if (x < 0 || y < 0 || x >= max_x || y >= max_y) { return errno.I_BADPARAM; }
-    if (have_left == 1 && x <= 0) { return errno.I_BADPARAM; }
-    if (have_above == 1 && y <= 0) { return errno.I_BADPARAM; }
-
-    let is i64 as size = 4 << tx_sz;
-    let is i64 as maxx = max_x - 1;
-    let is i64 as maxy = max_y - 1;
-
-    if (have_above == 1) {
-        let is i64 as k with mut = 0;
-        while (k < size) {
-            let is i64 as xx with mut = x + k;
-            if (xx > maxx) { xx = maxx; }
-            tmp[1 + k] = plane[(y - 1) * stride + xx];
-            k = k + 1;
-        }
-        k = size;
-        while (k < 2 * size) {
-            if (not_right == 1 && tx_sz == rt.TX_4X4) {
-                let is i64 as xx with mut = x + k;
-                if (xx > maxx) { xx = maxx; }
-                tmp[1 + k] = plane[(y - 1) * stride + xx];
-            } else {
-                tmp[1 + k] = tmp[1 + size - 1];
-            }
-            k = k + 1;
-        }
-        if (have_left == 1) {
-            tmp[0] = plane[(y - 1) * stride + (x - 1)];
-        } else {
-            tmp[0] = cast(u8, 129);
-        }
-    } else {
-        let is i64 as k with mut = 0;
-        while (k < 2 * size) { tmp[1 + k] = cast(u8, 127); k = k + 1; }
-        tmp[0] = cast(u8, 127);
-    }
-
-    if (have_left == 1) {
-        let is i64 as i with mut = 0;
-        while (i < size) {
-            let is i64 as yy with mut = y + i;
-            if (yy > maxy) { yy = maxy; }
-            tmp[(1 + i) * BLK_TMP_STRIDE] = plane[yy * stride + (x - 1)];
-            i = i + 1;
-        }
-    } else {
-        let is i64 as i with mut = 0;
-        while (i < size) {
-            tmp[(1 + i) * BLK_TMP_STRIDE] = cast(u8, 129);
-            i = i + 1;
-        }
-    }
-
-    let is pred.IntraEdge as e;
-    e.have_left = have_left;
-    e.have_above = have_above;
-    e.not_on_right = not_right;
-    e.max_x = 2 * size;
-    e.max_y = size;
-    let is i64 as st = pred.pred_intra(tmp, BLK_TMP_STRIDE, 1, 1,
-                                       tx_sz, mode, &e);
-    if (st < 0) { return st; }
-
-    let is i64 as i with mut = 0;
-    while (i < size) {
-        let is i64 as yy = y + i;
-        if (yy >= max_y) { break; }
-        let is i64 as j with mut = 0;
-        while (j < size) {
-            let is i64 as xx = x + j;
-            if (xx >= max_x) { break; }
-            plane[yy * stride + xx] = tmp[(1 + i) * BLK_TMP_STRIDE + 1 + j];
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-    return errno.I_OK;
-}
-
-// Copy the on-screen part of the temporary prediction/decoded block to the
-// frame. Used after _predict_clipped and after adding the residual.
-fn _copy_clipped(plane as *u8, stride as i64, x as i64, y as i64,
-                 size as i64, max_x as i64, max_y as i64,
-                 tmp as *u8) as void {
-    let is i64 as i with mut = 0;
-    while (i < size) {
-        let is i64 as yy = y + i;
-        if (yy >= max_y) { break; }
-        let is i64 as j with mut = 0;
-        while (j < size) {
-            let is i64 as xx = x + j;
-            if (xx >= max_x) { break; }
-            plane[yy * stride + xx] = tmp[(1 + i) * BLK_TMP_STRIDE + 1 + j];
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-}
-
 // ── residual orchestration (section 6.4.21) ─────────────────────────
 
 // get_qindex (section 8.6.1).
@@ -704,9 +451,7 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
     if (skip != 0 && skip != 1) { return errno.I_CORRUPT; }
     if (tx_sz < rt.TX_4X4 || tx_sz > rt.TX_32X32) { return errno.I_CORRUPT; }
     if (cast(i64, b.cc) == 0) { return errno.I_BADPARAM; }
-    if (cast(i64, b.coef) == 0 || cast(i64, b.tmp) == 0) {
-        return errno.I_BADPARAM;
-    }
+    if (cast(i64, b.coef) == 0) { return errno.I_BADPARAM; }
 
     let is i64 as qidx = _qindex(b, segment_id);
     let is res.Vp9Quant as q;
@@ -730,7 +475,7 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
 
         let is i64 as txs with mut = tx_sz;
         if (plane > 0) {
-            txs = blk_uv_tx_size(bs_res, tx_sz, subx, suby);
+            txs = rt.recon_uv_tx_size(bs_res, tx_sz, subx, suby);
             if (txs < 0) { return txs; }
         }
         let is i64 as pbs with mut = bs_res;
@@ -738,8 +483,8 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
             pbs = blk_plane_size(bs_res, subx, suby);
             if (pbs < 0) { return pbs; }
         }
-        let is i64 as n4w = blk_num4_wide(pbs);
-        let is i64 as n4h = blk_num4_high(pbs);
+        let is i64 as n4w = rt.recon_num_4x4_wide(pbs);
+        let is i64 as n4h = rt.recon_num_4x4_high(pbs);
         if (n4w < 1 || n4h < 1) { return errno.I_CORRUPT; }
 
         let is i64 as base_x = (c * 8) >> subx;
@@ -781,24 +526,15 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                 let is i64 as not_right with mut = 0;
                 if (x + step < n4w) { not_right = 1; }
 
-                let is i64 as full with mut = 0;
-                if (sx + size <= maxx && sy + size <= maxy) { full = 1; }
-
                 let is i64 as st with mut = 0;
                 if (b.h.frame_is_intra == 1) {
-                    if (full == 1) {
-                        let is pred.IntraEdge as e;
-                        e.have_left = have_l;
-                        e.have_above = have_a;
-                        e.not_on_right = not_right;
-                        e.max_x = maxx - 1;
-                        e.max_y = maxy - 1;
-                        st = pred.pred_intra(pl, stride, sx, sy, txs, mode, &e);
-                    } else {
-                        st = _predict_clipped(pl, stride, sx, sy, txs, mode,
-                                              have_l, have_a, not_right,
-                                              maxx, maxy, b.tmp);
-                    }
+                    let is pred.IntraEdge as e;
+                    e.have_left = have_l;
+                    e.have_above = have_a;
+                    e.not_on_right = not_right;
+                    e.max_x = maxx - 1;
+                    e.max_y = maxy - 1;
+                    st = pred.pred_intra(pl, stride, sx, sy, txs, mode, &e);
                     if (st < 0) { return st; }
                 } else {
                     return errno.I_UNSUPPORTED;
@@ -824,18 +560,9 @@ fn _residual(b as *Vp9Blk, br as *vb.Vp9Bool, r as i64, c as i64, bs as i64,
                         }
                         st = tx.tx_2d(dq, txs + 2, txt, b.lossless);
                         if (st < 0) { return st; }
-                        if (full == 1) {
-                            st = tx.tx_add_residual(pl, stride, dq, n0);
-                        } else {
-                            st = tx.tx_add_residual(
-                                cast(*u8, cast(i64, b.tmp) + BLK_TMP_STRIDE + 1),
-                                BLK_TMP_STRIDE, dq, n0);
-                        }
+                        st = tx.tx_add_residual(pl, stride, dq, n0);
                         if (st < 0) { return st; }
                     }
-                }
-                if (full == 0) {
-                    _copy_clipped(pl, stride, sx, sy, size, maxx, maxy, b.tmp);
                 }
 
                 // Section 6.4.21: one context entry per 4x4 position of the
@@ -873,8 +600,8 @@ fn _decode_block(b as *Vp9Blk, br as *vb.Vp9Bool,
     }
     if (bs < rt.BLOCK_4X4 || bs > rt.BLOCK_64X64) { return errno.I_CORRUPT; }
 
-    let is i64 as bw8 = blk_num8_wide(bs);
-    let is i64 as bh8 = blk_num8_high(bs);
+    let is i64 as bw8 = rt.recon_num_8x8_wide(bs);
+    let is i64 as bh8 = rt.recon_num_8x8_high(bs);
     if (bw8 < 1 || bh8 < 1) { return errno.I_CORRUPT; }
     let is i64 as x_mis with mut = b.mi_cols - c;
     let is i64 as y_mis with mut = b.mi_rows - r;
@@ -932,7 +659,7 @@ fn _decode_block(b as *Vp9Blk, br as *vb.Vp9Bool,
 // 8x8 columns/rows, selecting the bit for this block size.
 fn _partition_ctx(b as *Vp9Blk, r as i64, c as i64, bs as i64,
                   n8 as i64) as i64 {
-    let is i64 as bsl = blk_mi_width_log2(bs);
+    let is i64 as bsl = blk_log2(rt.recon_num_8x8_wide(bs));
     if (bsl < 0 || bsl > 3) { return errno.I_CORRUPT; }
     let is i64 as boffset = 3 - bsl;
     let is i64 as above with mut = 0;
@@ -1007,7 +734,7 @@ fn blk_decode_partition(b as *Vp9Blk, br as *vb.Vp9Bool,
                         r as i64, c as i64, bs as i64) as i64 {
     if (r >= b.mi_rows || c >= b.mi_cols) { return errno.I_OK; }
     if (bs < rt.BLOCK_8X8 || bs > rt.BLOCK_64X64) { return errno.I_CORRUPT; }
-    let is i64 as n8 = blk_num8_wide(bs);
+    let is i64 as n8 = rt.recon_num_8x8_wide(bs);
     if (n8 < 1) { return errno.I_CORRUPT; }
     let is i64 as half = n8 >> 1;
 
@@ -1047,8 +774,8 @@ fn blk_decode_partition(b as *Vp9Blk, br as *vb.Vp9Bool,
     if (st < 0) { return st; }
 
     if (bs == rt.BLOCK_8X8 || part != PART_SPLIT) {
-        let is i64 as bwlog = blk_bw_log2(subsize);
-        let is i64 as bhlog = blk_bh_log2(subsize);
+        let is i64 as bwlog = blk_log2(rt.recon_num_4x4_wide(subsize));
+        let is i64 as bhlog = blk_log2(rt.recon_num_4x4_high(subsize));
         if (bwlog < 0 || bhlog < 0) { return errno.I_CORRUPT; }
         let is i64 as i with mut = 0;
         while (i < n8) {
