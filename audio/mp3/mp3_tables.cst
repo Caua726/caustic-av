@@ -540,9 +540,9 @@ fn mp3_lsf_nsf(context as i64, block_case as i64, partition as i64) as i64 {
 
 // ── pending analytic window tables ─────────────────────────────────
 
-// 1 once stage 8b has written the analytic MP3_WINDOW_* blobs in
-// mp3_tables_data.cst. Stage 8b must check this before using the IMDCT
-// windows; the tables are not needed by the parser in mp3.cst.
+// 1 once the optional analytic MP3_WINDOW_* blobs in mp3_tables_data.cst
+// are filled. Stage 8b builds its IMDCT windows analytically at init and
+// does not consult this; the tables are not needed by the parser.
 fn mp3_window_tables_ready() as i64 {
     return data.MP3_WINDOW_TABLES_GENERATED;
 }

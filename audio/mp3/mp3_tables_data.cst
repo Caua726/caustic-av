@@ -30,13 +30,14 @@
 // PENDING: the analytic IMDCT windows and DCT twiddles are not printed
 // tables, so they are empty here. mp3_window_tables_ready() reports
 // MP3_WINDOW_TABLES_GENERATED, which is 0 now. The parser does not need
-// them; stage 8b supplies them and must not synthesise until it is 1.
+// them; stage 8b builds the same windows analytically at init and does not
+// consume these, which stay optional table-driven placeholders.
 // =======================================================
 
-// 0 until the stage 8b writer has written MP3_WINDOW_* below.
+// 0 while the optional MP3_WINDOW_* placeholders below are empty.
 let is i64 as MP3_WINDOW_TABLES_GENERATED with imut = 0;
 
-// PENDING: 36 long-block (normal, block_type 0) IMDCT window values.
+// PENDING (optional): 36 long-block (normal, block_type 0) window values.
 let is *u8 as MP3_WINDOW_LONG with imut = "";
 // PENDING: 36 start-block (block_type 1) window values.
 let is *u8 as MP3_WINDOW_START with imut = "";

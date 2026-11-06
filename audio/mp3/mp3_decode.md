@@ -9,9 +9,9 @@ compiled or run. The FFmpeg PCM-difference check named by the stage brief is
 recorded below for the test phase and has not been executed.
 
 > Stage 8a owns `mp3.cst`, `mp3_tables.cst`, the table data blobs and the
-> table generator. This note records the table contract this decode path was
-> written against; if 8a's final identifiers differ, adapt the small call
-> sites in `mp3_decode.cst`/`mp3_synth.cst` and update this table.
+> table generator. This branch is rebased on stage 8a's approved tip
+> (`stage8a-mp3`, ca4a564); the identifiers in the table contract below are
+> the ones that tip exports, checked by reading, not by compiling.
 
 ## Files
 
@@ -50,8 +50,12 @@ i64 mp3_decode_frame(Mp3Decode *m, Mp3Frame *f,
   `samples_per_frame * channels * 2` bytes of little-endian signed 16-bit
   PCM to `pcm`. `cap` is in bytes. It returns frames per channel (1152 for
   MPEG-1, 576 for MPEG-2/2.5), or a negative error.
-- No allocation from untrusted sizes: all buffers are fields of `Mp3Decode`;
-  every stream offset and part length is checked before use.
+- No allocation from untrusted sizes: the persistent buffers are fields of
+  `Mp3Decode` and `Mp3Synth`, and the kernels use fixed-size stack arrays
+  (`block[36]`, `p[24]`, `o[12]`, `u[512]`, `s_in[32]`, `out[32]`,
+  `tmp[576]`, and the Huffman `code[256]`/`len[256]` plus count1
+  `ccode[16]`/`clen[16]`) whose sizes are compile-time constants. Every
+  stream offset, part length and band offset is checked before use.
 
 The ticket shorthand `mp3_decode_frame(m, frame, pcm, cap)` is split in two
 arguments here (`m` for persistent decode state, `f` for the parsed frame)
@@ -129,10 +133,8 @@ Everything after Huffman is `f64` in the natural units of ISO/IEC 11172-3
   extra `2/n` factor. Windows are the four spec shapes (normal, start, stop,
   short), computed at init.
 - The 32-point synthesis matrix is
-  `N[i][k] = cos((16+i)(2k+1)pi/64)`, i = 0..63. It is unnormalised (gain
-  32), so the IMDCT window output is scaled by `MP3_IMDCT_SCALE = 1/32`
-  before it. This matches the float reference's `/32` in the MDCT window and
-  keeps the natural sample in [-1, 1].
+  `N[i][k] = cos((16+i)(2k+1)pi/64)`, i = 0..63, used unnormalised (its
+  gain is 32) exactly as printed. No compensating division is applied.
 - The synthesis window `D[0..511]` is Table 3-B.3 read through
   `mp3_synth_window(i)` as the dimensionless printed value (range about
   -1.145..+1.145), not the Q16 integer.
@@ -140,13 +142,22 @@ Everything after Huffman is `f64` in the natural units of ISO/IEC 11172-3
   [-32768, 32767] and rounds away from zero, then writes two little-endian
   bytes.
 
-The `1/32` and the absence of a `2/n` IMDCT factor are the two constants that
-the test phase can confirm from a PCM comparison. They are the only
-global-gain choices in the chain; everything else is the spec formula.
+Requantization is the whole scaling chain. 2.4.3.4 states that "all
+necessary scaling factors are contained within this formula", that the
+constant 210 is a system constant, and that the synthesis filterbank is
+implemented "according to the formulas below", with PCM output in [-1, 1].
+So requant x unnormalised IMDCT x N x D is already full scale, and
+`MP3_IMDCT_SCALE` is 1. Dividing the IMDCT window output again (for example
+by 1/32 for the unnormalised matrix) double-counts and makes the output
+about 30 dB too quiet. The absence of a `2/n` IMDCT factor and the unity
+global scale are the two choices a PCM comparison can confirm; everything
+else is the spec formula.
 
 ## Table contract with stage 8a
 
-Used identifiers (all public in `mp3_tables.cst` / `mp3.cst`):
+Identifiers checked against stage 8a's tip (all public in `mp3_tables.cst` /
+`mp3.cst`; not every constant is referenced by name, several counts appear
+as literals in the loops below):
 
 - versions/modes: `MP3_VER_1`, `MP3_VER_2`, `MP3_VER_25`,
   `MP3_MODE_JOINT`; `mp3_is_mpeg1`, `mp3_sfb_row`.
@@ -186,20 +197,40 @@ can read them instead; the kernel layout is unchanged.
 
 Not implemented here: CRC verification (the parser locates the frame; a bad
 CRC is not used to mute), error concealment/PLC, emphasis/de-emphasis
-filtering, and ID3/Xing trimming (all parser/stream concerns). A decode
-error returns a negative code and leaves the caller to call
-`mp3_decode_reset` if it wants to continue.
+filtering, and gapless trimming (see below). A decode error returns a
+negative code and leaves the caller to call `mp3_decode_reset` if it wants
+to continue.
+
+## Gapless trimming
+
+Neither stage trims audio. Stage 8a's parser reads the Xing/LAME and VBRI
+fields into `Mp3` (`encoder_delay`, `encoder_padding`, `lame_present`,
+`vbri_delay`) and `mp3.cst` states that no audio is trimmed;
+`mp3_decode_frame` returns every decoded frame. Dropping the encoder
+delay and padding belongs to the layer that owns the stream (the caller of
+`mp3_next`/`mp3_decode_frame`), because only that layer knows the first and
+last frame of a track and can drop samples across frame boundaries.
+`mp3.md` (stage 8a) is aligned to this policy in this branch: no stage owns
+gapless trimming, and the parser fields are the interface for whoever does.
 
 ## Pending and unconfirmed
 
-- **PENDING BLOB.** Table 3-B.3 synthesis window D[0..511] depends on stage
-  8a's generator blob. `mp3_synth_window` is used directly; if the blob is
-  still a pending zero fill, synthesis is silent rather than an error. The
-  stage 8a note is the authority for that blob.
-- **UNCONFIRMED (normalisation).** `MP3_IMDCT_SCALE = 1/32` and the absence
-  of a `2/n` factor in the IMDCT are derived from the spec expression and
-  the reference float chain's `/32`, not from a run. A PCM comparison will
-  show whether a single global factor is needed.
+- **UNCONFIRMED (normalisation).** The global scale is unity because
+  2.4.3.4 states that the requantization formula contains all scaling
+  factors and that the printed synthesis yields PCM in [-1, 1], and because
+  the IMDCT is the unnormalised expression. The value is not confirmed by a
+  run: an FFmpeg PCM comparison is still the check, and `MP3_IMDCT_SCALE`
+  in `mp3_synth.cst` is the single place to adjust it. A further division,
+  such as the 1/32 an earlier draft applied for the unnormalised matrix,
+  makes the output about 30 dB too quiet.
+- **UNCONFIRMED (top-band intensity position).** The tail band (long sfb
+  21; short sfb 12 for each window) has no transmitted scalefactor, hence no
+  is_pos. This decoder reuses the previous band's position in that window,
+  as FFmpeg does (`k = (i == 21) ? 20 : i`, and the last short band shares
+  the previous band's k). minimp3 instead substitutes its neutral default
+  (3 for MPEG-1, 0 for LSF) when the band below carries data and the
+  previous position otherwise; the ISO text does not cover the tail band.
+  Only frames with left-only data in the tail band differ.
 - **UNCONFIRMED (LSF intensity maximum).** ISO 11172-3 says the maximum
   MPEG-1 intensity position (7) is illegal. For LSF this note treats 0..15
   as legal (matching the reference table), rather than declaring 15
@@ -209,26 +240,78 @@ error returns a negative code and leaves the caller to call
   8a's; the LSF four-partition split and counts in `_scf_lsf` follow the
   pseudocode in the bitstream note 4.2.4 and ISO/IEC 13818-3. They have not
   been checked against a real LSF stream.
-- **PENDING (reference files read).** minimp3.h; FFmpeg
-  `libavcodec/mpegaudiodec_template.c`, `mpegaudiodata.c`,
-  `mpegaudiodec_common.c`, `mpegaudiodsp_template.c`, `mpegaudiodsp.c`,
-  `mpegaudio.h`, `dct32_template.c`. Public docs used as primary:
-  `.work/mp3/docs/iso11172-3.pdf`, `mp3_bitstream.pdf`, `mp3_theory.pdf`
-  (the 3-B.3 window and 3-B.9 alias table text, count1 tables, sfb tables,
-  side-info syntax, requantization and stereo sections).
+
+The Table 3-B.3 synthesis window D is committed as stage 8a's blob
+(`MP3_SYNTH_WINDOW_NANO` in `mp3_tables_data.cst`) and `syn_init` reads it
+through `mp3_synth_window`; no path here depends on an unwritten blob. The
+stage 8a `MP3_WINDOW_*` IMDCT-window placeholders stay unused: this stage
+builds those windows analytically at init.
+
+## Reference reading
+
+These were read to understand behaviour only; no code was copied, ported or
+transcribed. Public docs are the primary source:
+
+- `lieff/minimp3`, `minimp3.h` — Layer III decode order, intensity
+  top-band handling, IMDCT/window scaling.
+- `FFmpeg/FFmpeg`, `libavcodec/mpegaudiodec_template.c` — decode order,
+  MS/intensity stereo including the last-band scale-factor reuse, the
+  short-block IMDCT layout.
+- `FFmpeg/FFmpeg`, `libavcodec/mpegaudiodec_common.c`, `mpegaudiodata.c`,
+  `mpegaudiodsp_template.c`, `mpegaudio.h`, `mpegaudiodsp.c`,
+  `dct32_template.c` — table dimensions, window/`FRAC_BITS` scaling and the
+  synthesis kernels.
+- `.work/mp3/docs/iso11172-3.pdf`, `mp3_bitstream.pdf`, `mp3_theory.pdf` —
+  the 3-B.3 window and 3-B.9 alias text, count1 tables, sfb tables,
+  side-info syntax, requantization and stereo sections; plus
+  `.work/docs/iso11172-3.txt` and `mp3_bitstream.txt` for the extracted
+  requantization and intensity-stereo text quoted above.
 
 ## Oracle check for the test phase (NOT RUN)
 
 The brief's original criterion is the maximum absolute difference from
-FFmpeg on the same decoded frames. Suggested method, to be executed only in
-the test phase:
+FFmpeg on the same decoded frames. No MP3 vector is committed in this
+branch (`tests/vectors/small/` holds Opus and VP9 files only), and there is
+no `tests/test_mp3.cst`; both still have to be added in the test phase.
+Suggested method, to be executed only in the test phase:
 
-1. Decode the committed small vectors (MPEG-1 44.1 stereo CBR, MPEG-2
-   22.05 mono, MPEG-2.5 11.025 stereo, VBR Xing/LAME) with this decoder and
-   with `ffmpeg -f s16le`.
-2. Align at frame 0, discard the codec delay/padding according to the
-   parser's recorded policy, and compare equal sample counts.
+1. Obtain or cut MPEG-1 44.1 stereo CBR, MPEG-2 22.05 mono, MPEG-2.5
+   11.025 stereo and VBR Xing/LAME vectors; no vector is committed today.
+2. Decode the same span with this decoder and with `ffmpeg -f s16le`.
+   Neither stage trims, so compare untrimmed frame-aligned output; if the
+   FFmpeg demuxer has already dropped the LAME delay/padding, drop the same
+   sample counts from ours using the parser's `encoder_delay` /
+   `encoder_padding`. The first decoded frame is frame 0 on both sides.
 3. Record `max(abs(ours - ffmpeg))` per rate/channel/mode and use it as the
-   tolerance in `tests/test_mp3.cst`.
+   tolerance of a future `tests/test_mp3.cst`.
 
 No command above has been run.
+
+## Pending review notes
+
+Notes on this stage's files from the read-only review of stage 8b. None
+affects valid-stream output or memory safety. The first three were
+corrected in the fix round; the last two are open and recorded for the next
+reader.
+
+1. **Fixed (P1).** The note and `mp3_synth.cst` described the Table 3-B.3
+   synthesis window as a pending, zero-filled blob whose silence only the
+   oracle would catch. The blob is committed in `mp3_tables_data.cst`
+   (`MP3_SYNTH_WINDOW_NANO`); the comment and this note now say so. The
+   scalar accessor still returns 0 for a malformed blob (stage 8a review
+   note 4), which is only reachable with a damaged in-tree blob.
+2. **Fixed (P2).** "All buffers are fields of `Mp3Decode`" was false: the
+   kernels use fixed-size stack arrays. The API section now lists them and
+   states the real property (no size comes from the stream).
+3. **Fixed (P3).** The oracle step decoded "the committed small vectors"
+   and named `tests/test_mp3.cst`; neither exists. The step now says the
+   vectors and the test have to be obtained or written in the test phase.
+4. **Open (naming).** The tail-band intensity substitution in `_stereo`
+   uses the literal indices 21/20 and 12/11. They follow
+   `MP3_SFB_LONG_SCALEFAC_COUNT` (21) and `MP3_SFB_SHORT_SCALEFAC_COUNT`
+   (12) but are not written in terms of them; the surrounding band loops
+   use the same literals, so a count change has to touch all of them
+   together.
+5. **Open (wording).** `_intensity_gains` clamps an MPEG-1 position to
+   0..6 although `_illegal_pos` already rejects 7 and above before the call;
+   the clamp only guards a negative value, which no caller reaches.

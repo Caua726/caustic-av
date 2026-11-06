@@ -266,8 +266,10 @@ written yet:
 * `MP3_DCT_TWIDDLE` — the DCT/IMDCT twiddles stage 8b chooses.
 
 `MP3_WINDOW_TABLES_GENERATED` is 0 and `mp3_window_tables_ready()` returns
-0. Stage 8b must not synthesise until these exist. The values have to come
-from the window definitions in the specification, not from a decoder.
+0. Stage 8b does not consume these blobs: it builds the four windows and
+the IMDCT/synthesis matrices analytically at init (`mp3_synth.cst`) from
+the window definitions in the specification. The blobs stay placeholders
+for a future table-driven path; the parser does not need them.
 
 ## Pending review notes
 
@@ -296,9 +298,15 @@ Main-data parsing (scalefactors with scfsi, MPEG-2 partition expansion),
 Huffman decoding of `big_values`/count1 with linbits and signs, region
 bounds from `region0_count`/`region1_count`, requantisation, reordering for
 short blocks, joint-stereo processing, alias reduction, IMDCT and the
-polyphase synthesis filterbank. Stage 8b also owns the reservoir buffer,
-gapless trimming from the LAME/VBRI delay and padding, and frame-to-PCM
-output.
+polyphase synthesis filterbank. Stage 8b also owns the reservoir buffer and
+frame-to-PCM output.
+
+Gapless trimming is not part of either stage. The parser exposes the
+LAME/VBRI delay and padding (`encoder_delay`, `encoder_padding`,
+`vbri_delay`) and the Layer III decoder returns every decoded frame;
+dropping delay/padding samples belongs to the layer that owns the stream
+(the caller of `mp3_next`/`mp3_decode_frame`), which alone knows the first
+and last frame of a track. `mp3_decode.md` states the same policy.
 
 ## Reference reading
 

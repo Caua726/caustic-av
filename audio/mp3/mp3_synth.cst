@@ -14,8 +14,7 @@
 //   * requantized spectral values are real; the caller already applied
 //     is^(4/3) and all gains;
 //   * IMDCT uses the analytical expression with N = 36 or N = 12 and no
-//     extra 2/N factor (the window and overlap supply the reconstruction
-//     normalisation);
+//     extra 2/n factor, exactly as printed;
 //   * the window coefficients and the synthesis matrix N[i][k] are computed
 //     at init with std/math from their spec definitions;
 //   * the polyphase window D is read from mp3_tables.cst
@@ -159,9 +158,11 @@ fn syn_init(s as *Mp3Synth) as i64 {
         i = i + 1;
     }
 
-    // Synthesis window D[0..511] from Table 3-B.3. Pending generator values
-    // are zero-filled by mp3_tables.cst; the caller sees that as a silent
-    // but otherwise valid synthesis and the oracle comparison reports it.
+    // Synthesis window D[0..511] from Table 3-B.3, read through
+    // mp3_synth_window from the committed blob in mp3_tables_data.cst. A
+    // malformed blob would read as zeros because the scalar accessor
+    // swallows its error (stage 8a review note 4); the blob is committed
+    // data, not a pending fill, so init does not reload it as a whole.
     i = 0;
     while (i < 512) {
         s.dwin[i] = tbl.mp3_synth_window(i);
