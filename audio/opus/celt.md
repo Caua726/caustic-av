@@ -200,6 +200,7 @@ celt.celt_reset(&d)                                   // state reset
 celt.celt_set_frame(&d, start, end, lm, stream_channels)
 celt.celt_frame_size(&d)                              // 120<<lm
 celt.celt_decode(&d, data, len, pcm, pcm_cap)         // frames or <0
+celt.celt_decode_with_range(&d, r, pcm, pcm_cap)      // frames or <0
 ```
 
 - `start` is 0 for a CELT-only frame and 17 for a hybrid frame.
@@ -209,6 +210,11 @@ celt.celt_decode(&d, data, len, pcm, pcm_cap)         // frames or <0
 - `pcm` is interleaved f64, `pcm_cap` counts scalar values and must be at
   least `frame_size * channels`.
 - The return value is frames per channel on success.
+- `celt_decode` binds its own range decoder at byte 0. A hybrid Opus frame
+  is one range stream shared with SILK, so the Opus layer calls
+  `celt_decode_with_range` with the decoder SILK has already advanced; the
+  CELT bit budget is measured against `r.len`, which must be the same frame
+  slice.
 
 The range decoder contract used is the one agreed for the Ogg/packet/range
 slice:
