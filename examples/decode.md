@@ -268,3 +268,57 @@ would require, all **NOT RUN**:
    state is tainted by an error, so this path is only expected on a
    resolution-changing key frame where the shortfall is found before the first
    displayed output.
+7. **The sample output is illustrative, not captured.** The "Output contract"
+   block shows `container: matroska/webm` but gives the audio track
+   `timebase=1/48000`, which is the Ogg Opus mapping; Matroska publishes
+   `1/1000000000` for every track. It also shows `codec_id=A_OPUS` alongside
+   that timebase, but only Matroska publishes a codec id string; an Ogg track
+   has `codec_id_len == 0` and prints no `codec_id=` field. No single input
+   produces that block; a future run should replace it with real stderr.
+8. **Two error paths print no `err_name`/code.** The "Unsupported and error
+   paths" section says a short input read and an unopenable `--pcm` file are
+   reported "with `err_name` and the exact negative code". The short-read path
+   prints only `decode: short read on input`, and `_sink_start` prints only
+   `decode: cannot open --pcm output: <path>`; both then exit 1 without a
+   code. The wording and the two sites disagree: either narrow the bullet to
+   the demux/decode/output failures that call `_err_status`/`_err_track`, or
+   make those two sites report a code.
+9. **The exit-2 row is incomplete.** The exit-status table lists an unknown
+   option, a missing option argument and more than one input. A non-numeric
+   `--threads` value, or one outside 1..16, also exits 2; the range case first
+   prints `decode: --threads must be between 1 and 16`.
+10. **`Session.video_tracks` is dead.** It is incremented in `_sync_tracks`,
+    but nothing reads it; `has_video`, set in the same branch, is what the
+    sink policy uses. The field can be removed.
+11. **A failed `Vp9Mem` allocation is silent.** In `_ensure_decoder`, the
+    `bins_alloc(sizeof(Vp9Mem))` null check returns `I_OOM` without the
+    `_err_track` diagnostic the other setup failures print.
+12. **A write failure is reported as `I_EOF`.** `_sink_flush` returns `I_EOF`
+    when `write_all_fd` writes fewer bytes than asked, and the stdout hash
+    path reports `I_EOF` for its two writes. A failed write is not
+    end-of-file; a dedicated I/O code, or the write's own status, would name
+    the failure. This affects the message, not the exit status.
+13. **`_ensure_decoder` assumes every video codec is VP9.** After a successful
+    `av_decode_open` it allocates a `Vp9Mem` and calls `_vp9_mem_open` for any
+    `TRACK_VIDEO`. That holds while `decode_open` accepts only VP9 as video;
+    adding another video codec needs a per-codec branch here. Latent, not
+    reachable with the current hub.
+14. **The first-granule check is a clamp, not validation.** `_sink_finish`
+    leaves `initial = 0` when the first packet's granule is negative (the Ogg
+    `-1` "no packet completes" sentinel, which a completing page must not
+    carry) or smaller than the samples returned from the first page, instead
+    of returning `I_CORRUPT`. Valid streams always give a consistent
+    non-negative first granule, so the clamp only masks malformed input.
+15. **The mid-packet resend and probability double-advance are documented.**
+    Note 6 above and `video/vp9/vp9.md`'s resend guidance (Pending review
+    notes 12 and the Stage 6 note) record that a packet whose `receive` has
+    already decoded slices must not be re-sent: references are published and
+    the probability state has advanced, so re-running the leading slices
+    advances the probabilities a second time. The example's 32-resend cap is
+    reached only when the shortfall is found before the first displayed
+    output, and the duplicate hashes are dropped. Recorded as documented
+    behaviour, not an open issue.
+16. **Docs staleness was fixed separately.** The review's doc-staleness item,
+    which described stage 8 MP3 and stage 9 threads as unmerged, was corrected
+    by "examples: describe the merged MP3 and thread APIs" (6754991); no
+    change is carried here.
