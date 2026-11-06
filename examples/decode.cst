@@ -57,7 +57,7 @@ struct Vp9Mem {
 // One run. Everything that is allocated is tracked here so the single defer
 // in _run releases it on every exit path.
 struct Session {
-    heap as mem.Bins;
+    heap as mem.bins.Bins;
     heap_ready as i64;
 
     data as *u8;
@@ -134,9 +134,10 @@ fn _err_track(s as *Session, ti as i64, what as *u8, code as i64) as void {
 }
 
 fn _usage(fd as i64) as void {
-    io.write_str(fd, "usage: decode [--md5] [--pcm <file>] [--threads N] <input>\n");
+    io.write_str(fd, "usage: decode [--md5|--yuv] [--pcm <file>] [--threads N] <input>\n");
     io.write_str(fd, "  input       .webm/.mkv, .ogg, .opus or .mp3; detected by content\n");
     io.write_str(fd, "  --md5       print the I420 MD5 of every displayed video frame (default)\n");
+    io.write_str(fd, "  --yuv       write every displayed video frame as raw I420 on stdout\n");
     io.write_str(fd, "  --pcm FILE  write decoded interleaved S16LE PCM to FILE\n");
     io.write_str(fd, "  --threads N VP9 tile threads, 1..16 (default 1); stage 9 API\n");
 }
@@ -395,6 +396,31 @@ fn _vp9_grow(s as *Session, ti as i64) as i64 {
 // Feed the visible I420 planes, row by row, without the coded stride padding:
 // libvpx's MD5 helper hashes d_w bytes per luma row and (d_w+1)/2 per chroma
 // row; FFmpeg's rawvideo encoder reaches the same bytes with align=1.
+// --yuv: write displayed frames as raw I420 on stdout instead of their MD5.
+let is i64 as g_yuv with mut = 0;
+
+fn _write_plane(p as *u8, stride as i64, w as i64, h as i64) as i64 {
+    let is i64 as y with mut = 0;
+    while (y < h) {
+        if (io.write_all_fd(io.STDOUT, p + y * stride, w) != w) {
+            return av.errno.I_EOF;
+        }
+        y = y + 1;
+    }
+    return av.errno.I_OK;
+}
+
+fn _write_i420(f as *av.frame.Frame) as i64 {
+    if (f.width <= 0 || f.height <= 0) { return av.errno.I_CORRUPT; }
+    let is i64 as cw = (f.width + 1) / 2;
+    let is i64 as ch = (f.height + 1) / 2;
+    let is i64 as r with mut = _write_plane(f.y, f.stride_y, f.width, f.height);
+    if (r < 0) { return r; }
+    r = _write_plane(f.u, f.stride_u, cw, ch);
+    if (r < 0) { return r; }
+    return _write_plane(f.v, f.stride_v, cw, ch);
+}
+
 fn _md5_i420(h as *md5.Md5, f as *av.frame.Frame) as i64 {
     if (f.width <= 0 || f.height <= 0) { return av.errno.I_CORRUPT; }
     if (cast(i64, f.y) == 0 || cast(i64, f.u) == 0 || cast(i64, f.v) == 0) {
@@ -765,7 +791,12 @@ fn _decode_packet(s as *Session, ti as i64,
             } else {
                 let is i64 as er with mut = av.errno.I_OK;
                 if (out.kind == av.decode.OUTPUT_VIDEO) {
-                    if (hash_count >= 8) {
+                    if (g_yuv != 0) {
+                        er = _write_i420(&out.video);
+                        if (er == av.errno.I_OK) {
+                            s.video_frames[ti] = s.video_frames[ti] + 1;
+                        }
+                    } else if (hash_count >= 8) {
                         er = av.errno.I_DIMS;
                     } else {
                         er = _video_hash(&out, &hashes[hash_count][0]);
@@ -1055,6 +1086,9 @@ fn main(argc as i64, argv as *u8) as i32 {
             return 0;
         }
         if (_streq(a, "--md5") == 1) {
+            ai = ai + 1;
+        } else if (_streq(a, "--yuv") == 1) {
+            g_yuv = 1;
             ai = ai + 1;
         } else if (_streq(a, "--pcm") == 1) {
             if (ai + 1 >= env.argc()) {
