@@ -61,6 +61,10 @@ pcm: 144000 samples/ch written, 144000 decoded (Ogg Opus final-granule trim chec
   stdout PCM stream has started (a chained Ogg) is also refused.
 - **Timing:** the example does not print packet timestamps. The hub output
   record carries them, but the MD5 comparison is sample/frame order only.
+- **Errors after output started:** a fatal demux/decode error exits with a
+  nonzero status; a `--pcm` file (or a redirected stdout) can already contain
+  the blocks written before the failure. The example does not truncate or
+  unlink partial output.
 
 Exit status:
 

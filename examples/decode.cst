@@ -192,7 +192,10 @@ fn _sync_tracks(s as *Session) as i64 {
     while (s.known_tracks < n) {
         let is i64 as ti = s.known_tracks;
         let is *av.codec.Track as t = av.av_track(&s.demux, ti);
-        if (cast(i64, t) == 0) { return av.errno.I_CORRUPT; }
+        if (cast(i64, t) == 0) {
+            _err_status("track list", av.errno.I_CORRUPT);
+            return av.errno.I_CORRUPT;
+        }
         _print_track(s, ti, t);
 
         if (t.kind == av.codec.TRACK_VIDEO) {
@@ -487,7 +490,11 @@ fn _emit_audio(s as *Session, ti as i64, out as *av.decode.Output) as i64 {
 // MD5 lines and the samples do not share a stream.
 fn _sink_start(s as *Session, ti as i64, t as *av.codec.Track,
                dec as *av.decode.Decoder) as i64 {
-    if (s.sink_track >= 0) { return av.errno.I_BADPARAM; }
+    if (s.sink_track >= 0) {
+        io.write_str(io.STDERR,
+            "decode: an audio sink is already assigned to another track\n");
+        return av.errno.I_BADPARAM;
+    }
 
     let is i64 as want with mut = 0;
     if (cast(i64, s.pcm_path) != 0) { want = 1; }
@@ -595,7 +602,10 @@ fn _ensure_decoder(s as *Session, ti as i64) as i64 {
     if (s.dec_state[ti] != 0) { return av.errno.I_OK; }
 
     let is *av.codec.Track as t = av.av_track(&s.demux, ti);
-    if (cast(i64, t) == 0) { return av.errno.I_CORRUPT; }
+    if (cast(i64, t) == 0) {
+        _err_status("track", av.errno.I_CORRUPT);
+        return av.errno.I_CORRUPT;
+    }
 
     if (t.kind != av.codec.TRACK_VIDEO && t.kind != av.codec.TRACK_AUDIO) {
         io.write_str(io.STDERR, "decode: track ");
