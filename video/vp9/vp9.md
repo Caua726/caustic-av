@@ -257,6 +257,11 @@ the stream size at all.
   `RefBitDepth`), not from the zeroed header fields listed in stage 3's
   Pending note 3. It can therefore display a frame smaller or larger than
   the coded frames around it, even across a resolution change.
+- SVC needs no separate syntax here: the spatial layers are ordinary slices
+  of different sizes inside one superframe, with hidden layers feeding the
+  reference slots and the shown (or show-existing) layer producing output.
+  Because the handoff is a per-slice loop over the packet, the layers keep
+  their bitstream order and each is published before the next reads it.
 
 ### Inter mode info
 
