@@ -612,6 +612,8 @@ fn _receive_mp3(d as *Decoder, out as *Output) as i64 {
         }
         d.pending_pts_off = d.pending_pts_off + adv;
 
+        // A damaged frame costs its own samples, not the rest of the stream.
+        if (got == errno.I_CORRUPT) { continue; }
         if (got < 0) {
             d.pending = 0;
             return got;

@@ -757,10 +757,56 @@ fn mp3_open(m as *Mp3, src as *u8, len as i64) as i64 {
     return errno.I_OK;
 }
 
-// Return the next frame, 0 at the end of the audio range, or a negative
-// error. The frame is a view into the caller's buffer. On error the frame
-// and the parser position are unchanged.
+// Offset of the next frame after `start` whose successor also has a valid
+// header (or that ends the audio), or a negative code when none is left. The
+// second header is what tells a real sync from four bytes of damaged data.
+fn _mp3_resync(m as *Mp3, start as i64, out_off as *i64) as i64 {
+    let is i64 as pos with mut = start;
+    while (1) {
+        let is i64 as off with mut = 0;
+        let is i64 as r with mut = _mp3_find_frame(m.src, pos, m.audio_end, &off);
+        if (r < 0) { return r; }
+        let is Mp3Header as h;
+        r = mp3_header_parse(m.src + off, m.audio_end - off, &h);
+        if (r < 0) { return r; }
+        let is i64 as nxt = off + h.frame_len;
+        if (nxt == m.audio_end) { *out_off = off; return errno.I_OK; }
+        if (nxt + 4 <= m.audio_end) {
+            let is Mp3Header as h2;
+            if (mp3_header_parse(m.src + nxt, m.audio_end - nxt, &h2) == errno.I_OK) {
+                *out_off = off;
+                return errno.I_OK;
+            }
+        }
+        pos = off + 1;
+    }
+    return errno.I_BADMAGIC;
+}
+
+// Return the next frame, or 0 at the end of the audio range. The frame is a
+// view into the caller's buffer. Damaged data is skipped: when a frame does not
+// parse, the search continues at the next sync, and a stream with nothing valid
+// left simply ends. Only a bad argument or an inconsistent parser is an error.
 fn mp3_next(m as *Mp3, frame as *Mp3Frame) as i64 {
+    if (cast(i64, m) == 0 || cast(i64, frame) == 0) { return errno.I_BADPARAM; }
+    if (m.pos < m.audio_start || m.pos > m.audio_end) { return errno.I_CORRUPT; }
+    while (1) {
+        if (m.pos == m.audio_end) { return 0; }
+        let is i64 as r = _mp3_next_strict(m, frame);
+        if (r == 1 || r == 0) { return r; }
+        let is i64 as off with mut = 0;
+        if (_mp3_resync(m, m.pos + 1, &off) < 0) {
+            m.pos = m.audio_end;
+            return 0;
+        }
+        m.pos = off;
+    }
+    return 0;
+}
+
+// One frame at the current position, or a negative code with the position and
+// the frame unchanged.
+fn _mp3_next_strict(m as *Mp3, frame as *Mp3Frame) as i64 {
     if (cast(i64, m) == 0 || cast(i64, frame) == 0) { return errno.I_BADPARAM; }
     if (m.pos < m.audio_start || m.pos > m.audio_end) { return errno.I_CORRUPT; }
     if (m.pos == m.audio_end) { return 0; }
@@ -776,19 +822,6 @@ fn mp3_next(m as *Mp3, frame as *Mp3Frame) as i64 {
                             h.side_info_len, h.version, h.channels, &side);
     if (r < 0) { return r; }
 
-    // Reservoir bound: the frame plus its backpointer may not exceed the
-    // 7680-bit Layer III buffer, and the 9/8-bit field caps it further.
-    let is i64 as max_mdb = t.MP3_RESERVOIR_BITS - h.frame_len * 8;
-    let is i64 as cap with mut = t.MP3_MAX_MDB_MPEG2;
-    if (h.mpeg1 != 0) { cap = t.MP3_MAX_MDB_MPEG1; }
-    let is i64 as mdb_max with mut = 0;
-    if (max_mdb > 0) {
-        mdb_max = max_mdb;
-        if (mdb_max > cap) { mdb_max = cap; }
-    }
-    // main_data_begin counts bytes; the standard's bound is in bits
-    // (4088/2040 for the 9/8-bit field, and 7680 minus the frame bits).
-    if (side.main_data_begin * 8 > mdb_max) { return errno.I_CORRUPT; }
     // The backpointer indexes the logical main-data stream of earlier
     // frames, not raw file offsets. The first frame has no earlier main
     // data, so it must have main_data_begin 0.
