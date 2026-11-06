@@ -36,9 +36,9 @@
 //   decode_vp9_work_need(dec)         work_need after I_NOMEM
 //
 // Opus and MP3 need no extra block: their state is inside the Decoder. The
-// optional stage-9 tile threads add a third block, which the wrappers at the
-// bottom expose (decode_vp9_bind_threads and friends); they are written
-// against the stage 9 API and that branch is not merged yet.
+// optional tile threads add a third block, which the wrappers at the bottom
+// expose (decode_vp9_bind_threads and friends); they forward the thread API in
+// the merged video/vp9/decode.cst.
 //
 // Packet handoff
 // --------------
@@ -819,7 +819,6 @@ fn decode_vp9_frame_need(d as *Decoder) as i64 {
 
 // Required worker-block size after receive returned I_NOMEM for the thread
 // block; 0 when tile threads are off or the last frame did not report one.
-// PENDING: this reads the stage 9 Vp9Threads.need field.
 fn decode_vp9_threads_need(d as *Decoder) as i64 {
     let is i64 as r = _vp9_check(d);
     if (r < 0) { return r; }
@@ -827,7 +826,7 @@ fn decode_vp9_threads_need(d as *Decoder) as i64 {
 }
 
 // Attach a worker block and enable tile threads; `workers` includes the
-// calling thread, so 2 means one spawned worker. PENDING: stage 9 API.
+// calling thread, so 2 means one spawned worker.
 fn decode_vp9_bind_threads(d as *Decoder, mem as *u8, cap as i64,
                            workers as i64) as i64 {
     let is i64 as r = _vp9_check(d);
@@ -835,7 +834,7 @@ fn decode_vp9_bind_threads(d as *Decoder, mem as *u8, cap as i64,
     return vp9.vp9_decoder_bind_threads(&d.vp9_dec, mem, cap, workers);
 }
 
-// Change the worker count after decode_vp9_bind_threads. PENDING: stage 9 API.
+// Change the worker count after decode_vp9_bind_threads.
 fn decode_vp9_set_threads(d as *Decoder, workers as i64) as i64 {
     let is i64 as r = _vp9_check(d);
     if (r < 0) { return r; }

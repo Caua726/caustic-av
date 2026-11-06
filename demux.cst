@@ -9,11 +9,11 @@
 //   demux_track_count(d)         tracks discovered so far
 //   demux_track(d, i)            one codec.Track, or null out of range
 //
-// No file is opened, no byte is copied, and nothing is allocated. Every packet
-// points into the caller's source buffer (or, for an Ogg packet that spans
-// pages, into the Ogg state's own fixed assembly buffer), so the bytes are
-// valid until the next demux_next call. The source itself must outlive the
-// Demux.
+// No file is opened and nothing is allocated. Matroska and raw MP3 packets
+// point into the caller's source buffer; an Ogg packet that spans pages is
+// assembled in the Ogg state's own fixed buffer, which container/ogg.cst
+// documents. Either way the bytes are valid until the next demux_next call.
+// The source itself must outlive the Demux.
 //
 // Sniffing is by leading bytes only, in this order:
 //

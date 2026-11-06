@@ -18,7 +18,7 @@ NOT RUN.
 | `core/codec.cst` | `CODEC_*` and `TRACK_*` identifiers, `codec_name`, `codec_kind`, `kind_name`, the neutral `Track`, `track_clear`. |
 | `container/matroska.cst` | The Matroska/WebM demuxer this module dispatches to (stage 2, merged). |
 | `container/ogg.cst` | The Ogg demuxer this module dispatches to (stage 7, merged). |
-| `audio/mp3/mp3.cst` | The raw MP3 parser this module dispatches to. **PENDING:** stage 8a, written on `stage8a-mp3`, not merged. |
+| `audio/mp3/mp3.cst` | The raw MP3 parser this module dispatches to (merged stage 8). |
 | `audio/opus/opus_head.cst` | Parses OpusHead for Ogg track fields (merged). |
 
 ## API
@@ -33,7 +33,9 @@ demux_track(d, i)              *codec.Track, or null out of range
 ```
 
 `Demux`, `Track`, `Packet` and every other structure are caller-owned. The
-library opens no file, allocates nothing, and copies no packet byte. A `Demux`
+library opens no file and allocates nothing. Matroska and raw MP3 packets
+borrow the source directly; an Ogg packet that spans pages is assembled in the
+Ogg state's fixed 64 KiB buffer, which `container/ogg.cst` documents. A `Demux`
 embeds the Matroska, Ogg and MP3 demuxer states at once (the Ogg assembly
 buffer alone is 64 KiB), so it belongs in caller storage rather than a small
 stack; Caustic has no untagged union to overlay the three.
@@ -228,7 +230,7 @@ open.
 | `I_BADPARAM` | null `Demux`/`Packet`, negative length, null source with bytes. |
 | `I_EOF` | empty source; a container header or page cut short; a declared frame past the source. |
 | `I_BADMAGIC` | no recognised signature; EBML DocType neither webm nor matroska; no Layer III frame after the ID3 tag/junk. |
-| `I_UNSUPPORTED` | Ogg version other than 0; too many Ogg tracks; a Layer I/II or free-format MP3 stream that carried an ID3 tag; an MP3 frame whose rate/channels change mid-stream. Without an ID3 tag, the sniff scan accepts only a Layer III frame and reports `I_BADMAGIC`. |
+| `I_UNSUPPORTED` | Matroska: `DocTypeReadVersion > 4`, `EBMLReadVersion > 1`, `EBMLMaxIDLength` outside 1..4, `EBMLMaxSizeLength` outside 1..8, `TrackTimestampScale != 1.0`, or a negative BlockGroup `DiscardPadding`. Ogg: version other than 0, or too many tracks. MP3: a Layer I/II or free-format stream that carried an ID3 tag, or a frame whose rate/channels change mid-stream. Without an ID3 tag, the sniff scan accepts only a Layer III frame and reports `I_BADMAGIC`. |
 | `I_CORRUPT` | malformed page/EBML/block/header; a track index outside the published list; a timestamp past the arithmetic ceiling. |
 | `I_DIMS` | a Matroska audio rate too large to represent; an ID3-tagged MP3 larger than `core/bits`' byte ceiling. |
 
@@ -238,13 +240,12 @@ Container modules already behave that way; the hub preserves it.
 
 ## Integration points and assumptions
 
-- **MP3 (stage 8a, not merged).** `demux.cst` imports `audio/mp3/mp3.cst` and
-  uses `mp3_open`, `mp3_next`, `mp3_header_parse`, the `Mp3` state,
+- **MP3 (merged stage 8).** `demux.cst` imports `audio/mp3/mp3.cst` and uses
+  `mp3_open`, `mp3_next`, `mp3_header_parse`, the `Mp3` state,
   `Mp3Frame.header/side`, `offset`, `length`, `samples_per_frame`,
-  `reservoir_back`, `first_frame`, and the Xing/LAME fields named above. If
-  the merged stage 8 names any of these differently, the call sites are the
-  only place to adapt. Until that branch merges, the hub branch does not
-  compile.
+  `reservoir_back`, `first_frame`, and the Xing/LAME fields named above.
+  Those names were re-checked against merged `main` (`1cc1c63`) and match, so
+  no call-site adaptation was needed.
 - **Matroska/Ogg** use only already-merged public functions
   (`mk_open`, `mk_next`, `mk_track_count`, `mk_track`, `mk_track_codec_eq`,
   `ogg_open`, `ogg_next`, `ogg_track_count`, `ogg_track`).
@@ -289,33 +290,64 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
   a chained stream; the alternative (scan the whole file at open) would cost
   a second full pass.
 - **MP3 Xing/LAME trimming.** The parser exposes encoder delay/padding, but
-  the track list does not carry them and the hub does not trim. Stage 8b's
-  note assigns gapless trimming to the decode path; it is not implemented
-  there in the branch read. PENDING for a later stage.
+  the track list does not carry them and the hub does not trim. The merged MP3
+  notes leave gapless trimming to the layer that owns the stream (the caller
+  of `mp3_next`/`mp3_decode_frame`); that layer is this hub, and it is not
+  done. PENDING (review item 3).
 
 ## Pending review notes
 
-1. `demux_sniff` runs the MP3 parser and `demux_open` runs it again on the
-   same bytes. Correct but does double work; a later interface could return a
-   prepared parser.
-2. `codec.Track.codec_id` is null for Ogg and raw MP3. The unified `codec`
-   plus `codec_name` identify them; if a caller expects a container-style id
-   string on every track, a synthetic one would be needed.
-3. `_fill_ogg_track` silently leaves `channels = 0` when OpusHead parsing
-   fails, instead of publishing a partial error. `decode.open` reports the
-   real error from the same bytes.
-4. The `Track.kind` field for Matroska comes from TrackType, while
-   `decode_kind` later reports the codec's media type. They agree for every
-   codec this stage decodes and can differ only for a mislabelled or unknown
-   track.
-5. `demux.cst` documents `I_DIMS` for an oversized Matroska rate; the same
-   ceiling is not applied to an Ogg rate because Ogg Opus is fixed at 48000
-   and the other mappings publish 0.
-6. `container/matroska.cst` attaches a BlockGroup's DiscardPadding to every
-   lace packet of that block. `demux_next` clears it on all but the last lace
-   using `Mk.lace_index`/`Mk.lace_count`; that is a hub-side correction of a
-   container detail, and a future matroska change could mark the last lace
-   itself and let this wrapper disappear.
+Items 1-3 are behavioural/contract notes from the post-rebase review; 4-10 are
+LOW.
+
+1. **Ogg Opus per-packet pts is page-end, not packet start.**
+   `container/ogg.cst` sets `Packet.pts` to the completing page's granule,
+   which for Opus is the sample count through the last packet on that page;
+   earlier packets on the page share it. Neither the container module nor
+   `demux.cst` derives per-packet starts from the Opus TOC durations.
+   `decode.cst` passes the value through unchanged. A caller that needs exact
+   starts must walk the TOC or accept page granularity.
+2. **OpusHead output gain has no decode-level application or accessor.**
+   `opus_decoder_init` stores the Q7.8 value and
+   `opus_decoder_set_apply_gain` exists, but `decode.cst` has no decode-level
+   getter/setter and leaves `apply_gain` at its default (off). RFC 7845
+   Section 5.1 says players and media frameworks SHOULD apply it by default,
+   with any additional volume adjustment applied in addition; this hub leaves
+   that choice to the caller. PENDING.
+3. **Raw-MP3 gapless trimming belongs to this hub and is not done.**
+   The merged MP3 notes say neither MP3 stage trims and that dropping encoder
+   delay/padding belongs to the layer that owns the stream (the caller of
+   `mp3_next`/`mp3_decode_frame`). That layer is `demux.cst`/`decode.cst`:
+   `Track` carries no `encoder_delay`/`encoder_padding`, and no hub API
+   exposes them. PENDING.
+4. **"copies no packet byte" was wrong for Ogg.** An Ogg packet that spans
+   pages is copied into `Ogg.pktbuf`. `demux.cst` and the ownership section
+   above now say so. LOW.
+5. **`Mp3Frame.index` is always 0 in the hub's reconstructed frames.**
+   `mp3_decode_frame` does not read the field, so decoded output is
+   unaffected; it is not the stream frame number. LOW.
+6. **Stale not-merged text.** Removed after rebasing onto `1cc1c63`; stages 8
+   and 9 are merged, and their names were re-checked against that tree with
+   no mismatch. LOW.
+7. **EOS-trim advice has no accessor.** `decode.md` suggests using
+   `decode_set_end_trim` for an Ogg Opus EOS granule, but neither `Packet` nor
+   this hub exposes an EOS flag or the final granule; a caller must track it
+   through `container/ogg.cst` or the raw packet stream. The setter itself
+   exists. LOW.
+8. **Unreachable branch in `_receive_mp3`.** `count == 0` can only follow the
+   last-frame DiscardPadding path, which sets `pending = 0`, so
+   `if (d.pending == 0) return 0; continue;` always returns and the `continue`
+   is dead. No behavioural effect. LOW.
+9. **Matroska `I_UNSUPPORTED` causes were missing from the error table.**
+   `mk_open` returns it for `DocTypeReadVersion > 4`, `EBMLReadVersion > 1`,
+   `EBMLMaxIDLength` outside 1..4, `EBMLMaxSizeLength` outside 1..8 and
+   `TrackTimestampScale != 1.0`; `mk_next` returns it for a negative
+   BlockGroup `DiscardPadding` (start padding). The error table above now
+   lists them. LOW.
+10. **`_id_prefix("A_AAC")` also matches `A_AACX`.** The prefix test maps any
+    CodecID beginning with `A_AAC` to `CODEC_AAC`. A Matroska mapping that
+    starts that way is not standard, so this is LOW; tightening it to exact
+    `A_AAC`/`A_AAC/` is a future fix.
 
 ## Checks NOT RUN
 

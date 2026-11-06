@@ -16,8 +16,8 @@ checks are listed at the end as NOT RUN.
 | `decode.cst` | `Decoder`, `Output`, `decode_open`, `decode_send`, `decode_receive`, the VP9 memory wrappers, pre-skip/end-trim hooks. |
 | `video/vp9/decode.cst` | The VP9 frame driver (stages 4-6, merged). |
 | `audio/opus/opus.cst` | The Opus decoder (stage 7, merged). |
-| `audio/mp3/mp3.cst` | The MP3 stream parser (stage 8a, not merged). |
-| `audio/mp3/mp3_decode.cst` | The MP3 Layer III decode path (stage 8b, not merged). |
+| `audio/mp3/mp3.cst` | The MP3 stream parser (merged stage 8). |
+| `audio/mp3/mp3_decode.cst` | The MP3 Layer III decode path (merged stage 8). |
 | `core/frame.cst`, `core/samples.cst`, `core/codec.cst` | Output views and the `codec.Track` this layer consumes. |
 
 ## API
@@ -202,6 +202,12 @@ range-checked before multiplication. For Matroska Opus, 120-sample frames at
   zero calls `decode_set_pre_skip(dec, 0)` before the first packet. The output
   `pts` remains the packet's container timestamp: the dropped samples are the
   coded pre-roll, so the first returned sample belongs at that timestamp.
+- **Output gain.** `OpusHead.output_gain` is parsed and stored by
+  `opus_decoder_init`, and `opus_decoder_set_apply_gain` can enable it, but the
+  hub neither applies it nor gives it a decode-level accessor: `apply_gain`
+  stays at its default (off). RFC 7845 Section 5.1 says players and media
+  frameworks SHOULD apply it by default, with any additional volume adjustment
+  applied in addition. LOW (review item 2).
 - **Codec delay.** Matroska's `CodecDelay` is stored in the `Decoder` and
   reported by `decode_codec_delay`, but it is not applied a second time.
   `container/matroska.cst` reports block timestamps unshifted and explains
@@ -224,7 +230,10 @@ range-checked before multiplication. For Matroska Opus, 120-sample frames at
 - **Ogg EOS trim.** Ogg has no DiscardPadding element. RFC 7845 puts the end
   trim in the final granule, which the caller can turn into a sample count and
   pass to `decode_set_end_trim` before the final packet; the next packet's
-  DiscardPadding (if any) is added to it rather than replacing it.
+  DiscardPadding (if any) is added to it rather than replacing it. There is no
+  EOS flag or final-granule accessor on `Packet` or in the hub: the caller
+  must obtain the final granule from `container/ogg.cst` or track it on the raw
+  packet stream. LOW (review item 7).
 
 `_ns_to_samples` splits the nanosecond value into whole seconds and a
 remainder before multiplying, so no untrusted padding value can overflow the
@@ -282,10 +291,10 @@ decode_vp9_bind            -> vp9_decoder_bind
 decode_vp9_add_buffer      -> vp9_decoder_add_buffer
 decode_vp9_free_buffer     -> vp9_decoder_free_buffer
 decode_vp9_replace_buffer  -> vp9_decoder_replace_buffer
-decode_vp9_bind_threads    -> vp9_decoder_bind_threads   (stage 9, PENDING)
-decode_vp9_set_threads     -> vp9_decoder_set_threads    (stage 9, PENDING)
-decode_vp9_threads_work_size -> vp9_threads_work_size    (stage 9, PENDING)
-decode_vp9_threads_need    -> Vp9Threads.need            (stage 9, PENDING)
+decode_vp9_bind_threads    -> vp9_decoder_bind_threads   (merged)
+decode_vp9_set_threads     -> vp9_decoder_set_threads    (merged)
+decode_vp9_threads_work_size -> vp9_threads_work_size    (merged)
+decode_vp9_threads_need    -> Vp9Threads.need            (merged)
 ```
 
 The sizes (`work_size`, `frame_size`, `threads_work_size`) are static and do
@@ -320,23 +329,21 @@ as `video/vp9/vp9.md` records.
 
 ## Integration points and assumptions
 
-- **MP3 (stage 8a/8b, not merged).** The hub imports
+- **MP3 (merged stage 8).** The hub imports
   `audio/mp3/mp3.cst` and `audio/mp3/mp3_decode.cst` and uses:
   `mp3_header_parse`, `mp3_side_info_parse`, `Mp3Header.frame_len`,
   `side_info_offset`, `side_info_len`, `side_info_end`, `sample_rate`,
   `channels`, `samples_per_frame`, `version`; `Mp3SideInfo.main_data_begin`;
   `Mp3Frame` and its fields; `Mp3Decode.stream.src/len`, `mp3_decode_init`,
-  `mp3_decode_frame(m, frame, pcm, cap_bytes)`. This is exactly the API in
-  stage 8a's and 8b's notes. If the merge renames anything, these call sites
-  are the adaptation point. Until both branches merge, the hub branch does not
-  compile.
-- **VP9 (stages 4-6 merged; 9 not merged).** The base `vp9_decoder_*`,
-  `vp9_work_size`, `vp9_frame_size` and `Vp9Output` are on `main`. The thread
-  wrappers and `Vp9Threads.need` are written against the documented stage 9
-  API (`vp9_decoder_bind_threads`, `vp9_decoder_set_threads`,
-  `vp9_threads_work_size`, `Vp9Threads.need`); they are PENDING until that
-  branch merges. The SIMD layer changes no public function signature and needs
-  no hub call.
+  `mp3_decode_frame(m, frame, pcm, cap_bytes)`. Those names were re-checked
+  against merged `main` (`1cc1c63`) and match, so no call-site adaptation was
+  needed.
+- **VP9 (stages 4-6 and 9 merged).** The base `vp9_decoder_*`,
+  `vp9_work_size`, `vp9_frame_size` and `Vp9Output` are on `main`, and the
+  tile-thread API (`vp9_decoder_bind_threads`, `vp9_decoder_set_threads`,
+  `vp9_threads_work_size`, `Vp9Threads.need`) is in the same merged tree. The
+  hub wrappers forward it; their names were re-checked against `1cc1c63`. The
+  SIMD layer changes no public function signature and needs no hub call.
 - **Opus (stage 7 merged).** Uses `opus_decoder_init`, `opus_decode`,
   `opus_decoder_rate/channels/pre_skip/set_pre_skip`,
   `opus_decoder_end_trim/set_end_trim`, and `opus.OpusDecoder` by value.
@@ -357,14 +364,15 @@ plausible output:
   `vp9_residual_tables_ready()` and returns `I_UNSUPPORTED` while either blob
   is pending, so the hub returns `I_UNSUPPORTED` for every frame until the
   generators have been run and their output committed.
-- **MP3:** stage 8a's note lists `MP3_WINDOW_LONG/START/STOP/SHORT` and
-  `MP3_DCT_TWIDDLE` as pending analytical blobs and reports
-  `mp3_window_tables_ready() == 0`; it lists the 512-entry Table 3-B.3
-  synthesis window as committed data in `mp3_tables_data.cst`. Stage 8b's note
+- **MP3:** the merged MP3 notes list `MP3_WINDOW_LONG/START/STOP/SHORT` and
+  `MP3_DCT_TWIDDLE` as pending analytical blobs and report
+  `mp3_window_tables_ready() == 0`; they list the 512-entry Table 3-B.3
+  synthesis window as committed data in `mp3_tables_data.cst`. The decode note
   says it builds analytic windows and reads only that synthesis vector through
-  `mp3_synth_window`; if the merged branch left the vector zero-filled,
-  synthesis would be silent rather than an error. Neither note says it is
-  zero-filled, so this is a merge-time check, not a hub guard.
+  `mp3_synth_window`; if the tree left the vector zero-filled, synthesis would
+  be silent rather than an error. The merged tree still has
+  `MP3_WINDOW_TABLES_GENERATED == 0`, so the analytical blobs remain a
+  generator task.
 - **Opus:** `celt_tables_data.cst` and `silk_tables_data.cst` are committed;
   their own notes are the authority for whether any generated blob remains.
 
@@ -382,7 +390,8 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
   `.work/vp9/spec/clean.txt` and the repository's `video/vp9/vp9.md`.
 - RFC 6716 / RFC 7845 (Opus frame durations, pre-skip, granule) through
   `.work/opus/spec/` and the repository's `audio/opus/opus.md`.
-- The stage 8a/8b MP3 notes on the `stage8a-mp3` / `stage8b-mp3` branches.
+- The merged MP3 parser and decode notes (`audio/mp3/mp3.md`,
+  `audio/mp3/mp3_decode.md`), read on their stage branches before the rebase.
 
 ## UNCONFIRMED
 
@@ -398,10 +407,11 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
   on the theory that Opus pre-skip already covers it. A file where the two
   disagree keeps the difference; this is unverified against ffmpeg's
   packet-time output.
-- **MP3 gapless trimming.** The stage 8b note assigns LAME/VBRI delay and
-  padding trimming to the decode path, but the branch read does not implement
-  it. The hub applies only Matroska DiscardPadding and does not read the
-  parser's `encoder_delay`/`encoder_padding`. PENDING.
+- **MP3 gapless trimming.** The merged MP3 notes leave LAME/VBRI delay and
+  padding trimming to the layer that owns the stream (the caller of
+  `mp3_next`/`mp3_decode_frame`). That is this hub, and it does not trim:
+  `Track` carries no `encoder_delay`/`encoder_padding` and no hub API exposes
+  them. The hub applies only Matroska DiscardPadding. PENDING (review item 3).
 - **MP3 frame independence.** `keyframe` in the demuxer is 0 when a frame's
   main data reaches into the reservoir. The decoder still needs the preceding
   frames; a caller that treats every packet as seekable would be wrong.
@@ -429,22 +439,57 @@ Read only to understand behaviour; no code was copied, ported or transcribed:
 
 ## Pending review notes
 
-1. `decode_send` accepts a zero-length Opus packet (with a null data pointer)
-   and lets `opus_decode` reject it at receive time. Failing earlier would be
-   possible with `opus_packet_parse`, but that duplicates the decoder's own
-   validation.
-2. `decode_open` does not store the track's width/height for VP9. The caller
-   sizes the work and pixel blocks from the track it already has, or from the
-   stream's key-frame header; the hub does not need them.
-3. `decode_codec_delay` is informational. A future API could return a
-   shifted `pts` and let the caller choose, instead of documenting the
-   subtraction outside the module.
-4. `_receive_mp3` drops the packet's last frame when `DiscardPadding` covers
-   it instead of carrying the excess. Valid files do not hit this; the
-   alternative would match the Opus decoder's carry semantics.
-5. `decode_set_end_trim` has no upper bound beyond the Opus decoder's
-   non-negative check; a caller can ask to trim more than the stream holds,
-   which simply drops everything.
+Items 1-3 are behavioural/contract notes from the post-rebase review; 4-10 are
+LOW.
+
+1. **Ogg Opus per-packet pts is page-end, not packet start.**
+   `container/ogg.cst` sets `Packet.pts` to the completing page's granule,
+   which for Opus is the sample count through the last packet on that page;
+   earlier packets on the page share it. Neither the container module nor this
+   hub derives per-packet starts from the Opus TOC durations. Output `pts` is
+   passed through unchanged. A caller that needs exact starts must walk the
+   TOC or accept page granularity.
+2. **OpusHead output gain has no decode-level application or accessor.**
+   `opus_decoder_init` stores the Q7.8 value and
+   `opus_decoder_set_apply_gain` exists, but `decode.cst` has no decode-level
+   getter/setter and leaves `apply_gain` at its default (off). RFC 7845
+   Section 5.1 says players and media frameworks SHOULD apply it by default,
+   with any additional volume adjustment applied in addition; this hub leaves
+   that choice to the caller. PENDING.
+3. **Raw-MP3 gapless trimming belongs to this hub and is not done.**
+   The merged MP3 notes say neither MP3 stage trims and that dropping encoder
+   delay/padding belongs to the layer that owns the stream (the caller of
+   `mp3_next`/`mp3_decode_frame`). That layer is `demux.cst`/`decode.cst`:
+   `Track` carries no `encoder_delay`/`encoder_padding`, and no hub API
+   exposes them. PENDING.
+4. **"copies no packet byte" was wrong for Ogg.** An Ogg packet that spans
+   pages is copied into `Ogg.pktbuf`. `demux.cst` and `demux.md` now say so.
+   LOW.
+5. **`Mp3Frame.index` is always 0 in the reconstructed frame.**
+   `mp3_decode_frame` does not read the field, so decoded output is
+   unaffected; it is not the stream frame number. LOW.
+6. **Stale not-merged text.** Removed after rebasing onto `1cc1c63`; stages 8
+   and 9 are merged, and their names were re-checked against that tree with
+   no mismatch. LOW.
+7. **EOS-trim advice has no accessor.** This note suggests using
+   `decode_set_end_trim` for an Ogg Opus EOS granule, but neither `Packet` nor
+   the hub exposes an EOS flag or the final granule; a caller must track it
+   through `container/ogg.cst` or the raw packet stream. The setter itself
+   exists. LOW.
+8. **Unreachable branch in `_receive_mp3`.** `count == 0` can only follow the
+   last-frame DiscardPadding path, which sets `pending = 0`, so
+   `if (d.pending == 0) return 0; continue;` always returns and the `continue`
+   is dead. No behavioural effect. LOW.
+9. **Matroska `I_UNSUPPORTED` causes were missing from the demux error
+   table.** `mk_open` returns it for `DocTypeReadVersion > 4`,
+   `EBMLReadVersion > 1`, `EBMLMaxIDLength` outside 1..4,
+   `EBMLMaxSizeLength` outside 1..8 and `TrackTimestampScale != 1.0`;
+   `mk_next` returns it for a negative BlockGroup `DiscardPadding` (start
+   padding). `demux.md` now lists them. LOW.
+10. **`_id_prefix("A_AAC")` also matches `A_AACX`.** The prefix test maps any
+    CodecID beginning with `A_AAC` to `CODEC_AAC`. A Matroska mapping that
+    starts that way is not standard, so this is LOW; tightening it to exact
+    `A_AAC`/`A_AAC/` is a future fix.
 
 ## Checks NOT RUN
 
