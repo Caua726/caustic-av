@@ -566,12 +566,13 @@ fn _sink_start(s as *Session, ti as i64, t as *av.codec.Track,
 }
 
 // RFC 7845 4.3/4.4: the final page granule minus pre-skip is the final PCM
-// sample position; the number of samples to keep is that position minus the
-// stream's initial PCM position. A normal stream starts at granule zero, so
-// the initial position is zero. A cropped or joined stream (Section 4.5) can
-// start at a positive granule; the initial position is then
+// sample position; the number of output samples to keep is that position
+// minus the stream's initial granule position (the granule before its first
+// decoded sample). A normal stream starts at granule zero, so the initial
+// granule is zero. A cropped or joined stream (Section 4.5) can start at a
+// positive granule; the initial granule is then
 //
-//   first_page_granule - first_page_decoded_samples - pre_skip
+//   first_page_granule - first_page_decoded_samples
 //
 // and the example estimates first_page_decoded_samples as the samples the
 // first page returned plus the pre-skip. That is exact when the pre-skip lies
