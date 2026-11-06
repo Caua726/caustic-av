@@ -1,0 +1,83 @@
+// =======================================================
+// caustic-av/dsp/vp9_dsp_abi.cst
+// The VP9 acceleration table and the CPU feature bits it is built from.
+//
+// This file holds only the type and the constants, so both the portable
+// dispatcher (`dsp/vp9_dsp.cst`) and an architecture module can name them
+// without an import cycle: the dispatcher imports the architecture module,
+// the architecture module imports this file, and this file imports nothing.
+//
+// The table and what a null slot means
+// ------------------------------------
+// `Vp9Dsp` carries one function pointer per kernel that has an accelerated
+// implementation. A null slot is not an error and not a fallback chain: it
+// means "the codec's own scalar kernel", which lives in the video module that
+// owns the process (`video/vp9/predict.cst`, `transforms.cst`, `inter.cst`).
+// The scalar code is therefore never duplicated here and never removed:
+// it is the reference the accelerated kernels are checked against, and it is
+// what runs on every target or CPU that has no kernel installed.
+//
+// A slot is written once, at initialisation, with a value that never changes
+// for the life of the process (see `dsp/vp9_dsp.cst`), so a reader sees either
+// null or a finished kernel pointer; there is no state in which a slot points
+// at a half-built kernel.
+//
+// Kernel ABI
+// ----------
+// Every kernel is a plain SysV x86_64 call with integer arguments only
+// (pointers and counts), so no floating-point argument register is involved:
+//
+//   intra:     void fn(u8 *dst, i64 stride, const u8 *above,
+//                      const u8 *left, i64 size)
+//   residual:  void fn(u8 *dst, i64 stride, const i32 *dq, i64 n0)
+//   compound:  void fn(u8 *a, i64 a_stride, const u8 *b, i64 b_stride,
+//                      i64 w, i64 h)
+//
+// `above` points at aboveRow[0] of section 8.5.1, so aboveRow[-1] (the
+// top-left sample) is `above[-1]`; `left` points at leftCol[0]. Both arrays
+// are the ones section 8.5.1 defines, already substituted with the 127/129
+// values for an unavailable side, so a kernel never has to know about
+// availability. A kernel that does not read a side (V reads only `above`,
+// H only `left`) still receives both; the argument is simply ignored.
+//
+// A kernel writes the whole size x size block, exactly as the scalar
+// predictor does, and returns nothing: the inputs it is given are validated
+// by the caller (`size` is 4, 8, 16 or 32; `n0` is 4, 8, 16 or 32; a compound
+// call has w a multiple of 16), so a kernel may assume its preconditions.
+// =======================================================
+
+// CPU features, as reported by the architecture probe. The bits say what the
+// CPU offers; a kernel is installed only when the bit its instruction set
+// needs is present.
+let is i64 as VP9_DSP_SSE2  with imut = 1;    // leaf 1, EDX bit 26
+let is i64 as VP9_DSP_SSE41 with imut = 2;    // leaf 1, ECX bit 19
+let is i64 as VP9_DSP_AVX   with imut = 4;    // leaf 1, ECX bit 28
+let is i64 as VP9_DSP_AVX2  with imut = 8;    // leaf 7.0, EBX bit 5
+
+// 1 on x86_64 with the System V ABI (Linux and the other ELF targets), 0
+// everywhere else. Both builtins are parser-injected literals, so this folds
+// to a literal at semantic time and every `if (VP9_X86_SYSV == 1)` around a
+// reference into dsp/x86_64/ is a dead branch on the other targets — the
+// name of a module that the gated import did not load is never resolved
+// there. It is written as a single comparison at each use because the
+// compiler folds comparisons of literals but deliberately does not fold
+// arithmetic expressions into literals at the AST level.
+let is i64 as VP9_X86_SYSV with imut = __target_is_x86_64 - __target_is_windows;
+
+struct Vp9Dsp {
+    // Intra predictors, `void fn(u8*, i64, const u8*, const u8*, i64)`.
+    pred_v      as *u8;
+    pred_h      as *u8;
+    pred_tm     as *u8;
+
+    // Spec 8.6.2 step 4, `void fn(u8*, i64, const i32*, i64)`.
+    add_residual as *u8;
+
+    // 8.5.2 compound average, Round2(a + b, 1),
+    // `void fn(u8*, i64, const u8*, i64, i64, i64)`.
+    compound_avg as *u8;
+
+    // Feature bits the install pass saw, for diagnostics. Written with the
+    // slots and never again; 0 on a target that installs nothing.
+    features    as i64;
+}
