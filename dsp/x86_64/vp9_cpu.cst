@@ -6,10 +6,10 @@
 // the SysV calling convention defines and is imported only under
 // `__target_is_x86_64 - __target_is_windows == 1` (see dsp/vp9_dsp.cst).
 //
-// CPUID is the only instruction here that caustic's assembler lacks nothing
-// for: `cpuid` is a supported mnemonic and is used exactly as the Caustic
-// guide documents it. The results the bits come from are the ones the Intel
-// SDM defines:
+// caustic-as has no `cpuid` mnemonic, so the instruction is emitted the way
+// the compiler's own feature probe emits it: `asm(".byte 15, 162\n")`
+// (`src/codegen/emit_inst.cst`). The results the bits come from are the ones
+// the Intel SDM defines:
 //
 //   leaf 1, EDX bit 26   SSE2
 //   leaf 1, ECX bit 19   SSE4.1
@@ -39,12 +39,12 @@ fn vp9_cpu_probe_x86_64() as i64 with naked {
     // Highest basic leaf, kept in r8d (CPUID does not touch r8).
     asm("xor eax, eax\n");
     asm("xor ecx, ecx\n");
-    asm("cpuid\n");
+    asm(".byte 15, 162\n");   // cpuid
     asm("mov r8d, eax\n");
     // Leaf 1: SSE2 (EDX bit 26), SSE4.1 (ECX bit 19), AVX (ECX bit 28).
     asm("mov eax, 1\n");
     asm("xor ecx, ecx\n");
-    asm("cpuid\n");
+    asm(".byte 15, 162\n");   // cpuid
     asm("xor r9d, r9d\n");
     asm("mov eax, edx\n");
     asm("and eax, 67108864\n");
@@ -66,7 +66,7 @@ fn vp9_cpu_probe_x86_64() as i64 with naked {
     asm("jb .Lvp9dsp_cpu_done\n");
     asm("mov eax, 7\n");
     asm("xor ecx, ecx\n");
-    asm("cpuid\n");
+    asm(".byte 15, 162\n");   // cpuid
     asm("mov eax, ebx\n");
     asm("and eax, 32\n");
     asm("jz .Lvp9dsp_cpu_done\n");
