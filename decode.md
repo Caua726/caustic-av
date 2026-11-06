@@ -97,6 +97,9 @@ After a VP9 `I_NOMEM`, `decode_vp9_work_need`, `decode_vp9_frame_need` or
 `decode_vp9_threads_need` says how large the rejected block had to be; the
 caller re-binds between packets and decodes the frame again. This is the same
 contract `video/vp9/decode.cst` documents, only routed through the hub.
+Reopening the same `Decoder` for another track reinitialises the newly selected
+codec; a VP9 work or pixel binding from an earlier open is not preserved, so
+rebind it after the new `decode_open`.
 
 Audit inputs: every packet length is checked before parsing, every codec call
 validates its own slices, and no size from the file is used as an allocation
