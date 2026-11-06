@@ -10,9 +10,9 @@
 //     length N (channel 0 at 0, channel 1 at N), exactly the layout the band
 //     decoder walks. 2 * 960 f64 covers the largest frame.
 //   * norm holds the previous-band folding data, one plane per channel.
-//   * pf_hist is the post-filter history: CELT_MAX_PERIOD past samples plus
-//     the current frame, per channel. It is linearly memmoved down after each
-//     frame, which keeps the comb filter a plain indexed read.
+//   * pf_hist is the post-filter history: 1024 past samples plus the current
+//     frame, per channel. It is linearly memmoved down after each frame,
+//     which keeps the comb filter a plain indexed read.
 //   * ola holds the tail of the previous frame's windowed inverse MDCT: 120
 //     samples per channel (CELT_OVERLAP).
 //   * No packet-loss state is carried: PLC is out of scope for this decoder
@@ -25,7 +25,6 @@ struct CeltDec {
     // configuration (set once by the Opus layer)
     channels        as i64;   // output channels, 1 or 2
     stream_channels as i64;   // channels coded in the bitstream, 1 or 2
-    rate            as i64;   // always 48000 here
     start           as i64;   // first coded band: 0, or 17 in hybrid mode
     end             as i64;   // one past the last coded band, <= 21
     lm              as i64;   // frame size shift, 0..3

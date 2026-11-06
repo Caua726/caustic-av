@@ -56,6 +56,7 @@ fn celt_alloc_caps(d as *st.CeltDec) as i64 {
 fn celt_pulses2bits(d as *st.CeltDec, n as i64, q as i64) as i64 {
     if (q <= 0) { return 0; }
     if (n < 0 || n > tbl.CELT_MAX_PVQ_N) { return 0; }
+    if (q > tbl.CELT_MAX_PSEUDO) { return 0; }
     return cast(i64, d.tab.pvq_bits[n * 41 + q]);
 }
 
@@ -85,8 +86,10 @@ fn celt_bits2pulses(d as *st.CeltDec, n as i64, bits as i64) as i64 {
     return hi;
 }
 
-// LOG2_FRAC_TABLE lookup for a band count, 0..23. The table lives in the
-// state because it is derived at init, not shipped.
+// LOG2_FRAC_TABLE lookup for a band count, 0..23: the table entry n is
+// log2_frac(n+1, 3), the 1/8-bit cost of the uniform intensity symbol over
+// n+1 values, so callers pass the count itself (RFC 4.3.3). The table lives
+// in the state because it is derived at init, not shipped.
 fn celt_log2frac_at(d as *st.CeltDec, n as i64) as i64 {
     if (n <= 0) { return 0; }
     if (n >= 24) { return d.tab.log2frac[23]; }

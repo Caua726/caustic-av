@@ -6,7 +6,10 @@
 // no PLC: the Opus packet layer owns everything before the first range-coded
 // byte. The caller sets the coded band range and the frame-size shift with
 // celt_set_frame() (start = 0 for CELT-only, 17 for hybrid; end from the
-// bandwidth; LM 0..3), then calls celt_decode() for every frame.
+// bandwidth; LM 0..3), then decodes every frame either with
+// celt_decode_with_range(), which continues a range decoder that SILK has
+// already advanced (hybrid frames), or with celt_decode(), the standalone
+// wrapper that binds a fresh range decoder at byte 0 of the payload.
 //
 // Flow, in bitstream order:
 //   silence, post-filter parameters, transient, intra
@@ -99,7 +102,6 @@ fn celt_init(d as *st.CeltDec, channels as i64, stream_channels as i64) as i64 {
     if (stream_channels < 1 || stream_channels > 2) { return errno.I_BADPARAM; }
     d.channels = channels;
     d.stream_channels = stream_channels;
-    d.rate = 48000;
     d.start = 0;
     d.end = 21;
     d.lm = 3;
@@ -134,12 +136,14 @@ fn celt_frame_size(d as *st.CeltDec) as i64 {
 
 // ── TF table (RFC 4.3.1, Tables 60-63) ──────────────────────────────
 
-// Index = 4*transient + 2*tf_select + per-band flag.
+// Index = 4*transient + 2*tf_select + per-band flag, RFC Tables 60-63. Every
+// frame-size row of those tables has [0, -1] at 2.5 ms, so the flag alone
+// decides there.
 fn _celt_tf_value(lm as i64, transient as i64, tf_select as i64,
                   flag as i64) as i64 {
     let is i64 as idx = 4 * transient + 2 * tf_select + flag;
     if (lm == 0) {
-        if (idx == 1 || idx == 5 || idx == 7) { return -1; }
+        if (flag == 1) { return -1; }
         return 0;
     }
     if (lm == 1) {
@@ -278,45 +282,28 @@ fn celt_synthesise(d as *st.CeltDec, n as i64, lm as i64, transient as i64,
 
 // ── frame decode ────────────────────────────────────────────────────
 
-// Decode one CELT frame. `pcm` is interleaved with d.channels lanes and
-// `pcm_cap` counts scalar values. Returns frames per channel, or a negative
-// error. A NULL payload or an empty one is packet loss, which this decoder
-// does not conceal: I_UNSUPPORTED.
+// Decode one CELT frame from a range decoder the caller already owns.
 //
-// This entry point owns the whole frame slice: it binds a range decoder at
-// byte 0. A hybrid Opus frame shares one range decoder between SILK and
-// CELT, so the Opus layer calls celt_decode_with_range instead after SILK
-// has consumed the leading symbols.
-fn celt_decode(d as *st.CeltDec, data as *u8, len as i64,
-               pcm as *f64, pcm_cap as i64) as i64 {
-    if (data == cast(*u8, 0)) { return errno.I_UNSUPPORTED; }   // PLC
-    if (len < 1) { return errno.I_UNSUPPORTED; }                // PLC
-    if (len > 1275) { return errno.I_CORRUPT; }
-    let is rc.OpusRange as er;
-    let is i64 as er_ret = rc.opus_range_init(&er, data, len);
-    if (er_ret != errno.I_OK) { return er_ret; }
-    return celt_decode_with_range(d, &er, pcm, pcm_cap);
-}
-
-// Decode one CELT frame from a range decoder the caller already initialised
-// over the frame slice. Hybrid frames use this: SILK reads the first symbols
-// from the same frame, including its header bits, and CELT continues at the
-// resulting position. r.len is the frame size the CELT bit budget is
-// measured against; it must be the same slice SILK read.
+// The Opus packet layer reaches this entry for the CELT part of a hybrid
+// frame, and could use it for any frame: `r` keeps the position, the raw-bit
+// cursor and the budget (`r.len` bytes) SILK left behind, and this function
+// neither re-initialises nor shrinks the decoder. The frame budget is
+// `r.len * 8`, the slice still bound after the caller's own trimming, the
+// same way the reference uses `dec->storage*8`.
+//
+// `pcm` is interleaved with d.channels lanes and `pcm_cap` counts scalar
+// values. Returns frames per channel, or a negative error.
 fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
                           pcm as *f64, pcm_cap as i64) as i64 {
     if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
-    let is i64 as len = r.len;
-    if (len < 0) { return errno.I_BADPARAM; }
-    if (len > 0 && cast(i64, r.ptr) == 0) { return errno.I_BADPARAM; }
-    if (len < 1) { return errno.I_UNSUPPORTED; }
-    if (len > 1275) { return errno.I_CORRUPT; }
     if (tbl.celt_tables_ready(&d.tab) == 0) { return errno.I_UNSUPPORTED; }
     if (d.start != 0 && d.start != 17) { return errno.I_BADPARAM; }
     if (d.end <= d.start || d.end > 21) { return errno.I_BADPARAM; }
     if (d.lm < 0 || d.lm > 3) { return errno.I_BADPARAM; }
     if (d.stream_channels < 1 || d.stream_channels > 2) { return errno.I_BADPARAM; }
     if (d.channels < 1 || d.channels > 2) { return errno.I_BADPARAM; }
+    let is i64 as len = r.len;
+    if (len < 0 || len > 1275) { return errno.I_CORRUPT; }
     let is i64 as C = d.stream_channels;
     let is i64 as CC = d.channels;
     let is i64 as lm = d.lm;
@@ -326,11 +313,15 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
     if (pcm == cast(*f64, 0) || pcm_cap < n * CC) { return errno.I_BADPARAM; }
 
     let is i64 as total_bits = len * 8;
-    let is i64 as tell0 = rc.opus_range_tell(r);
+    // The reference captures the bit position before the silence symbol and
+    // keeps using that stale value for the optional-symbol gates, refreshing
+    // it only where a block was actually entered (RFC 4.3, Table 56 order).
+    let is i64 as tell with mut = rc.opus_range_tell(r);
+    if (tell < 0) { return tell; }
     let is i64 as silence with mut = 0;
-    if (tell0 >= total_bits) {
+    if (tell >= total_bits) {
         silence = 1;
-    } else if (tell0 == 1) {
+    } else if (tell == 1) {
         silence = rc.opus_range_bit_logp(r, 15);
     }
     let is i64 as M = 1 << lm;
@@ -356,7 +347,8 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
 
     if (silence == 0) {
         // Post-filter parameters, RFC 4.3.7.1 (coded first, applied last).
-        let is i64 as tell with mut = rc.opus_range_tell(r);
+        // The gate uses the tell captured before the silence symbol; the
+        // value is refreshed only because this block was entered.
         if (start == 0 && tell + 16 <= total_bits) {
             if (rc.opus_range_bit_logp(r, 1) != 0) {
                 let is i64 as octave = rc.opus_range_uint(r, 6);
@@ -368,17 +360,19 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
                 }
                 pf_gain = 0.09375 * cast(f64, qg + 1);
             }
+            tell = rc.opus_range_tell(r);
         }
 
-        // Transient (RFC 4.3.1).
-        tell = rc.opus_range_tell(r);
+        // Transient (RFC 4.3.1). Same rule: gate on the current tell and
+        // refresh it only when the symbol is actually read.
         if (lm > 0 && tell + 3 <= total_bits) {
             transient = rc.opus_range_bit_logp(r, 3);
+            tell = rc.opus_range_tell(r);
         }
 
-        // Intra energy flag (RFC 4.3.2.1).
+        // Intra energy flag (RFC 4.3.2.1): gated on the same tell and not
+        // refreshed afterwards (coarse energy captures its own).
         let is i64 as intra with mut = 0;
-        tell = rc.opus_range_tell(r);
         if (tell + 3 <= total_bits) {
             intra = rc.opus_range_bit_logp(r, 3);
         }
@@ -524,11 +518,19 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
     let is i64 as sr = celt_synthesise(d, n, lm, transient, silence, C, CC);
     if (sr != errno.I_OK) { return sr; }
 
-    // Post-filter and de-emphasis for each output channel.
+    // Post-filter and de-emphasis for each output channel, then one state
+    // advance for the frame (RFC 4.3.7.1): every channel is filtered with the
+    // same old -> current -> new transition, and only afterwards does the
+    // filter state move on.
     let is i64 as c with mut = 0;
     while (c < CC) {
-        mdct.celt_postfilter_frame(d, c, n, lm, pf_period, pf_gain, pf_tapset);
+        mdct.celt_postfilter_apply(d, c, n, lm, pf_period, pf_gain, pf_tapset);
         mdct.celt_deemphasis_write(d, c, n, CC, pcm);
+        c = c + 1;
+    }
+    mdct.celt_postfilter_advance(d, lm, pf_period, pf_gain, pf_tapset);
+    c = 0;
+    while (c < CC) {
         mdct.celt_postfilter_shift(d, c, n);
         c = c + 1;
     }
@@ -546,4 +548,20 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
 
     if (rc.opus_range_tell(r) > len * 8) { return errno.I_CORRUPT; }
     return n;
+}
+
+// Decode one standalone CELT frame payload: bind a range decoder at the first
+// byte of `data` and delegate to celt_decode_with_range(). A NULL payload or
+// one with fewer than two bytes is packet loss, which this decoder does not
+// conceal: I_UNSUPPORTED (the reference treats `len <= 1` the same way).
+// Returns frames per channel, or a negative error.
+fn celt_decode(d as *st.CeltDec, data as *u8, len as i64,
+               pcm as *f64, pcm_cap as i64) as i64 {
+    if (data == cast(*u8, 0)) { return errno.I_UNSUPPORTED; }   // PLC
+    if (len <= 1) { return errno.I_UNSUPPORTED; }               // PLC
+    if (len > 1275) { return errno.I_CORRUPT; }
+    let is rc.OpusRange as r;
+    let is i64 as rr = rc.opus_range_init(&r, data, len);
+    if (rr != errno.I_OK) { return rr; }
+    return celt_decode_with_range(d, &r, pcm, pcm_cap);
 }

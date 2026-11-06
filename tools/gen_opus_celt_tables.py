@@ -3,7 +3,10 @@
 
 This tool is committed source. It is NOT run in the writing phase: the
 committed audio/opus/celt_tables_data.cst is the output it produces, and
-celt.md records the validation it performs.
+celt.md records the validation it performs. `--check-only` validates the
+constants *and* compares the committed file byte for byte with what this
+tool would emit, so a passing check is evidence that the committed blob and
+the committed generator agree.
 
 What it emits
     audio/opus/celt_tables_data.cst with the three CELT tables that RFC 6716
@@ -36,14 +39,18 @@ Validation performed before writing
     * TF tables match RFC Tables 60-63 and use only the printed values;
     * window W(n)=sin(pi/2*sin(pi/2*(n+1/2)/120)^2) is monotone and satisfies
       W(i)^2 + W(119-i)^2 = 1 within 1e-12;
-    * log2_frac is exact on powers of two and equals ceil(8*log2(v)) for the
-      values the allocation uses;
+    * log2_frac is exact on powers of two and, elsewhere, inside
+      [ceil(8*log2(v)), ceil(8*log2(v)) + 1] (the helper's own rounding may
+      add one unit);
+    * log2_frac(i+1, 3) for i = 0..23 equals the reference LOG2_FRAC_TABLE
+      literal that the decoder derives at init;
     * V(N,K) from the recurrence equals the closed form
       sum_{j=1..K} 2^j * C(N,j) * C(K-1,j-1) for small N,K, and
       bits(N,q)=log2_frac(V(N,get_pulses(q)),3) is non-decreasing in q.
 
 Usage
     python3 tools/gen_opus_celt_tables.py -o audio/opus/celt_tables_data.cst
+    python3 tools/gen_opus_celt_tables.py --check-only
 """
 
 import argparse
@@ -248,13 +255,13 @@ def validate():
     need(len(ALLOC) == 11 and all(len(r) == 21 for r in ALLOC), "ALLOC shape")
     need(all(0 <= v <= 200 for r in ALLOC for v in r), "ALLOC range")
 
-    # TF table against RFC Tables 60-63.
-    expect = {
-        (0, 0): [0, -1], (0, 1): [0, -1], (1, 0): [0, -1], (1, 1): [0, -1],
-        (0, 0, 1): [0, -1], (0, 1, 1): [0, -1],
-        (1, 0, 1): [1, 0], (1, 1, 1): [1, -1],
-        (2, 0): [0, -2], (2, 1): [0, -2], (2, 0, 1): [2, 0], (2, 1, 1): [1, -1],
-        (3, 0): [0, -2], (3, 1): [0, -2], (3, 0, 1): [3, 0], (3, 1, 1): [1, -1],
+    # TF table against RFC Tables 60-63. Each table lists the two per-band
+    # flags for the four frame sizes (LM 0..3, i.e. 2.5/5/10/20 ms).
+    tables = {
+        (0, 0): [[0, -1], [0, -1], [0, -2], [0, -2]],   # Table 60
+        (0, 1): [[0, -1], [0, -2], [0, -3], [0, -3]],   # Table 61
+        (1, 0): [[0, -1], [1, 0], [2, 0], [3, 0]],      # Table 62
+        (1, 1): [[0, -1], [1, -1], [1, -1], [1, -1]],   # Table 63
     }
     need(len(TF_TABLE) == 4 and all(len(r) == 8 for r in TF_TABLE), "TF shape")
     need(all(v in (-3, -2, -1, 0, 1, 2, 3) for r in TF_TABLE for v in r), "TF values")
@@ -262,11 +269,11 @@ def validate():
         for tr in range(2):
             for sel in range(2):
                 for flag in range(2):
-                    v = TF_TABLE[lm][4 * tr + 2 * sel + flag]
-                    key = (lm, tr) if sel == 0 else (lm, tr, 1)
-                    if key in expect:
-                        need(v == expect[key][flag],
-                             "TF mismatch LM %d tr %d sel %d flag %d" % (lm, tr, sel, flag))
+                    got = TF_TABLE[lm][4 * tr + 2 * sel + flag]
+                    want = tables[(tr, sel)][lm][flag]
+                    need(got == want,
+                         "TF mismatch LM %d transient %d select %d flag %d: "
+                         "%d, table says %d" % (lm, tr, sel, flag, got, want))
 
     # Means and models.
     need(len(E_MEANS_Q4) == 25, "eMeans length")
@@ -303,6 +310,16 @@ def validate():
         need(lo <= got <= lo + 1,
              "log2_frac bounds at %d: %d not in [%d,%d]" % (v, got, lo, lo + 1))
 
+    # LOG2_FRAC_TABLE as celt_tables.cst derives it at init:
+    # table[i] = log2_frac(i+1, 3) must equal the reference's 24 literals,
+    # because the stereo intensity and skip reservations are exact bits.
+    log2_frac_ref = [0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31,
+                     32, 32, 33, 34, 34, 35, 36, 36, 37, 37]
+    for i, want in enumerate(log2_frac_ref):
+        got = log2_frac(i + 1, 3)
+        need(got == want,
+             "LOG2_FRAC_TABLE[%d] = %d, reference says %d" % (i, got, want))
+
     # PVQ recurrence against the closed form (RFC 4.3.4.2), small values.
     for n in range(1, 7):
         for k in range(1, 7):
@@ -320,7 +337,8 @@ def validate():
     return errors
 
 
-def emit(path):
+def render():
+    """The exact text the generator writes for the current constants."""
     out = [PREFIX]
     out.append('\nlet is *u8 as CELT_TBL_E_MEANS with imut =\n    "'
                + " ".join(str(v) for v in E_MEANS_Q4) + '";\n')
@@ -330,8 +348,12 @@ def emit(path):
     out.append('\nlet is *u8 as CELT_TBL_CAPS with imut =\n    "'
                + " ".join(" ".join(str(v) for v in row)
                           for lm in CAPS for row in lm) + '";\n')
+    return "".join(out)
+
+
+def emit(path):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("".join(out))
+        f.write(render())
 
 
 def main(argv):
@@ -340,10 +362,22 @@ def main(argv):
                     default="audio/opus/celt_tables_data.cst",
                     help="output file")
     ap.add_argument("--check-only", action="store_true",
-                    help="validate the tables without writing")
+                    help="validate the constants and compare the emitted file")
     args = ap.parse_args(argv)
 
     errors = validate()
+    # --check-only also proves that the committed blob is exactly what this
+    # tool emits, so the check is reproducible from the repository alone.
+    if args.check_only:
+        try:
+            with open(args.output, encoding="utf-8", newline="") as f:
+                committed = f.read()
+        except OSError as exc:
+            errors.append("cannot read %s: %s" % (args.output, exc))
+        else:
+            if committed != render():
+                errors.append("%s is not what this generator emits"
+                              % args.output)
     if errors:
         for e in errors:
             print("error: " + e, file=sys.stderr)

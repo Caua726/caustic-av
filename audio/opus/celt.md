@@ -2,8 +2,10 @@
 
 Stage 7c. It decodes one CELT frame payload — no Opus TOC byte, no packet
 padding, no loss concealment — into 48 kHz f64 PCM. The Opus packet layer
-decides the frame size, the coded band range and the channel count and calls
-`celt_decode` once per frame.
+decides the frame size, the coded band range and the channel count, then
+calls `celt_decode_with_range` (the entry that continues a range decoder
+SILK has already advanced, for hybrid frames) or `celt_decode` (the
+standalone wrapper) once per frame.
 
 ## Files
 
@@ -28,7 +30,7 @@ the packet layer.
 
 `CeltDec` is caller-owned and fixed-size. It contains:
 
-- configuration: output channels (1-2), stream channels (1-2), rate (48 kHz),
+- configuration: output channels (1-2), stream channels (1-2),
   `start` (0 or 17), `end` (<= 21), `lm` (0-3), `disable_inv`.
 - energy history: `old_e`, `old_log_e`, `old_log_e2`, 2 x 21 values each,
   log2 domain, without the mean table.
@@ -49,18 +51,40 @@ touching the tables. `celt_set_frame` validates and stores the band range and
 
 ## Frame flow
 
-`celt_decode(data, len, pcm, pcm_cap)` requires `len >= 1` and `len <= 1275`.
-A NULL or empty payload is packet loss and returns `I_UNSUPPORTED`: this
-decoder has no PLC and refuses to pretend. It then follows Table 56:
+`celt_decode_with_range(d, r, pcm, pcm_cap)` decodes one frame from a range
+decoder the caller already owns (`r` is an `OpusRange` bound by
+`opus_range_init`). It reads the current position and never re-initialises,
+shrinks or resets the decoder, so the Opus packet layer can call it after
+SILK has consumed the front of a hybrid frame. The frame budget is
+`r.len * 8` bits, the slice the caller bound. `celt_decode(data, len, pcm,
+pcm_cap)` is the standalone wrapper: it binds a fresh range decoder at byte
+0 of `data` and delegates. The wrapper requires `2 <= len <= 1275`; a NULL
+payload or one with fewer than two bytes is packet loss (`I_UNSUPPORTED`, as
+the reference treats `len <= 1`), because this decoder has no PLC and
+refuses to pretend. The range entry accepts any slice the caller bound
+(`0 <= r.len <= 1275`): an empty slice makes `tell >= total_bits`, so the
+frame decodes as silence rather than failing.
 
-1. **silence**: if the range decoder has consumed the frame, or the very
-   first symbol (logp 15) says silence, the whole frame is silent. The path
-   still runs synthesis and the filters so the overlap tail and filter state
-   decay exactly as a zero frame would; energies are set to the -28 floor.
-2. **post-filter**: only for `start == 0` and only if 16 bits fit. Octave
-   (uniform 6), 4+octave raw bits, gain (3 raw bits) and tapset ({2,1,1}/4).
-   Period = (16<<octave) + fine - 1, so 15..1022.
-3. **transient** (logp 3, only when LM > 0), **intra** (logp 3).
+Decoding then follows Table 56:
+
+1. **silence**: the bit position is captured *before* this symbol. If the
+   range decoder has consumed the frame, or the very first symbol (logp 15)
+   says silence, the whole frame is silent and the remaining symbols are
+   skipped (the reference pretends `len*8` bits were read). The path still
+   runs synthesis and the filters so the overlap tail and filter state decay
+   exactly as a zero frame would; energies are set to the -28 floor.
+2. **post-filter**: only for `start == 0` and only if 16 bits fit, gated on
+   the tell captured before the silence symbol. Octave (uniform 6),
+   4+octave raw bits, gain (3 raw bits) and tapset ({2,1,1}/4). Period =
+   (16<<octave) + fine - 1, so 15..1022.
+3. **transient** (logp 3, only when LM > 0), **intra** (logp 3). The
+   reference gates these on the same tell variable and refreshes it only
+   where a block was actually entered: after the post-filter block, and after
+   the transient symbol when it is read. This decoder threads that variable
+   the same way. On a valid stream the stale and current values coincide at
+   every gate (the only symbol the stale value can hide is the silence flag,
+   and its non-silent outcome leaves the whole-bit tell unchanged), so this
+   is a fidelity fix to the gate order, not a change in what is parsed.
 4. **coarse energy**: per band and channel, Laplace with the frame-size and
    intra/inter model for as long as 15 bits remain; otherwise the small
    uniform symbol, a single logp-1 bit, or -1.
@@ -76,6 +100,14 @@ decoder has no PLC and refuses to pretend. It then follows Table 56:
     **anti-collapse** bit (reserved earlier), then the **final fine bits**.
 11. **denormalise**, inverse MDCT, overlap-add, comb post-filter,
     de-emphasis and interleaved PCM.
+
+The post-filter is applied to every output channel with the same transition
+(the state left by the previous frame crossed to this frame's parameters,
+over the squared window), and only after the channel loop is the filter
+state advanced once: previous := current, current := this frame's, and for
+LM > 0 previous := current again. Advancing inside the channel loop would
+give channel 1 different endpoints and would corrupt the following frame at
+LM = 0. De-emphasis and the history shift follow per channel.
 
 The frame budget checks use `opus_range_tell` (bits) where the syntax is
 counted in bits and `opus_range_tell_frac` (1/8 bits) where the allocation
@@ -93,7 +125,11 @@ drives the range decoder:
 - skip: backwards from the last band, with the reference's band-bit estimate
   and the one reserved bit; a kept band stops the loop.
 - intensity: `start + uint(coded+1-start)`; dual: one logp-1 bit, only when
-  intensity stereo is in use.
+  intensity stereo is in use. The reservation is `LOG2_FRAC_TABLE[n]` with
+  `n` the band count, and the table entry `n` is `log2_frac(n+1, 3)` — the
+  1/8-bit cost of the uniform symbol over `n+1` values. Building it as
+  `log2_frac(n, 3)` leaves the stereo reservation one 1/8 bit short except
+  at fullband and three short for a hybrid frame.
 - leftover bits are spread by `percoeff` over the band-edge span in 2.5 ms
   units (not frame bins) and the remainder one bin at a time.
 - fine/PVQ split: the reference's `dof`, `NClogN`, two extra offsets for the
@@ -117,11 +153,13 @@ any equivalent V computation (4.3.4.2).
   `gain` and rotated by the spreading rotation (theta = pi/4 * g_r^2,
   g_r = N/(N + f_r K), f_r from Table 59), including the extra interleaved
   rotation of 4.3.4.3 when the block is large enough.
-- `quant_partition` recurses while `b > max_bits + 12 && N > 2`, coding the
-  mid/side angle with `compute_theta` and rebalancing as it goes. The angle
-  PDFs are the uniform, step (stereo, N>2) and triangular ones of 4.3.4.4;
-  the mid/side gain is `cos(pi/2 * itheta/16384)` and its complement, and the
-  bit difference `delta` comes from the bit-exact log2 tangent.
+- `quant_partition` recurses while `b > pulses2bits(qmax) + 11 && N > 2`
+  (the reference's `cache[qmax] + 12`, with its cache entry equal to
+  `pulses2bits(qmax) - 1`), coding the mid/side angle with `compute_theta`
+  and rebalancing as it goes. The angle PDFs are the uniform, step (stereo,
+  N>2) and triangular ones of 4.3.4.4; the mid/side gain is
+  `cos(pi/2 * itheta/16384)` and its complement, and the bit difference
+  `delta` comes from the bit-exact log2 tangent.
 - `quant_band` applies the TF recombine (`haar1`), time divide, Hadamard
   sequency interleave and their inverses, and scales the folding history by
   sqrt(N) for the next band.
@@ -171,11 +209,11 @@ to mono output averages the two spectra before the inverse MDCT.
 | TF adjustments | 4 x 8 | RFC Tables 60-63 |
 | post-filter taps and gain | 3 x 3 + formula | RFC 4.3.7.1 |
 | de-emphasis coefficient | 1 | RFC 4.3.7.2 |
-| mean band energy | 25 | reference data (RFC 4.3.6 names it, does not print it) |
-| coarse-energy Laplace model | 4 x 2 x 42 | reference data (RFC 4.3.2.1 names it) |
-| band caps | 4 x 2 x 21 | reference data (RFC 4.3.3 defines its conversion and names the source) |
+| mean band energy | 25 | reference data table (the RFC text does not name or print it) |
+| coarse-energy Laplace model | 4 x 2 x 42 | reference data (RFC 4.3.2.1 names `e_prob_model`) |
+| band caps | 4 x 2 x 21 | reference data (RFC 4.3.3 defines its conversion and names the cap source) |
 | window | 120 | RFC 4.3.7 formula, computed at init |
-| logN and log2_frac table | 21 / 24 | conservative log2 formula, computed at init |
+| logN and log2_frac table | 21 / 24 | conservative log2 formula, computed at init; `LOG2_FRAC_TABLE[n] = log2_frac(n+1, 3)` |
 | PVQ pulse/bit cache | 177 x 41 | `log2_frac(V(N,K),3)`, computed at init |
 | PVQ U/V | computed | RFC 4.3.4.2 recurrence |
 
@@ -185,10 +223,12 @@ every value is bounded and dimension-checked by the generator. The
 licence/provenance wording is recorded as UNCONFIRMED for review.
 
 No table is left pending. `tools/gen_opus_celt_tables.py` has **not been
-run** in the writing phase. The committed `celt_tables_data.cst` was written
-with the same literals the generator holds and the same emitter layout; the
-identity of the two has not been confirmed by a diff because nothing was
-executed.
+run** in the writing phase. Its `--check-only` mode now validates the
+constants (including Tables 60-63, whose earlier expectation map mixed the
+transient and non-transient columns) and compares the committed
+`celt_tables_data.cst` byte for byte with the text the generator renders, so
+the check is reproducible from the repository alone. That comparison has not
+been executed here; it is listed under the required checks.
 
 ## Interface for the Opus decoder
 
@@ -200,7 +240,7 @@ celt.celt_reset(&d)                                   // state reset
 celt.celt_set_frame(&d, start, end, lm, stream_channels)
 celt.celt_frame_size(&d)                              // 120<<lm
 celt.celt_decode(&d, data, len, pcm, pcm_cap)         // frames or <0
-celt.celt_decode_with_range(&d, r, pcm, pcm_cap)      // frames or <0
+celt.celt_decode_with_range(&d, &r, pcm, pcm_cap)     // frames or <0
 ```
 
 - `start` is 0 for a CELT-only frame and 17 for a hybrid frame.
@@ -210,16 +250,31 @@ celt.celt_decode_with_range(&d, r, pcm, pcm_cap)      // frames or <0
 - `pcm` is interleaved f64, `pcm_cap` counts scalar values and must be at
   least `frame_size * channels`.
 - The return value is frames per channel on success.
-- `celt_decode` binds its own range decoder at byte 0. A hybrid Opus frame
-  is one range stream shared with SILK, so the Opus layer calls
-  `celt_decode_with_range` with the decoder SILK has already advanced; the
-  CELT bit budget is measured against `r.len`, which must be the same frame
-  slice. If the caller has already parsed a 4.5.1 redundancy header,
-  `r.len` is the *reduced* main-frame slice with the redundant tail
-  excluded, not the original frame size. `r.len` must be non-negative (a
-  negative length is `I_BADPARAM`); `r.len == 0` is the PLC/DTX case and
-  returns `I_UNSUPPORTED`; `r.ptr` must be non-null when `r.len > 0`
-  (`I_BADPARAM`).
+
+`celt_decode_with_range` is the hybrid path and the lowest-level entry:
+
+- `r` is an `OpusRange` the caller initialised with `opus_range_init` over
+  the frame slice. For a hybrid frame that slice starts at the first byte of
+  the packet and SILK has already advanced the decoder; CELT continues from
+  the same position, sharing the front cursor, the raw-bit cursor and the
+  slice. A zeroed or uninitialised range has `rng == 0`, which
+  `opus_range_tell` reports as `I_CORRUPT`; the entry returns that error
+  instead of decoding garbage.
+- CELT neither re-initialises `r`, nor rewinds it, nor changes `r.len`. The
+  caller may narrow `r.len` before the call (the packet layer does this to
+  move the raw-bit reader past a redundant-CELT tail); CELT uses whatever
+  slice remains. The frame budget is `r.len * 8` bits for every gate
+  (`tell`, `tell_frac`, final energy, anti-collapse), and the final tell
+  must stay within it.
+- The redundant-CELT header and the redundant-frame trimming that precede
+  this call belong to the packet layer; CELT starts at the byte where the
+  high band starts.
+- After the call the caller may keep using `r` (a hybrid frame has no
+  further CELT data, but the packet layer owns the decision).
+
+`celt_decode` is a thin wrapper for CELT-only frames: it rejects a NULL or
+shorter-than-two-byte payload with `I_UNSUPPORTED` (packet loss), bounds
+`len` to 1275, binds `r` at `data[0]` and calls the range entry.
 
 The range decoder contract used is the one agreed for the Ogg/packet/range
 slice:
@@ -227,23 +282,22 @@ slice:
 ```
 OpusRange, opus_range_init, opus_range_decode, opus_range_decode_bin,
 opus_range_update, opus_range_bit_logp, opus_range_icdf, opus_range_uint,
-opus_range_tell, opus_range_tell_frac
+opus_range_bits, opus_range_tell, opus_range_tell_frac
 ```
 
-**Two commands must be added to that contract for this decoder:**
+`opus_range_bits(r, n)` is `ec_dec_bits`, the raw-bit reader. The range
+decoder's raw-bit path is not equivalent to `decode_bin` plus `update`: it
+reads the low window bits directly. The CELT layer needs it for the
+post-filter period/gain, fine energy, final energy, anti-collapse and the
+N=1/N=2 sign bits. It is provided by the range slice
+(`audio/opus/range.cst`).
 
-1. `opus_range_bits(r, n) -> i64` — `ec_dec_bits`, the raw-bit reader. The
-   range decoder's raw-bit path is not equivalent to `decode_bin` plus
-   `update`: it reads the low window bits directly. The CELT layer needs it
-   for the post-filter period/gain, fine energy, final energy, anti-collapse
-   and the N=1/N=2 sign bits.
-2. `opus_range_rng(r) -> i64` (optional) — the final range value, used only
-   as the seed of the folding/anti-collapse LCG. Without it the noise
-   sequence differs from libopus but the bitstream parse is unaffected.
-   `celt_quant_all_bands` currently keeps its own LCG state in `d.rng` and
-   seeds it from zero at reset.
-
-If the range layer names these differently, adapt these two call sites.
+`OpusRange` supplies `len` for the frame budget, and `opus_range_tell`
+supplies the bit position for every optional-symbol gate. No other range
+entry is needed by this layer. `opus_range_rng` (the final range value,
+which libopus uses as the folding/anti-collapse seed) is **not** used:
+`celt_quant_all_bands` keeps its own LCG state in `d.rng`, seeded from zero
+at reset. That divergence is recorded as Pending review note 1.
 
 ## UNCONFIRMED items
 
@@ -267,14 +321,19 @@ scale depend on its FFT normalisation. Both are candidates for a single
 global amplitude/time-offset difference, not for parsing differences. Verify
 with the FFmpeg difference and MD5 checks first.
 
-### U2. Post-filter parameter timing (UNCONFIRMED)
+### U2. Post-filter parameter timing (read-confirmed, external check pending)
 
 RFC 4.3.7.1 says the transition uses the square of the MDCT window but not
 where the segment boundaries are. This decoder follows the reference's
 timing: for LM=0 the filter of the previous frame is used for the whole
 120-sample frame and the new parameters take effect next frame; for LM>0 the
-first 120 samples fade old→previous and the rest fade previous→new. If the
-checks show a one-frame delay mismatch, this is the place to change.
+first 120 samples fade old→previous and the rest fade previous→new. The
+parameters that carry across frames (`pf_period/gain/tapset` and their
+`_old` copies) are advanced once per frame, after every output channel has
+been filtered, exactly as libopus updates them outside its channel loop and
+as FFmpeg keeps one parameter set per block; see `celt_postfilter_apply` and
+`celt_postfilter_advance`. The external checks still have to confirm the
+sample alignment.
 
 ### U3. Noise sequence for folding and anti-collapse (UNCONFIRMED)
 
@@ -293,8 +352,9 @@ integer definitions whose rounding is part of the format: the allocation and
 the mid/side split depend on them. They were reconstructed from the
 reference behaviour and from the requirement that the allocation is exactly
 recoverable (RFC 4.3.3), not copied as code. The generator checks
-`log2_frac` against `ceil(8*log2(v))`; the two cosine helpers are checked
-only by their use. A mismatch shows up as diverging allocations.
+`log2_frac` against `ceil(8*log2(v))`, allowing the helper's own one-unit
+rounding; the two cosine helpers are checked only by their use. A mismatch
+shows up as diverging allocations.
 
 ### U5. `bit_deinterleave` generalisation (UNCONFIRMED)
 
@@ -306,14 +366,86 @@ not exercised by the reference.
 
 ### U6. Provenance of the three data tables (UNCONFIRMED)
 
-`eMeans`, `e_prob_model` and the caps are named by the RFC but printed only
-in the reference implementation. They are reproduced here as data. Confirm
-that treating these constants as specification data is acceptable for the
-project's licence position, and record the wording in this note.
+The RFC names the coarse-energy model (`e_prob_model`, 4.3.2.1) and the cap
+source (4.3.3) and refers to the mean band energy without printing it; all
+three tables are printed only in the reference implementation. They are
+reproduced here as data. Confirm that treating these constants as
+specification data is acceptable for the project's licence position, and
+record the wording in this note.
 
 ## Pending review notes
 
-Low severity, no effect on valid-stream parsing or memory safety:
+The review's numbered findings, with the state of each after this fix pass.
+Items 2, 3, 6, 7 and 8 are fixed on this branch; the rest are recorded and
+deliberately unchanged. None of them affects valid-stream parsing except
+where stated.
+
+1. **Noise seed and magnitude divergence (recorded, not fixed).**
+   `celt_pvq.cst` fills noise bands with 12-bit centred values
+   (`((seed >> 20) & 0xFFF) - 2048`); libopus fills with the unsigned
+   `(opus_int32)seed >> 20`. More importantly, `d.rng` is never seeded from
+   the range decoder's final state: libopus sets `st->rng = dec->rng` at
+   every frame end, while here the LCG is seeded from zero at reset and only
+   threads through `quant_all_bands`. RFC 4.3.5 only asks for a
+   pseudo-random signal, so this is not a spec violation, but folded, noise
+   and anti-collapse blocks will not match the reference sample for sample
+   and the MD5 / `opus_compare` criteria will differ on them. Either match
+   the reference (seed from the range's final `rng`, unsigned noise) or keep
+   the divergence as intentional; not decided here.
+2. **Generator TF validation and `--check-only` (fixed).** The expectation
+   map mixed the transient and non-transient columns of RFC Tables 60-63
+   (for example it wanted `[1, 0]` for the non-transient 5 ms row where
+   Table 61 says `[0, -2]`), so the committed tool would have rejected its
+   own correct `TF_TABLE`. `validate()` now checks all 32 entries against
+   the four tables, and `--check-only` renders the output and compares it
+   byte for byte with the committed `celt_tables_data.cst`. The comparison
+   has not been executed.
+3. **Documentation accuracy (fixed).** The `celt_tables.cst` comment no
+   longer claims the RFC prints the 24 `LOG2_FRAC_TABLE` entries; U6 no
+   longer says 4.3.6 names `eMeans`; the stale "unused local" note about
+   `celt_synthesise` and the energy module is gone; the data-table paragraph
+   now describes the generator check instead of claiming an unverified diff.
+   The DTX/silence wording and the interface section were brought in line
+   with the code.
+4. **Dead Haar on the decoder's scratch X (recorded).**
+   `_celt_quant_band` applies `celt_haar1` to `x` in the forward recombine
+   and time-divide loops; libopus guards those calls with `if (encode)`.
+   In the decoder `x` is scratch and fully overwritten by
+   `quant_partition`, so the result is correct and the work is dead. The undo
+   loops still apply the one transform that matters. Left as is: removing
+   the forward calls would break the symmetry with the reference's structure
+   for no output change.
+5. **Pointer-to-integer arithmetic with a hard-coded 8-byte f64
+   (recorded).** `celt.cst` (the synthesis output pointer), `celt_mdct.cst`
+   (`celt_tbl_offset`) and `celt_pvq.cst` (`celt_elem_ptr`) form pointers as
+   `cast(*f64, cast(i64, base) + off * 8)`, while the rest of these files
+   uses `&base[off]`. It depends on f64 being 8 bytes, which the fixed-size
+   buffers already assume. Converting to the array form would touch every
+   call site; not done in this pass.
+6. **A one-byte payload is packet loss (fixed).** `celt_decode` now rejects
+   `len <= 1` with `I_UNSUPPORTED`, matching libopus
+   (`data == NULL || len <= 1` goes to `celt_decode_lost`). A one-byte CELT
+   payload used to reach the budget check and return `I_CORRUPT`.
+7. **Dead declarations (fixed).** Removed the unused `CELT_MAX_LM`,
+   `CELT_SHORT_MDCT`, `CELT_MAX_FRAME`, `CELT_MAX_BINS`, `CELT_MAX_NORM`,
+   `CELT_MAX_PERIOD`, `CELT_MAX_FINE`, `CELT_QTHETA_OFFSET`,
+   `CELT_QTHETA_TWOPHASE`, `CELT_PVQ_CACHE` and the four `CELT_SPREAD_*`
+   constants from `celt_tables.cst`, and the write-only `rate` field from
+   `CeltDec` together with its initialisation.
+8. **Pulse-cache index (fixed).** `celt_pulses2bits` now rejects
+   `q > CELT_MAX_PSEUDO` (40) before indexing the row, so the
+   out-of-bounds read is impossible by construction instead of merely
+   unreachable through today's callers.
+9. **Provenance wording (recorded).** `celt_log2_frac`,
+   `celt_bitexact_cos/log2tan`, `celt_laplace_decode`, `_celt_cwrsi` and the
+   rate arithmetic necessarily reproduce the reference's integer steps: the
+   format is defined by them. The blanket "no code was copied, ported or
+   transcribed" below is too strong for those helpers; the U6 licence
+   wording should cover them as well as the three data blobs. The wording is
+   not settled here.
+
+Other low-severity notes carried over, no effect on valid-stream parsing or
+memory safety:
 
 1. **Direct O(N^2/2) inverse MDCT.** Correct and auditable, but the 20 ms
    block costs ~0.55 M multiply-adds per channel. A folded FFT-based IMDCT
@@ -322,21 +454,16 @@ Low severity, no effect on valid-stream parsing or memory safety:
    (~2 M operations) and parses the texts for each instance. A process-wide
    const table would remove that cost; the current shape keeps the "caller
    owns all memory, library allocates nothing" rule.
-3. **`celt_synthesise` has an unused `M` local** and the energy module keeps
-   one unused local (`tell` shadowing is intentional in the flow).
-4. **Silence path.** It does not run the coarse-energy -1 updates or the
+3. **Silence path.** It does not run the coarse-energy -1 updates or the
    allocation; it jumps to zero coefficients and the -28 floor. The output
    and history update match the reference's zeros, but the intermediate
    state values are not identical.
-5. **`old_e` clamps.** The reference's ±28 clamps are fixed-point guards;
+4. **`old_e` clamps.** The reference's ±28 clamps are fixed-point guards;
    the f64 path leaves valid values unclamped.
-6. **Post-filter history shift** is a linear memmove of 2048-N samples per
+5. **Post-filter history shift** is a linear memmove of 2048-N samples per
    channel per frame; a ring buffer would avoid the copy.
-7. **Output format.** f64 interleaved. The Opus layer converts; there is no
+6. **Output format.** f64 interleaved. The Opus layer converts; there is no
    S16/F32 path here and no clipping.
-8. **`pf_period_old`/`gain_old`/`tapset_old`** are written but only the
-   post-filter reads them; they are kept for the reference's two-stage
-   transition.
 
 ## Checks required (NOT RUN)
 
@@ -356,15 +483,31 @@ Nothing here was executed.
   reference output, for the CELT-only vectors.
 - **Frame sizes / fps**: 2.5, 5, 10 and 20 ms frames, mono and stereo,
   checking sample count and continuity across frame-size changes.
-- **Hybrid**: at least one hybrid (SILK+CELT, start band 17) stream, after
-  the SILK slice lands.
-- **PLC rejection**: a NULL/empty packet returns `I_UNSUPPORTED` (by
-  inspection; not run).
+- **Hybrid**: at least one hybrid (SILK+CELT, start band 17) stream through
+  `celt_decode_with_range`, after the SILK slice lands, confirming that the
+  shared range decoder continues at the right byte and that `r.len * 8` is
+  the budget SILK left.
+- **PLC rejection**: a NULL payload, an empty one or a single byte returns
+  `I_UNSUPPORTED` (by inspection; not run).
+- **Table generator**: `python3 tools/gen_opus_celt_tables.py --check-only`
+  from the repository root, which validates the constants against RFC
+  Tables 55/57/60-63 and compares the committed `celt_tables_data.cst` with
+  the rendered text (by inspection; not run).
+- **TF row**: the 2.5 ms rows of Tables 60-63 now come from the per-band
+  flag alone (`[0, -1]` in all four tables); a transient 2.5 ms frame with
+  `tf_select = 1` exercises the corrected entry.
 
 ## Reference implementations read
 
 Read only for behaviour and to settle ambiguities; no code was copied,
-ported or transcribed. Data constants are recorded separately above.
+ported or transcribed. Data constants are recorded separately above. The
+integer helpers whose arithmetic is part of the format are an exception to
+that blanket statement — see Pending review note 9.
+
+Confirmed in this pass (post-filter state update and tell gating in
+`celt_decoder.c`; `LOG2_FRAC_TABLE` and `compute_pulse_cache` in `rate.c`;
+the `quant_partition` split condition in `bands.c`; `parse_postfilter` and
+`celt_postfilter` in FFmpeg `dec_celt.c`).
 
 - xiph/opus `main`: `celt/celt_decoder.c` (frame flow, state, synthesis,
   tf_decode, post-filter timing), `celt/celt.c` (comb filter, tf table,
@@ -388,6 +531,7 @@ ported or transcribed. Data constants are recorded separately above.
 
 ## Status
 
-WRITTEN, NOT VERIFIED. Nothing was compiled or run. The stage is complete
-when a read-only reviewer approves it and the checks above have been
-executed in a later phase.
+WRITTEN, NOT VERIFIED. Nothing was compiled or run. This revision fixes the
+review's B1-B5 and PENDING 2, 3, 6, 7 and 8; the stage is complete when a
+read-only reviewer approves it and the checks above have been executed in a
+later phase.

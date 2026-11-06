@@ -521,7 +521,11 @@ fn _celt_quant_partition(d as *st.CeltDec, r as *rc.OpusRange,
     let is i64 as lm with mut = lm_in;
     let is i64 as fill with mut = fill_in;
     let is i64 as B0 = B;
-    let is i64 as maxbits = al.celt_pulses2bits(d, n, d.tab.pvq_qmax[n]);
+    // The reference's cache entry for the last usable q is
+    // pulses2bits(qmax) - 1 (`compute_pulse_cache` stores
+    // `tmp[get_pulses(j)] - 1`), and it splits at cache[qmax] + 12. With this
+    // cache holding the plain log2_frac the split point is one 1/8 bit lower.
+    let is i64 as maxbits = al.celt_pulses2bits(d, n, d.tab.pvq_qmax[n]) - 1;
     if (lm != 0 - 1 && b > maxbits + 12 && n > 2) {
         // Split in two, coding the relative gain of the halves.
         n = n >> 1;

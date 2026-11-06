@@ -199,10 +199,12 @@ fn celt_comb_filter(x as *f64, t0_in as i64, g0 as f64, tap0 as i64,
     }
 }
 
-// Apply the post-filter to one channel's frame, in place, in the history
-// buffer. `new_*` are this frame's decoded parameters; the state keeps the
-// previous frame's.
-fn celt_postfilter_frame(d as *st.CeltDec, c as i64, n as i64, lm as i64,
+// Apply this frame's post-filter to one channel, in place, in its history
+// buffer. Every output channel reads the same transition: the state left by
+// the previous frame (pf_period/pf_gain/pf_tapset) and the parameters decoded
+// in this one. Nothing that carries across frames changes here, apart from
+// the reference's minimum-period clamp, which is idempotent.
+fn celt_postfilter_apply(d as *st.CeltDec, c as i64, n as i64, lm as i64,
                          new_period as i64, new_gain as f64,
                          new_tap as i64) as i64 {
     let is *f64 as hist = &d.pf_hist[c * 2048];
@@ -225,6 +227,15 @@ fn celt_postfilter_frame(d as *st.CeltDec, c as i64, n as i64, lm as i64,
                          d.pf_period, d.pf_gain, d.pf_tapset,
                          new_period, new_gain, new_tap, n - 120, w, 120);
     }
+    return errno.I_OK;
+}
+
+// Advance the post-filter state by exactly one frame, after every output
+// channel has been filtered (RFC 4.3.7.1; the reference updates the
+// parameters outside its channel loop, so all channels see the same
+// old -> current -> new transition).
+fn celt_postfilter_advance(d as *st.CeltDec, lm as i64, new_period as i64,
+                           new_gain as f64, new_tap as i64) as void {
     d.pf_period_old = d.pf_period;
     d.pf_gain_old = d.pf_gain;
     d.pf_tapset_old = d.pf_tapset;
@@ -236,7 +247,6 @@ fn celt_postfilter_frame(d as *st.CeltDec, c as i64, n as i64, lm as i64,
         d.pf_gain_old = d.pf_gain;
         d.pf_tapset_old = d.pf_tapset;
     }
-    return errno.I_OK;
 }
 
 // De-emphasis and interleaved write (RFC 4.3.7.2). `pcm` is interleaved by

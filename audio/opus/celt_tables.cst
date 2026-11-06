@@ -6,7 +6,8 @@
 // formula (band edges from Table 55, the window of 4.3.7, the TF adjustment
 // tables 60-63, the static allocation of Table 57, the PDFs of Table 56 and
 // 58/59) the table is built here from that definition. The three data blobs
-// the RFC only names are in celt_tables_data.cst.
+// the RFC text does not print (it names the coarse-energy model and the cap
+// source, but not the mean band energy) are in celt_tables_data.cst.
 //
 // Two integer helpers are part of the bitstream definition because the
 // decoder must reproduce the encoder's bit allocation exactly:
@@ -33,23 +34,13 @@ use "celt_tables_data.cst" as dt;
 
 // ── mode constants (RFC 6716 4.3) ───────────────────────────────────
 let is i64 as CELT_MAX_BANDS   with imut = 21;    // bands 0..20
-let is i64 as CELT_MAX_LM      with imut = 3;     // 20 ms at 48 kHz
-let is i64 as CELT_SHORT_MDCT  with imut = 120;   // 2.5 ms at 48 kHz
 let is i64 as CELT_OVERLAP     with imut = 120;   // 2.5 ms at 48 kHz
-let is i64 as CELT_MAX_FRAME   with imut = 960;   // 20 ms at 48 kHz
-let is i64 as CELT_MAX_BINS    with imut = 960;   // one MDCT per frame
-let is i64 as CELT_MAX_NORM    with imut = 1248;  // 2 * 8 * eBands[20]
-let is i64 as CELT_MAX_PERIOD  with imut = 1024;  // post-filter history
 let is i64 as CELT_BITRES      with imut = 3;     // allocation in 1/8 bit
 let is i64 as CELT_ALLOC_VEC   with imut = 11;    // Table 57 rows
-let is i64 as CELT_MAX_FINE    with imut = 8;
 let is i64 as CELT_FINE_OFFSET with imut = 21;
-let is i64 as CELT_QTHETA_OFFSET with imut = 4;
-let is i64 as CELT_QTHETA_TWOPHASE with imut = 16;
 let is i64 as CELT_MAX_PSEUDO  with imut = 40;
 let is i64 as CELT_MAX_PVQ_N   with imut = 176;   // 22 << 3
 let is i64 as CELT_PVQ_QBITS   with imut = 41;    // 0..40 plus room
-let is i64 as CELT_PVQ_CACHE   with imut = 7257;  // 177 * 41
 
 // ── inverse CDFs of the single-symbol PDFs (RFC 6716 Table 56) ──────
 //
@@ -71,11 +62,8 @@ let is *u8 as CELT_ICDF_TRIM with imut =
 let is *u8 as CELT_ICDF_TAPSET with imut = "\x02\x01\x00";
 let is *u8 as CELT_ICDF_SMALL_ENERGY with imut = "\x02\x01\x00";
 
-// Spread decision values (RFC 6716 Table 59).
-let is i64 as CELT_SPREAD_NONE       with imut = 0;
-let is i64 as CELT_SPREAD_LIGHT      with imut = 1;
-let is i64 as CELT_SPREAD_NORMAL     with imut = 2;
-let is i64 as CELT_SPREAD_AGGRESSIVE with imut = 3;
+// Spread decision values 0..3 (RFC 6716 Table 59) and their effect on the
+// spreading rotation are applied in celt_pvq.cst; no constant is needed here.
 
 // Arithmetic on the band layout: everything is integral and bounded.
 fn celt_ilog2(v as i64) as i64 {
@@ -185,9 +173,9 @@ struct CeltTab {
     e_means    as [25]f64;      // mean band energy, Q4 data -> f64
     e_prob     as [336]i64;     // coarse-energy Laplace model
     caps       as [168]i64;     // band caps minus 64
-    log2frac   as [24]i64;      // LOG2_FRAC_TABLE
+    log2frac   as [24]i64;      // LOG2_FRAC_TABLE: log2_frac(i+1, 3)
     window     as [120]f64;     // RFC 4.3.7 low-overlap taper
-    pvq_bits   as [7257]i32;    // [N][q] pulse->bits, -1 when unused
+    pvq_bits   as [7257]i32;    // [N][q] pulse->bits, 0 for q > qmax
     pvq_qmax   as [177]i64;     // largest usable q per N
 }
 
@@ -321,12 +309,14 @@ fn celt_tables_init(t as *CeltTab) as i64 {
     r = _celt_parse(dt.CELT_TBL_CAPS, &t.caps[0], 168);
     if (r != errno.I_OK) { return r; }
 
-    // LOG2_FRAC_TABLE[i] is the conservative 1/8-bit log2 of i. The RFC
-    // quotes the 24 entries; deriving them keeps one definition.
-    t.log2frac[0] = 0;
-    i = 1;
+    // LOG2_FRAC_TABLE[i] is the conservative 1/8-bit log2 of i+1, that is the
+    // cost of a uniform symbol with i+1 values. RFC 4.3.3 names the table
+    // (its entries are the reference's rate.c literal) and the intensity and
+    // skip reservations index it by a band count; deriving the entries from
+    // the same log2_frac keeps one definition.
+    i = 0;
     while (i < 24) {
-        t.log2frac[i] = celt_log2_frac(i, CELT_BITRES);
+        t.log2frac[i] = celt_log2_frac(i + 1, CELT_BITRES);
         i = i + 1;
     }
 
