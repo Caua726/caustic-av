@@ -1,0 +1,439 @@
+// =======================================================
+// caustic-av/video/vp9/threads.cst
+// Optional tile-threaded decoding for VP9: the worker pool, the per-worker
+// private context block and the tile-grid split of section 6.4.
+//
+// What can run in parallel
+// ------------------------
+// Specification section 2 defines a tile as "a rectangular region of the
+// frame that is intended to be able to be decoded and encoded
+// independently", and then says the intention is only partially met: "For
+// VP9 this intention is only partially met. Partitioning into columns works
+// as expected, but partitioning into rows does not. The decode of a tile
+// depends on the decode of the tile above." Section 7.4.1 clears the above
+// context arrays once, before the first tile, and section 7.4.2 clears the
+// left contexts at the start of every 8x8 mode-info row. A tile row below
+// the first therefore reads (a) the above entropy contexts and (b) the
+// above mode-info/pixel neighbours written by the tile above it.
+//
+// The unit of work is consequently a TILE COLUMN for the whole frame: one
+// worker decodes tile columns [first, last) of every tile row, in ascending
+// row order. That keeps each column's above-context and above-neighbour
+// chain on one thread (so it is decoded in the same order as the sequential
+// walk in tile.cst) while tiles in different columns of a row run at the
+// same time. Tiles in different columns write disjoint mode-info cells,
+// disjoint pixel blocks and disjoint columns of the above context arrays;
+// the left contexts, the coefficient buffer, the inter-prediction scratch
+// and the section 9.3.4 counters are private per worker. There is therefore
+// no cross-worker read or write at all: JOIN is the only synchronisation.
+//
+// Everything after the tiles -- the 6.1.2 adaptation, the 8.8 loop filter,
+// the 8.9 output and the 8.10 reference/motion-field bookkeeping -- stays
+// sequential and runs on the caller's thread after the join, over the same
+// complete frame the single-threaded path would have produced.
+//
+// The above context arrays (partition, segment prediction and the three
+// nonzero planes) stay shared, because they are a per-column channel:
+// column j's entries are written and read only by the worker that owns tile
+// column j, in every tile row. The left arrays are per worker because they
+// are indexed by the mode-info row and hold the tile being decoded.
+//
+// Memory
+// ------
+// Nothing here allocates. The caller passes one 8-byte aligned block sized
+// by vp9_threads_size (decode.cst's vp9_threads_work_size maps a visible
+// width/height to it) plus a worker count. For up to VP9_MAX_WORKERS
+// workers the block holds: the Vp9Blk copies, one Vp9CoefCtx and one
+// Vp9Counts each, and a group with the left partition, left segment
+// prediction and left nonzero arrays, the 1024-entry coefficient buffer and
+// the inter-prediction scratch. The thread handles live in Vp9Threads, a
+// caller-owned field of the decoder object, not in that block.
+//
+// The count passed in includes the calling thread: count 2 means one
+// spawned worker plus the caller. Counts above VP9_MAX_WORKERS are clamped.
+// A frame with one tile column (or a decoder with count 0/1) takes the
+// sequential path in tile.cst and never reaches this module.
+//
+// Worker lifetime
+// ---------------
+// No thread is created until a frame is decoded. For each frame tile.cst
+// spawns workers 1..k-1, decodes worker 0 on the calling thread, joins the
+// spawned workers and then decodes, on the calling thread, the range of any
+// worker whose spawn failed. Every started worker is joined before the
+// frame returns, whatever the result, so no thread outlives the frame, and
+// consecutive frames spawn again. spawn/join are per-frame costs, not
+// per-tile ones.
+//
+// Error and taint rules
+// ---------------------
+// A worker stops at the first tile whose Boolean decoder, partition walk or
+// exit check fails, and records that tile's (row, column). tile.cst picks
+// the recorded failure with the smallest (row, column) -- the earliest
+// failing tile in the raster order the sequential walk uses -- so the
+// returned code does not depend on scheduling. On any failure the
+// per-worker counts are not summed into Vp9State.counts and the caller's
+// _decode_slice returns before adaptation, loop filtering and the
+// segment/motion-field updates, exactly as the sequential path does; the
+// persistent state stays tainted until the next key or intra-only frame.
+//
+// Reference frames stay read-only throughout: the workers only read the
+// published slot views (refs.cst) and the probability tables, and write the
+// transient decode target, which no slot names.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "std/thread.cst" as thread;
+use "block.cst" as blk;
+use "vp9_tables.cst" as t;
+use "residual.cst" as res;
+use "inter.cst" as ip;
+
+// Worker slots. A frame can carry up to 64 tile columns, but past the
+// machine's core count extra workers only cost memory and spawn time. The
+// value also sizes the job array in tile.cst, which repeats it as
+// TILE_MT_MAX and must be kept equal.
+let is i64 as VP9_MAX_WORKERS with imut = 16;
+
+// The mode-info ceiling decode.cst enforces (65536 pixels per side / 8).
+// Repeated here so a layout request for an absurd size is refused before
+// any multiplication can overflow.
+let is i64 as VP9_THREADS_MAX_MI with imut = 8192;
+
+// One spawned worker is a handle plus a flag saying whether this frame's
+// spawn succeeded. They are two flat arrays below: thread.spawn writes the
+// handle, thread.join reclaims it, and tile.cst consults the flag to decide
+// which ranges the calling thread must decode itself.
+struct Vp9Threads {
+    base as *u8;         // caller's worker block
+    cap  as i64;
+    need as i64;         // bytes the current frame's slots need (I_NOMEM)
+    count as i64;        // requested workers, 0/1 = sequential
+    frame_workers as i64;  // effective workers of the frame being decoded
+
+    handles as [VP9_MAX_WORKERS]thread.Thread;
+    started as [VP9_MAX_WORKERS]i64;
+
+    // Offsets into base, set by _carve for the frame being decoded.
+    blks_off        as i64;
+    ccs_off         as i64;
+    counts_off      as i64;
+    slices_off      as i64;
+    slice_bytes     as i64;   // per-worker left/coef/scratch group
+    arows           as i64;
+    nz_above_stride as i64;
+    nz_left_stride  as i64;
+    carved          as i64;
+}
+
+// ── small helpers ───────────────────────────────────────────────────
+
+fn _zero_bytes(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { p[i] = cast(u8, 0); i = i + 1; }
+}
+
+fn _align8(off as i64) as i64 {
+    return (off + 7) & (0 - 8);
+}
+
+fn _at(base as *u8, off as i64) as *u8 {
+    return cast(*u8, cast(i64, base) + off);
+}
+
+// The per-worker group inside base, or null when no block is bound.
+fn _slice(thr as *Vp9Threads, w as i64) as *u8 {
+    if (cast(i64, thr) == 0) { return cast(*u8, 0); }
+    if (w < 0 || w >= VP9_MAX_WORKERS) { return cast(*u8, 0); }
+    if (cast(i64, thr.base) == 0) { return cast(*u8, 0); }
+    return _at(thr.base, thr.slices_off + w * thr.slice_bytes);
+}
+
+// ── pool state ──────────────────────────────────────────────────────
+
+// Drop every view. The caller keeps ownership of the block and of any
+// thread handles; this only forgets them (threads are joined per frame, so
+// none can be running here).
+fn vp9_threads_init(thr as *Vp9Threads) as void {
+    if (cast(i64, thr) == 0) { return; }
+    _zero_bytes(cast(*u8, thr), sizeof(Vp9Threads));
+}
+
+fn vp9_threads_workers(thr as *Vp9Threads) as i64 {
+    if (cast(i64, thr) == 0) { return 0; }
+    if (thr.count < 0) { return 0; }
+    return thr.count;
+}
+
+// Attach the caller's worker block and request `workers` threads (the
+// caller included). A block is only required when more than one thread is
+// requested; `workers` 0 or 1 keeps the sequential path. Returns I_OK, or
+// I_BADPARAM for a null context, a negative count, an unaligned block or a
+// missing block with workers > 1.
+fn vp9_threads_bind(thr as *Vp9Threads, mem as *u8, cap as i64,
+                    workers as i64) as i64 {
+    if (cast(i64, thr) == 0) { return errno.I_BADPARAM; }
+    if (workers < 0) { return errno.I_BADPARAM; }
+    let is i64 as n with mut = workers;
+    if (n > VP9_MAX_WORKERS) { n = VP9_MAX_WORKERS; }
+    if (n > 1) {
+        if (cast(i64, mem) == 0) { return errno.I_BADPARAM; }
+        if (cap <= 0) { return errno.I_BADPARAM; }
+        if ((cast(i64, mem) & 7) != 0) { return errno.I_BADPARAM; }
+    }
+    thr.base = mem;
+    thr.cap = cap;
+    if (thr.cap < 0) { thr.cap = 0; }
+    thr.count = n;
+    thr.need = 0;
+    thr.carved = 0;
+    return errno.I_OK;
+}
+
+// Change the worker count without touching the block. Returns the effective
+// count (clamped to VP9_MAX_WORKERS), or I_BADPARAM when threads are asked
+// for before a block was bound.
+fn vp9_threads_set_workers(thr as *Vp9Threads, workers as i64) as i64 {
+    if (cast(i64, thr) == 0) { return errno.I_BADPARAM; }
+    if (workers < 0) { return errno.I_BADPARAM; }
+    let is i64 as n with mut = workers;
+    if (n > VP9_MAX_WORKERS) { n = VP9_MAX_WORKERS; }
+    if (n > 1 && cast(i64, thr.base) == 0) { return errno.I_BADPARAM; }
+    thr.count = n;
+    return n;
+}
+
+// ── per-frame layout ────────────────────────────────────────────────
+
+// Lay out the per-worker slots for an mi_cols x mi_rows mode-info grid and
+// `workers` workers. With a null base only the offsets and `need` are
+// computed, which is what vp9_threads_size uses. The geometry (acols,
+// arows, the nonzero strides) repeats decode.cst's _work_carve, so the
+// thread block can be sized before any frame exists; prepare checks the
+// capacity again for the actual frame.
+//
+// Layout, from the base: [workers x Vp9Blk] [workers x Vp9CoefCtx]
+// [workers x Vp9Counts] [worker groups], every section and the base
+// 8-byte aligned. A group is [left_part arows][left_segpred arows]
+// [left_nz 3*nz_left][pad][coef 1024 x i64][scratch INTER_SCRATCH_BYTES]
+// [pad], so every group has the same size and no per-worker pointers need
+// storing.
+fn _carve(thr as *Vp9Threads, mi_cols as i64, mi_rows as i64,
+          workers as i64, base as *u8, cap as i64) as i64 {
+    if (cast(i64, thr) == 0) { return errno.I_BADPARAM; }
+    if (mi_cols <= 0 || mi_rows <= 0) { return errno.I_BADPARAM; }
+    if (mi_cols > VP9_THREADS_MAX_MI || mi_rows > VP9_THREADS_MAX_MI) {
+        return errno.I_DIMS;
+    }
+    if (workers < 1 || workers > VP9_MAX_WORKERS) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as acols = ((mi_cols + 7) >> 3) << 3;
+    let is i64 as arows = ((mi_rows + 7) >> 3) << 3;
+    if (acols < mi_cols || arows < mi_rows) { return errno.I_DIMS; }
+    let is i64 as nz_above = 2 * acols + 16;
+    let is i64 as nz_left = 2 * arows + 16;
+
+    let is i64 as off with mut = 0;
+    thr.blks_off = off;
+    off = off + workers * sizeof(blk.Vp9Blk);
+    off = _align8(off);
+    thr.ccs_off = off;
+    off = off + workers * sizeof(res.Vp9CoefCtx);
+    off = _align8(off);
+    thr.counts_off = off;
+    off = off + workers * sizeof(t.Vp9Counts);
+    off = _align8(off);
+    thr.slices_off = off;
+
+    let is i64 as group with mut = arows + arows + 3 * nz_left;
+    group = _align8(group);
+    group = group + 1024 * 8;
+    group = group + ip.INTER_SCRATCH_BYTES;
+    group = _align8(group);
+    thr.slice_bytes = group;
+    off = off + workers * group;
+
+    // Every term is bounded by the mi ceiling above and the worker cap, so
+    // off cannot wrap; keep the guard anyway so a future layout change
+    // cannot turn a size bug into an out-of-bounds write.
+    if (off <= 0) { return errno.I_DIMS; }
+
+    thr.arows = arows;
+    thr.nz_above_stride = nz_above;
+    thr.nz_left_stride = nz_left;
+    thr.need = off;
+
+    if (cast(i64, base) == 0) { return errno.I_OK; }
+    if ((cast(i64, base) & 7) != 0) { return errno.I_BADPARAM; }
+    if (cap < off) { return errno.I_NOMEM; }
+    thr.base = base;
+    thr.cap = cap;
+    return errno.I_OK;
+}
+
+// Bytes vp9_threads_bind needs for a decoder that may see frames of
+// mi_cols x mi_rows mode-info units decoded with `workers` threads. Counts
+// above VP9_MAX_WORKERS are clamped, matching bind.
+fn vp9_threads_size(mi_cols as i64, mi_rows as i64, workers as i64) as i64 {
+    if (workers < 1) { return errno.I_BADPARAM; }
+    let is i64 as k with mut = workers;
+    if (k > VP9_MAX_WORKERS) { k = VP9_MAX_WORKERS; }
+    let is Vp9Threads as tmp;
+    let is i64 as st = _carve(&tmp, mi_cols, mi_rows, k, cast(*u8, 0), 0);
+    if (st < 0) { return st; }
+    return tmp.need;
+}
+
+// Prepare the slots for one frame and return the effective worker count
+// (1 means the caller should use the sequential walk). Each slot gets a
+// copy of the frame-wide block context plus its private pointers, an
+// initialised Vp9CoefCtx over the shared above arrays and its own left
+// arrays, and a cleared counter set (section 8.3 / header parse cleared the
+// shared one; the per-worker sets must start at zero for this frame too).
+//
+// Returns I_NOMEM with thr.need set when the bound block is too small.
+fn vp9_threads_prepare(thr as *Vp9Threads, tmpl as *blk.Vp9Blk,
+                       workers as i64) as i64 {
+    if (cast(i64, thr) == 0 || cast(i64, tmpl) == 0) {
+        return errno.I_BADPARAM;
+    }
+    thr.carved = 0;
+    if (workers < 1) { return errno.I_BADPARAM; }
+    let is i64 as k with mut = workers;
+    if (k > VP9_MAX_WORKERS) { k = VP9_MAX_WORKERS; }
+    if (k < 2) { thr.frame_workers = k; return k; }
+    if (cast(i64, thr.base) == 0) { return errno.I_BADPARAM; }
+
+    let is i64 as st = _carve(thr, tmpl.mi_cols, tmpl.mi_rows, k,
+                              thr.base, thr.cap);
+    if (st < 0) { return st; }
+
+    let is i64 as w with mut = 0;
+    while (w < k) {
+        let is *blk.Vp9Blk as wb = vp9_threads_blk(thr, w);
+        if (cast(i64, wb) == 0) { return errno.I_BADPARAM; }
+        blk.blk_copy(wb, tmpl);
+        // The tile walk overwrites these per tile; start from the full row.
+        wb.mi_col_start = 0;
+        wb.mi_col_end = tmpl.mi_cols;
+
+        let is *u8 as sl = _slice(thr, w);
+        if (cast(i64, sl) == 0) { return errno.I_BADPARAM; }
+        let is i64 as coef_off = _align8(2 * thr.arows
+                                         + 3 * thr.nz_left_stride);
+        wb.left_part = sl;
+        wb.left_segpred = _at(sl, thr.arows);
+        wb.left_nz = _at(sl, 2 * thr.arows);
+        wb.coef = cast(*i64, _at(sl, coef_off));
+        wb.scratch = _at(sl, coef_off + 1024 * 8);
+        wb.counts = vp9_threads_counts(thr, w);
+        wb.cc = cast(*res.Vp9CoefCtx,
+                     _at(thr.base, thr.ccs_off
+                                     + w * sizeof(res.Vp9CoefCtx)));
+
+        let is i64 as cs = res.vp9_coef_ctx_init(
+            wb.cc, tmpl.above_nz, thr.nz_above_stride,
+            wb.left_nz, thr.nz_left_stride,
+            tmpl.mi_cols, tmpl.mi_rows, tmpl.sub_x, tmpl.sub_y);
+        if (cs < 0) { return cs; }
+        t.vp9_counts_clear(wb.counts);
+        thr.started[w] = 0;
+        w = w + 1;
+    }
+    thr.frame_workers = k;
+    thr.carved = 1;
+    return k;
+}
+
+// One worker's block context (carved by prepare), or null before prepare.
+fn vp9_threads_blk(thr as *Vp9Threads, w as i64) as *blk.Vp9Blk {
+    if (cast(i64, thr) == 0) { return cast(*blk.Vp9Blk, 0); }
+    if (w < 0 || w >= VP9_MAX_WORKERS) { return cast(*blk.Vp9Blk, 0); }
+    if (cast(i64, thr.base) == 0) { return cast(*blk.Vp9Blk, 0); }
+    return cast(*blk.Vp9Blk,
+                _at(thr.base, thr.blks_off + w * sizeof(blk.Vp9Blk)));
+}
+
+// One worker's section 9.3.4 counter set, or null before prepare.
+fn vp9_threads_counts(thr as *Vp9Threads, w as i64) as *t.Vp9Counts {
+    if (cast(i64, thr) == 0) { return cast(*t.Vp9Counts, 0); }
+    if (w < 0 || w >= VP9_MAX_WORKERS) { return cast(*t.Vp9Counts, 0); }
+    if (cast(i64, thr.base) == 0) { return cast(*t.Vp9Counts, 0); }
+    return cast(*t.Vp9Counts,
+                _at(thr.base, thr.counts_off + w * sizeof(t.Vp9Counts)));
+}
+
+// ── splitting and running ───────────────────────────────────────────
+
+// Split `count` tile columns over `k` workers: worker w owns the contiguous
+// range [w*count/k, (w+1)*count/k). Every worker gets at least one column
+// when k <= count, which the caller guarantees. The split is fixed (no work
+// stealing), so the assignment does not depend on timing; tiles of one row
+// are assumed to cost roughly the same.
+fn vp9_threads_split(count as i64, k as i64, w as i64,
+                     first as *i64, last as *i64) as i64 {
+    if (cast(i64, first) == 0 || cast(i64, last) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (count < 1) { return errno.I_BADPARAM; }
+    if (k < 1 || k > count) { return errno.I_BADPARAM; }
+    if (w < 0 || w >= k) { return errno.I_BADPARAM; }
+    *first = (w * count) / k;
+    *last = ((w + 1) * count) / k;
+    return errno.I_OK;
+}
+
+// Start worker w. `hook` is an fn(arg as i64) as i64 (fn_ptr of tile.cst's
+// worker entry) and `arg` its job pointer. Returns I_OK when the thread
+// started, I_NOMEM when the OS refused; the caller then decodes that range
+// itself.
+fn vp9_threads_spawn(thr as *Vp9Threads, w as i64,
+                     hook as *u8, arg as i64) as i64 {
+    if (cast(i64, thr) == 0) { return errno.I_BADPARAM; }
+    if (w < 1 || w >= thr.frame_workers || w >= VP9_MAX_WORKERS) {
+        return errno.I_BADPARAM;
+    }
+    if (cast(i64, hook) == 0) { return errno.I_BADPARAM; }
+    thr.started[w] = 0;
+    if (thread.spawn(&thr.handles[w], hook, arg) != 0) {
+        return errno.I_NOMEM;
+    }
+    thr.started[w] = 1;
+    return errno.I_OK;
+}
+
+fn vp9_threads_started(thr as *Vp9Threads, w as i64) as i64 {
+    if (cast(i64, thr) == 0) { return 0; }
+    if (w < 0 || w >= VP9_MAX_WORKERS) { return 0; }
+    if (thr.started[w] != 1) { return 0; }
+    return 1;
+}
+
+// Wait for worker w and return its result (0 when it was never started).
+// The join is the happens-before edge: after it returns, tile.cst may read
+// everything that worker wrote.
+fn vp9_threads_join(thr as *Vp9Threads, w as i64) as i64 {
+    if (cast(i64, thr) == 0) { return errno.I_BADPARAM; }
+    if (w < 0 || w >= VP9_MAX_WORKERS) { return errno.I_BADPARAM; }
+    if (thr.started[w] != 1) { return 0; }
+    thr.started[w] = 0;
+    return thread.join(&thr.handles[w]);
+}
+
+// Sum worker w's section 9.3.4 counters into `dst` (the decoder's
+// Vp9State.counts). tile.cst calls this for every worker, in worker order,
+// after all of them have been joined, and only when the frame decoded
+// without error; a failed frame leaves the counts unmerged like the
+// sequential walk, and the next header parse clears them anyway.
+fn vp9_threads_sum_counts(thr as *Vp9Threads, w as i64,
+                          dst as *t.Vp9Counts) as i64 {
+    if (cast(i64, thr) == 0 || cast(i64, dst) == 0) {
+        return errno.I_BADPARAM;
+    }
+    if (w < 0 || w >= VP9_MAX_WORKERS) { return errno.I_BADPARAM; }
+    let is *t.Vp9Counts as src = vp9_threads_counts(thr, w);
+    if (cast(i64, src) == 0) { return errno.I_BADPARAM; }
+    t.vp9_counts_accumulate(dst, src);
+    return errno.I_OK;
+}
