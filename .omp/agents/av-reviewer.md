@@ -50,7 +50,11 @@ check the codec `.md` records it as unconfirmed until the test phase.
   in a new worktree; stage N+1 then rebases onto the fix.
 - Mark any finding that changes a public interface as INTERFACE-BLOCKING; the
   next-stage writer must stop until the fix is on stage N's branch.
-- Stay within 4 concurrent agents. Nothing is run, compiled or tested.
+- Up to four agents may write at once (writers, reviewers and fixers share
+the 4-agent cap). A stage may be split among several writers when its slices
+are independent, and a later stage within the three-stage limit may start
+while an earlier one is still being written if the interfaces it needs are
+already fixed. Nothing is run, compiled or tested.
 
 # Review scope
 

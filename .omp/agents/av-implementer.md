@@ -67,7 +67,11 @@ or erratum, record it in the codec `.md` as unconfirmed until the test phase.
 - A reviewer marks any finding that changes a public interface as
   INTERFACE-BLOCKING. The stage N+1 writer then stops until the fix is on
   stage N's branch, rebases, and adapts.
-- Stay within 4 concurrent agents. Nothing is run, compiled or tested.
+- Up to four agents may write at once (writers, reviewers and fixers share
+the 4-agent cap). A stage may be split among several writers when its slices
+are independent, and a later stage within the three-stage limit may start
+while an earlier one is still being written if the interfaces it needs are
+already fixed. Nothing is run, compiled or tested.
 
 # Hard rules
 
