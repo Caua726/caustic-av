@@ -257,6 +257,12 @@ fn _opus_celt_end(bandwidth as i64) as i64 {
 // then clamp to [-32768, 32767].
 fn _opus_i16(x as f64) as i64 {
     let is f64 as v with mut = x * 32768.0;
+    // A corrupt frame can leave a NaN in the spectral pipeline. Turning it
+    // into silence is better than an undefined float-to-integer cast.
+    let is i64 as bits = *cast(*i64, &v);
+    if (((bits >> 52) & 2047) == 2047 && (bits & 4503599627370495) != 0) {
+        return 0;
+    }
     if (v > 32767.0) { v = 32767.0; }
     if (v < -32768.0) { v = -32768.0; }
     return cast(i64, fm.round(v));

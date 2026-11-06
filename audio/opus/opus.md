@@ -150,8 +150,9 @@ between frames.
 Output is interleaved signed 16-bit, `channels` values per frame, at
 48 kHz. `opus_decode` returns frames per channel and writes the same value
 to `*got`. The f64 sample is scaled by 32768, rounded to nearest, and
-saturated to [-32768, 32767]. No soft clipping is applied; the reference's
-optional soft clip is not implemented (see UNCONFIRMED).
+saturated to [-32768, 32767]. A NaN from a corrupt frame becomes 0 instead
+of an undefined cast; infinities saturate. No soft clipping is applied; the
+reference's optional soft clip is not implemented (see UNCONFIRMED).
 
 ## Pre-skip, end trim and output gain
 
