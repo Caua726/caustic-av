@@ -298,10 +298,7 @@ N=1/N=2 sign bits. It is provided by the range slice
 
 `OpusRange` supplies `len` for the frame budget, and `opus_range_tell`
 supplies the bit position for every optional-symbol gate. No other range
-entry is needed by this layer. `opus_range_rng` (the final range value,
-which libopus uses as the folding/anti-collapse seed) is **not** used:
-`celt_quant_all_bands` keeps its own LCG state in `d.rng`, seeded from zero
-at reset. That divergence is recorded as Pending review note 1.
+entry is needed by this layer. The final range value seeds the next frame: `celt_quant_all_bands` keeps its LCG state in `d.rng`, zero at reset and set to the range state at the end of every frame.
 
 ## UNCONFIRMED items
 

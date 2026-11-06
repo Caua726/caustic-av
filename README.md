@@ -6,7 +6,7 @@
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 > **Decoders only, no encoders.** VP9 Profile 0 passes the official libvpx
-> vectors. Opus passes 8 of the 12 RFC 6716 vectors and MP3 matches FFmpeg on
+> vectors. Opus passes 9 of the 12 RFC 6716 vectors and MP3 matches FFmpeg on
 > real audio. See [Status](#status).
 
 ## What it is
@@ -64,7 +64,7 @@ headers and MP4/WAV demuxing are not written.
 
 | Codec | Decode | Encode | State and written limits |
 |---|---|---|---|
-| Opus | yes | no | 8 of 12 RFC 6716 vectors pass (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
+| Opus | yes | no | 9 of 12 RFC 6716 vectors pass (see Status). Ogg and WebM; OpusHead mapping family 0, 1-2 channels, 48 kHz output, signed 16-bit PCM |
 | MP3 | yes | no | matches FFmpeg on real audio. Layer III only (MPEG-1, MPEG-2 and MPEG-2.5); CBR and VBR; ID3v2.2/2.3/2.4 and ID3v1 skipping; Xing/Info and VBRI metadata; sync scan; free format refused |
 | PCM | no | no | planned |
 | FLAC | no | no | planned |
@@ -343,8 +343,8 @@ Results below use `caustic -O2 examples/decode.cst -o build/decode`.
 | VP9 Profile 0 | **works**: all 331 vectors with an official `.md5` pass frame by frame with 1 thread; 265 of them re-run with 4 threads also pass | libvpx `.md5` files |
 | VP9 on real video | first minute of a 720p video, 1800/1800 frames | FFmpeg `framemd5` |
 | MP3 | **works**: maximum sample difference of 1 on real audio across MPEG-1, 2 and 2.5, mono and stereo, CBR, VBR, joint and plain stereo, and ID3 tags. Leading junk is skipped; after damaged bytes it resynchronises and the tail matches the clean decode | FFmpeg PCM |
-| Opus RFC 6716 vectors | **8 of 12 pass**: 01 (99.8%), 03 (47.3%), 04 (69.1%), 07 (99.6%), 08 (94.8%), 09 (87.9%), 10 (87.7%), 11 (99.7%). Fail: 02 (error 0.464517), 05 (error 0.379529), 06 (error 0.433659), 12 (error 0.916999) (threshold about 0.28) | `opus_compare` |
-| Opus on real audio | 8 s from a real WebM track: maximum sample difference of 1, 101 dB, same length, no offset | libopus through FFmpeg |
+| Opus RFC 6716 vectors | **9 of 12 pass**: 01 (99.8%), 02 (58.4%), 03 (65.5%), 04 (64.6%), 07 (99.6%), 08 (94.7%), 09 (93.8%), 10 (87.8%), 11 (99.7%). Fail: 05 (error 0.379455), 06 (error 0.433649), 12 (error 0.393039) (threshold about 0.28) | `opus_compare` |
+| Opus on real audio | 8 s from a real WebM track: maximum sample difference of 1, 102 dB, same length, no offset | libopus through FFmpeg |
 | Matroska/WebM | exercised by every VP9 vector | same vectors |
 
 Speed on that 720p video (low bitrate): 72 fps with 1 thread, 87 fps with 4, on a
@@ -353,11 +353,11 @@ will be slower.
 
 Not checked yet:
 
-- Why vectors 02, 05, 06, 12 miss the threshold. CELT is near bit-exact, and the SILK and
-  hybrid vectors reach 30-44 dB once low-passed below the band edge, so parsing
-  and synthesis look right. The remaining error sits near the band edge, where
-  our own resampler differs (RFC 6716 section 4.2.9 leaves it free), and in
-  isolated peaks at bandwidth and stereo switches. Not proven to be only that.
+- Why vectors 05, 06, 12 miss the threshold. CELT is near bit-exact. SILK before the
+  resampler reaches about 48 dB against libopus at WB but only 15 to 19 dB at NB
+  and MB on a test sweep, falling as the signal nears the top of the band, so a
+  SILK bug is still open. NLSF to LPC conversion and the stability check were
+  read against the reference and match; the cause is not found yet.
 - Packet loss: PLC and FEC are not written, so the PCM transition a lost-frame
   decode would produce between modes without redundancy is also missing.
 - MP3 beyond 8 s of one track, and the MPEG reference conformance streams.
