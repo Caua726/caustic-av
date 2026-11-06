@@ -1,0 +1,631 @@
+// =======================================================
+// caustic-av/video/vp9/transforms.cst
+// VP9 inverse transforms, dequantisation and residual reconstruction, from
+// the VP9 Bitstream & Decoding Process Specification sections 8.6 and 8.7.
+// No block parsing, no coefficient parsing and no frame handling lives here:
+// the caller hands in a dequantised or token coefficient block and a plane
+// pointer, and this module produces clipped 8-bit samples.
+//
+// Fixed point and scaling
+// -----------------------
+// Everything is the integer path the spec defines:
+//   * Every 1D butterfly multiplies by cos64/sin64, which are
+//     round(16384*cos(angle*pi/64)), and rounds the product back with
+//     Round2(x, 14). There is no other scale factor in the 1D transform.
+//   * The 2D process applies the row transforms without an extra shift, then
+//     rounds each column output with Round2(T, Min(6, n+2)): 4, 5, 6, 6 for
+//     4x4, 8x8, 16x16, 32x32. That is the only place the 2D transform shifts.
+//   * Lossless uses the integer Walsh-Hadamard transform: rows pre-shift by
+//     2, columns by 0, and the column output is *not* rounded again.
+//   * Round2 is (x + (1 << (n-1))) >> n with an arithmetic shift, so it is
+//     the spec's biased rounding, not round-half-to-even.
+// Products and sums are accumulated in i64 even though the spec bounds the T
+// array to 8+BitDepth = 16 bits and the ADST intermediate array S to
+// 24+BitDepth = 32 bits: i64 removes any dependence on the compiler's wrap
+// behaviour in the intermediate steps. Values written into T are cast back to
+// i32 after each butterfly, as the spec stores them.
+//
+// The dequantiser checks the spec's conformance bound on its output (a signed
+// 16-bit value) and reports I_CORRUPT rather than silently wrapping.
+//
+// 32x32 has a DCT only: the spec defines no 32-point ADST. Lossless has a
+// 4x4 WHT only and the syntax forces TxType = DCT_DCT for it.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "recon_tables.cst" as rt;
+
+// Round2 and Clip1 come from recon_tables (rt.recon_round2, rt.recon_clip1),
+// which carries the spec section 4.6 definitions for every kernel.
+
+// brev(numBits, x) from spec 8.7.1.1: reverse the low numBits of x.
+fn tx_brev(numbits as i64, x as i64) as i64 {
+    let is i64 as t with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < numbits) {
+        let is i64 as bit = (x >> i) & 1;
+        t = t + (bit << (numbits - 1 - i));
+        i = i + 1;
+    }
+    return t;
+}
+
+// B(a, b, angle, 0) from spec 8.7.1.1: a butterfly rotation in place on T,
+// rounded by 14 bits. The spec's two-multiply special case for
+// angle = 16 + 32*k is algebraically and bit-for-bit the same products, so the
+// general form is used for every angle.
+fn tx_butterfly(t as *i32, a as i64, b as i64, angle as i64, flip as i64) as void {
+    let is i64 as ta = cast(i64, t[a]);
+    let is i64 as tb = cast(i64, t[b]);
+    let is i64 as c = rt.recon_cos64(angle);
+    let is i64 as s = rt.recon_sin64(angle);
+    let is i64 as x = ta * c - tb * s;
+    let is i64 as y = ta * s + tb * c;
+    t[a] = cast(i32, rt.recon_round2(x, 14));
+    t[b] = cast(i32, rt.recon_round2(y, 14));
+    if (flip == 1) {
+        let is i32 as tmp = t[a];
+        t[a] = t[b];
+        t[b] = tmp;
+    }
+}
+
+// H(a, b, 0) from spec 8.7.1.1: a Hadamard rotation on T. flip means the
+// indices are swapped, H(b, a, 0).
+fn tx_hadamard(t as *i32, a as i64, b as i64, flip as i64) as void {
+    let is i64 as ia with mut = a;
+    let is i64 as ib with mut = b;
+    if (flip == 1) { ia = b; ib = a; }
+    let is i64 as x = cast(i64, t[ia]);
+    let is i64 as y = cast(i64, t[ib]);
+    t[ia] = cast(i32, x + y);
+    t[ib] = cast(i32, x - y);
+}
+
+// SB(a, b, angle, 0) from spec 8.7.1.1: unrounded butterfly rotation from T
+// into S. flip exchanges S[a] and S[b] afterwards.
+fn tx_sb(t as *i32, s as *i64, a as i64, b as i64, angle as i64, flip as i64) as void {
+    let is i64 as ta = cast(i64, t[a]);
+    let is i64 as tb = cast(i64, t[b]);
+    let is i64 as c = rt.recon_cos64(angle);
+    let is i64 as sn = rt.recon_sin64(angle);
+    s[a] = ta * c - tb * sn;
+    s[b] = ta * sn + tb * c;
+    if (flip == 1) {
+        let is i64 as tmp = s[a];
+        s[a] = s[b];
+        s[b] = tmp;
+    }
+}
+
+// SH(a, b) from spec 8.7.1.1: rounded Hadamard rotation from S back into T.
+fn tx_sh(t as *i32, s as *i64, a as i64, b as i64) as void {
+    t[a] = cast(i32, rt.recon_round2(s[a] + s[b], 14));
+    t[b] = cast(i32, rt.recon_round2(s[a] - s[b], 14));
+}
+
+// Spec 8.7.1.2: in-place bit-reversal permutation of T[0..2^n-1].
+fn tx_idct_permute(t as *i32, n as i64) as void {
+    let is i64 as n0 = 1 << n;
+    let is [32]i32 as copy;
+    let is *i32 as c = cast(*i32, &copy);
+    let is i64 as i with mut = 0;
+    while (i < n0) {
+        c[i] = t[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n0) {
+        t[i] = c[tx_brev(n, i)];
+        i = i + 1;
+    }
+}
+
+// Spec 8.7.1.3: in-place inverse DCT of the already permuted array T of
+// length 2^n, 2 <= n <= 5. Recursive exactly as the spec states.
+fn tx_idct(t as *i32, n as i64) as void {
+    let is i64 as n0 = 1 << n;
+    let is i64 as n1 = 1 << (n - 1);
+    let is i64 as n2 = 1 << (n - 2);
+    let is i64 as n3 with mut = 0;
+    if (n >= 3) { n3 = 1 << (n - 3); }
+
+    // Step 1.
+    if (n == 2) {
+        tx_butterfly(t, 0, 1, 16, 1);
+    } else {
+        tx_idct(t, n - 1);
+    }
+
+    // Step 2.
+    let is i64 as i with mut = 0;
+    while (i < n2) {
+        tx_butterfly(t, n1 + i, n0 - 1 - i, 32 - tx_brev(5, n1 + i), 0);
+        i = i + 1;
+    }
+
+    // Step 3.
+    if (n >= 3) {
+        i = 0;
+        while (i < n3) {
+            let is i64 as j with mut = 0;
+            while (j < 2) {
+                tx_hadamard(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Step 4.
+    if (n == 5) {
+        i = 0;
+        while (i < 2) {
+            let is i64 as j with mut = 0;
+            while (j < 2) {
+                tx_butterfly(t, n0 - n + 3 - n2 * j - 4 * i,
+                             n1 + n - 4 + n2 * j + 4 * i,
+                             28 - 16 * i + 56 * j, 1);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 2) {
+            let is i64 as j with mut = 0;
+            while (j < 4) {
+                tx_hadamard(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, j & 1);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Step 5. The upper bound "i = 0..(n==5)" is inclusive: one iteration for
+    // n == 4, two for n == 5.
+    if (n >= 4) {
+        let is i64 as n5 with mut = 0;
+        if (n == 5) { n5 = 1; }
+        i = 0;
+        while (i <= n5) {
+            let is i64 as j with mut = 0;
+            while (j < 2) {
+                tx_butterfly(t, n0 - n + 2 - i - n2 * j,
+                             n1 + n - 3 + i + n2 * j, 24 + 48 * j, 1);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i <= 2 * n - 7) {
+            let is i64 as j with mut = 0;
+            while (j < 2) {
+                tx_hadamard(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, j & 1);
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Step 6.
+    if (n >= 3) {
+        i = 0;
+        while (i < n3) {
+            tx_butterfly(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, 1);
+            i = i + 1;
+        }
+    }
+
+    // Step 7.
+    i = 0;
+    while (i < n1) {
+        tx_hadamard(t, i, n0 - 1 - i, 0);
+        i = i + 1;
+    }
+}
+
+// Spec 8.7.1.4: ADST input permutation of T[0..2^n-1].
+fn tx_adst_input_permute(t as *i32, n as i64) as void {
+    let is i64 as n0 = 1 << n;
+    let is i64 as n1 = 1 << (n - 1);
+    let is [32]i32 as copy;
+    let is *i32 as c = cast(*i32, &copy);
+    let is i64 as i with mut = 0;
+    while (i < n0) {
+        c[i] = t[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n1) {
+        t[2 * i] = c[n0 - 1 - 2 * i];
+        t[2 * i + 1] = c[2 * i];
+        i = i + 1;
+    }
+}
+
+// Spec 8.7.1.5: ADST output permutation of T, n == 3 or n == 4.
+fn tx_adst_output_permute(t as *i32, n as i64) as void {
+    let is [32]i32 as copy;
+    let is i64 as n0 = 1 << n;
+    let is i64 as i with mut = 0;
+    while (i < n0) {
+        copy[i] = t[i];
+        i = i + 1;
+    }
+    if (n == 4) {
+        let is i64 as a with mut = 0;
+        while (a < 2) {
+            let is i64 as b with mut = 0;
+            while (b < 2) {
+                let is i64 as c2 with mut = 0;
+                while (c2 < 2) {
+                    let is i64 as d with mut = 0;
+                    while (d < 2) {
+                        t[8 * a + 4 * b + 2 * c2 + d] =
+                            copy[8 * (d ^ c2) + 4 * (c2 ^ b) + 2 * (b ^ a) + a];
+                        d = d + 1;
+                    }
+                    c2 = c2 + 1;
+                }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+    } else {
+        let is i64 as a with mut = 0;
+        while (a < 2) {
+            let is i64 as b with mut = 0;
+            while (b < 2) {
+                let is i64 as c2 with mut = 0;
+                while (c2 < 2) {
+                    t[4 * a + 2 * b + c2] = copy[4 * (c2 ^ b) + 2 * (b ^ a) + a];
+                    c2 = c2 + 1;
+                }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+    }
+}
+
+// The four ADST constants from spec 8.7.1.6. They are
+// round(16384*sin(k*pi/9)) for k = 1..4.
+let is i64 as SINPI_1_9 with imut = 5283;
+let is i64 as SINPI_2_9 with imut = 9929;
+let is i64 as SINPI_3_9 with imut = 13377;
+let is i64 as SINPI_4_9 with imut = 15212;
+
+// Spec 8.7.1.6: in-place 4-point inverse ADST, the special case for n == 2.
+fn tx_iadst4(t as *i32) as void {
+    let is i64 as x0i = cast(i64, t[0]);
+    let is i64 as x1i = cast(i64, t[1]);
+    let is i64 as x2i = cast(i64, t[2]);
+    let is i64 as x3i = cast(i64, t[3]);
+
+    let is i64 as s0 = SINPI_1_9 * x0i;
+    let is i64 as s1 = SINPI_2_9 * x0i;
+    let is i64 as s2 = SINPI_3_9 * x1i;
+    let is i64 as s3 = SINPI_4_9 * x2i;
+    let is i64 as s4 = SINPI_1_9 * x2i;
+    let is i64 as s5 = SINPI_2_9 * x3i;
+    let is i64 as s6 = SINPI_4_9 * x3i;
+    let is i64 as v = x0i - x2i + x3i;
+    let is i64 as s7 = SINPI_3_9 * v;
+
+    let is i64 as a0 = s0 + s3 + s5;
+    let is i64 as a1 = s1 - s4 - s6;
+    let is i64 as a2 = s7;
+    let is i64 as a3 = s2;
+    let is i64 as b0 = a0 + a3;
+    let is i64 as b1 = a1 + a3;
+    let is i64 as b2 = a2;
+    let is i64 as b3 = a0 + a1 - a3;
+
+    t[0] = cast(i32, rt.recon_round2(b0, 14));
+    t[1] = cast(i32, rt.recon_round2(b1, 14));
+    t[2] = cast(i32, rt.recon_round2(b2, 14));
+    t[3] = cast(i32, rt.recon_round2(b3, 14));
+}
+
+// Spec 8.7.1.7: in-place 8-point inverse ADST.
+fn tx_iadst8(t as *i32) as void {
+    let is [16]i64 as sbuf;
+    let is *i64 as s = cast(*i64, &sbuf);
+    let is i64 as i with mut = 0;
+
+    tx_adst_input_permute(t, 3);
+    i = 0;
+    while (i < 4) {
+        tx_sb(t, s, 2 * i, 1 + 2 * i, 30 - 8 * i, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        tx_sh(t, s, i, 4 + i);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        tx_sb(t, s, 4 + 3 * i, 5 + i, 24 - 16 * i, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        tx_sh(t, s, 4 + i, 6 + i);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        tx_hadamard(t, i, 2 + i, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        tx_butterfly(t, 2 + 4 * i, 3 + 4 * i, 16, 1);
+        i = i + 1;
+    }
+    tx_adst_output_permute(t, 3);
+    i = 0;
+    while (i < 4) {
+        t[1 + 2 * i] = 0 - t[1 + 2 * i];
+        i = i + 1;
+    }
+}
+
+// Spec 8.7.1.8: in-place 16-point inverse ADST.
+fn tx_iadst16(t as *i32) as void {
+    let is [16]i64 as sbuf;
+    let is *i64 as s = cast(*i64, &sbuf);
+    let is i64 as i with mut = 0;
+
+    tx_adst_input_permute(t, 4);
+    i = 0;
+    while (i < 8) {
+        tx_sb(t, s, 2 * i, 1 + 2 * i, 31 - 4 * i, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8) {
+        tx_sh(t, s, i, 8 + i);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        tx_sb(t, s, 8 + 2 * i, 9 + 2 * i, 28 - 16 * i, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        tx_sh(t, s, 8 + i, 12 + i);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        tx_hadamard(t, i, 4 + i, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        let is i64 as j with mut = 0;
+        while (j < 2) {
+            tx_sb(t, s, 4 + 8 * i + 3 * j, 5 + 8 * i + j, 24 - 16 * j, 1);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        let is i64 as j with mut = 0;
+        while (j < 2) {
+            tx_sh(t, s, 4 + 8 * j + i, 6 + 8 * j + i);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        let is i64 as j with mut = 0;
+        while (j < 2) {
+            tx_hadamard(t, 8 * j + i, 2 + 8 * j + i, 0);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 2) {
+        let is i64 as j with mut = 0;
+        while (j < 2) {
+            tx_butterfly(t, 2 + 4 * j + 8 * i, 3 + 4 * j + 8 * i,
+                         48 + 64 * (i ^ j), 0);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    tx_adst_output_permute(t, 4);
+    i = 0;
+    while (i < 2) {
+        let is i64 as j with mut = 0;
+        while (j < 2) {
+            t[1 + 12 * j + 2 * i] = 0 - t[1 + 12 * j + 2 * i];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Spec 8.7.1.9: inverse ADST of length 2^n, 2 <= n <= 4.
+fn tx_iadst(t as *i32, n as i64) as void {
+    if (n == 2) { tx_iadst4(t); }
+    else if (n == 3) { tx_iadst8(t); }
+    else { tx_iadst16(t); }
+}
+
+// Spec 8.7.1.10: in-place 4-point inverse Walsh-Hadamard with pre-shift.
+fn tx_iwht4(t as *i32, shift as i64) as void {
+    let is i64 as a = cast(i64, t[0]) >> shift;
+    let is i64 as c = cast(i64, t[1]) >> shift;
+    let is i64 as d = cast(i64, t[2]) >> shift;
+    let is i64 as b = cast(i64, t[3]) >> shift;
+    let is i64 as a1 = a + c;
+    let is i64 as d1 = d - b;
+    let is i64 as e = (a1 - d1) >> 1;
+    let is i64 as b1 = e - b;
+    let is i64 as c1 = e - c;
+    let is i64 as a2 = a1 - b1;
+    let is i64 as d2 = d1 + c1;
+    t[0] = cast(i32, a2);
+    t[1] = cast(i32, b1);
+    t[2] = cast(i32, c1);
+    t[3] = cast(i32, d2);
+}
+
+// Spec 8.7.2: in-place 2D inverse transform of the n0 x n0 array `dq`,
+// n0 = 1 << n. Rows use DCT for DCT_DCT/ADST_DCT and ADST for
+// DCT_ADST/ADST_ADST; columns use DCT for DCT_DCT/DCT_ADST. The row outputs
+// are written back unshifted; the column outputs are rounded by
+// Min(6, n+2), except in the lossless WHT path, which writes them raw.
+fn tx_2d(dq as *i32, n as i64, tx_type as i64, lossless as i64) as i64 {
+    if (n < 2 || n > 5) { return errno.I_BADPARAM; }
+    if (tx_type < rt.TXT_DCT_DCT || tx_type > rt.TXT_ADST_ADST) { return errno.I_BADPARAM; }
+    if (lossless != 0 && lossless != 1) { return errno.I_BADPARAM; }
+    if (cast(i64, dq) == 0) { return errno.I_BADPARAM; }
+    // Lossless is the 4x4 Walsh-Hadamard path only, and 32x32 has no ADST.
+    if (lossless == 1 && n != 2) { return errno.I_UNSUPPORTED; }
+    if (n == 5 && tx_type != rt.TXT_DCT_DCT) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as n0 = 1 << n;
+    let is [32]i32 as tbuf;
+    let is *i32 as t = cast(*i32, &tbuf);
+    let is i64 as shift with mut = n + 2;
+    if (shift > 6) { shift = 6; }
+
+    // Rows.
+    let is i64 as i with mut = 0;
+    while (i < n0) {
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            t[j] = dq[i * n0 + j];
+            j = j + 1;
+        }
+        if (lossless == 1) {
+            tx_iwht4(t, 2);
+        } else if (tx_type == rt.TXT_DCT_DCT || tx_type == rt.TXT_ADST_DCT) {
+            tx_idct_permute(t, n);
+            tx_idct(t, n);
+        } else {
+            tx_iadst(t, n);
+        }
+        j = 0;
+        while (j < n0) {
+            dq[i * n0 + j] = t[j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Columns.
+    let is i64 as col with mut = 0;
+    while (col < n0) {
+        i = 0;
+        while (i < n0) {
+            t[i] = dq[i * n0 + col];
+            i = i + 1;
+        }
+        if (lossless == 1) {
+            tx_iwht4(t, 0);
+        } else if (tx_type == rt.TXT_DCT_DCT || tx_type == rt.TXT_DCT_ADST) {
+            tx_idct_permute(t, n);
+            tx_idct(t, n);
+        } else {
+            tx_iadst(t, n);
+        }
+        i = 0;
+        while (i < n0) {
+            if (lossless == 1) {
+                dq[i * n0 + col] = t[i];
+            } else {
+                dq[i * n0 + col] = cast(i32, rt.recon_round2(cast(i64, t[i]), shift));
+            }
+            i = i + 1;
+        }
+        col = col + 1;
+    }
+    return errno.I_OK;
+}
+
+// Spec 8.6.2 steps 1 and 2: dequantise `tokens` into `dq`, dividing by 2 for
+// 32x32 (dqDenom) and using dc_q for coefficient 0 and ac_q elsewhere. The
+// result is checked against the spec's 8+BitDepth = 16-bit conformance bound.
+fn tx_dequant(tokens as *i32, n as i64, dc_q as i64, ac_q as i64,
+              dq as *i32) as i64 {
+    if (n < 2 || n > 5) { return errno.I_BADPARAM; }
+    if (cast(i64, tokens) == 0 || cast(i64, dq) == 0) { return errno.I_BADPARAM; }
+    if (dc_q <= 0 || ac_q <= 0) { return errno.I_BADPARAM; }
+
+    let is i64 as n0 = 1 << n;
+    let is i64 as denom with mut = 1;
+    if (n == 5) { denom = 2; }
+
+    let is i64 as i with mut = 0;
+    while (i < n0 * n0) {
+        let is i64 as v = (cast(i64, tokens[i]) * ac_q) / denom;
+        if (v < (0 - 32768) || v > 32767) { return errno.I_CORRUPT; }
+        dq[i] = cast(i32, v);
+        i = i + 1;
+    }
+    let is i64 as dc = (cast(i64, tokens[0]) * dc_q) / denom;
+    if (dc < (0 - 32768) || dc > 32767) { return errno.I_CORRUPT; }
+    dq[0] = cast(i32, dc);
+    return errno.I_OK;
+}
+
+// Spec 8.6.2 step 4: add the residual in `dq` to the n0 x n0 plane block at
+// `dst`, clipping each sample to 0..255.
+fn tx_add_residual(dst as *u8, stride as i64, dq as *i32, n0 as i64) as i64 {
+    if (n0 < 4 || n0 > 32) { return errno.I_BADPARAM; }
+    if (cast(i64, dst) == 0 || cast(i64, dq) == 0) { return errno.I_BADPARAM; }
+    if (stride < n0) { return errno.I_BADPARAM; }
+    let is i64 as i with mut = 0;
+    while (i < n0) {
+        let is i64 as j with mut = 0;
+        while (j < n0) {
+            let is i64 as off = i * stride + j;
+            let is i64 as v = cast(i64, dst[off]) + cast(i64, dq[i * n0 + j]);
+            dst[off] = cast(u8, rt.recon_clip1(v));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}
+
+// Full reconstruct process (spec 8.6.2): dequantise, inverse transform, add
+// to the prediction already present at `dst`. `tokens` holds n0*n0
+// coefficients in natural (raster) order, already scanned back from the
+// entropy-coded order by the caller.
+fn tx_reconstruct(tokens as *i32, tx_sz as i64, tx_type as i64, lossless as i64,
+                  dc_q as i64, ac_q as i64, dst as *u8, stride as i64) as i64 {
+    if (tx_sz < rt.TX_4X4 || tx_sz > rt.TX_32X32) { return errno.I_BADPARAM; }
+    if (tx_type < rt.TXT_DCT_DCT || tx_type > rt.TXT_ADST_ADST) { return errno.I_BADPARAM; }
+    if (lossless != 0 && lossless != 1) { return errno.I_BADPARAM; }
+    let is i64 as n = tx_sz + 2;
+    if (lossless == 1) {
+        // The syntax forces DCT_DCT when Lossless is set, and a lossless
+        // transform block is 4x4.
+        if (n != 2 || tx_type != rt.TXT_DCT_DCT) { return errno.I_UNSUPPORTED; }
+    }
+    // There is no 32-point ADST; 32x32 uses the DCT on both axes.
+    if (n == 5 && tx_type != rt.TXT_DCT_DCT) { return errno.I_UNSUPPORTED; }
+
+    let is i64 as n0 = 1 << n;
+    if (cast(i64, dst) == 0) { return errno.I_BADPARAM; }
+    if (stride < n0) { return errno.I_BADPARAM; }
+
+    let is [1024]i32 as dqbuf;
+    let is *i32 as dq = cast(*i32, &dqbuf);
+    let is i64 as st with mut = tx_dequant(tokens, n, dc_q, ac_q, dq);
+    if (st < 0) { return st; }
+    st = tx_2d(dq, n, tx_type, lossless);
+    if (st < 0) { return st; }
+    return tx_add_residual(dst, stride, dq, n0);
+}

@@ -1,0 +1,456 @@
+// =======================================================
+// caustic-av/video/vp9/predict.cst
+// VP9 intra prediction, from the VP9 Bitstream & Decoding Process
+// Specification section 8.5.1. It predicts one transform block at a time on
+// an 8-bit plane; the caller decides which mode applies (y_mode, uv_mode or
+// sub_modes[blockIdx]), where the block starts, and how much of the frame is
+// available above and to the left.
+//
+// Availability and substitution
+// -----------------------------
+// The spec's arrays aboveRow[] and leftCol[] are built here exactly as
+// section 8.5.1 states, which is what produces the 127/129 behaviour:
+//   * aboveRow[i] = 127 when have_above is 0.
+//   * leftCol[i]  = 129 when have_left is 0.
+//   * aboveRow[-1] = pixel (x-1, y-1) when both sides are available, else
+//     129 when only the above side is, else 127.
+// Because the predictors are then evaluated verbatim, an unavailable side
+// folds into the direction's own fallback (V/D45/D63 with no top produce 127,
+// H/D207 with no left produce 129, TM with one side produces the other side,
+// DC with neither produces 128) without a separate mode-switch table.
+//
+// aboveRow is extended to 2*size entries for the directional modes. The
+// spec's top-right rule is narrow: only for a 4x4 transform that is not on
+// the right edge of the prediction block are the real samples above the next
+// block used; every other case repeats aboveRow[size-1]. There is no edge filter and no 32x32 upsampling in VP9:
+// sections 8.5.1 (and both reference decoders) predict directly from the
+// reconstructed samples, unlike AV1. See recon.md.
+//
+// Two small pieces of state the spec carries outside the predictor are
+// inputs here: maxX/maxY (the last valid sample index of the plane, derived
+// from MiCols/MiRows and the plane's subsampling) and notOnRight. The caller
+// also passes the already reconstructed plane, so a transform block that is
+// not the first in a prediction block sees the previous block's output.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "recon_tables.cst" as rt;
+
+// Availability and geometry for one prediction call.
+//
+// have_left   : 1 when samples to the left of the block are valid
+// have_above  : 1 when samples above the block are valid
+// not_on_right: 1 when the transform block is not on the right edge of the
+//               prediction block (spec's notOnRight; only used for 4x4)
+// max_x/max_y : last valid sample index in this plane, i.e. frame width-1 and
+//               height-1 after subsampling
+struct IntraEdge {
+    have_left    as i64;
+    have_above   as i64;
+    not_on_right as i64;
+    max_x        as i64;
+    max_y        as i64;
+}
+
+// aboveRow[k] for k = -1..2*size-1, stored at abuf[k+1].
+fn pred_above(abuf as *i32, k as i64) as i64 {
+    return cast(i64, abuf[k + 1]);
+}
+
+// Predicted block, row-major, size*size entries in `pr`.
+fn pred_v(abuf as *i32, size as i64, pr as *i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            pr[i * size + j] = cast(i32, pred_above(abuf, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_h(lbuf as *i32, size as i64, pr as *i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as v = cast(i64, lbuf[i]);
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            pr[i * size + j] = cast(i32, v);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_dc(abuf as *i32, lbuf as *i32, size as i64, log2size as i64,
+           have_left as i64, have_above as i64, pr as *i32) as void {
+    let is i64 as avg with mut = 128;
+    if (have_left == 1 && have_above == 1) {
+        let is i64 as sum with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < size) {
+            sum = sum + cast(i64, lbuf[k]) + pred_above(abuf, k);
+            k = k + 1;
+        }
+        avg = (sum + size) >> (log2size + 1);
+    } else if (have_left == 1) {
+        let is i64 as sum with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < size) {
+            sum = sum + cast(i64, lbuf[k]);
+            k = k + 1;
+        }
+        avg = (sum + (1 << (log2size - 1))) >> log2size;
+    } else if (have_above == 1) {
+        let is i64 as sum with mut = 0;
+        let is i64 as k with mut = 0;
+        while (k < size) {
+            sum = sum + pred_above(abuf, k);
+            k = k + 1;
+        }
+        avg = (sum + (1 << (log2size - 1))) >> log2size;
+    }
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            pr[i * size + j] = cast(i32, avg);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_d45(abuf as *i32, size as i64, pr as *i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            let is i64 as k = i + j;
+            let is i64 as v with mut = 0;
+            if (k + 2 < size * 2) {
+                v = rt.recon_round2(pred_above(abuf, k)
+                                    + 2 * pred_above(abuf, k + 1)
+                                    + pred_above(abuf, k + 2), 2);
+            } else {
+                v = pred_above(abuf, 2 * size - 1);
+            }
+            pr[i * size + j] = cast(i32, v);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_d63(abuf as *i32, size as i64, pr as *i32) as void {
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            let is i64 as k = (i / 2) + j;
+            let is i64 as v with mut = 0;
+            if ((i & 1) == 1) {
+                v = rt.recon_round2(pred_above(abuf, k)
+                                    + 2 * pred_above(abuf, k + 1)
+                                    + pred_above(abuf, k + 2), 2);
+            } else {
+                v = rt.recon_round2(pred_above(abuf, k)
+                                    + pred_above(abuf, k + 1), 1);
+            }
+            pr[i * size + j] = cast(i32, v);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_d117(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+    // 1. first row from the above row.
+    let is i64 as j with mut = 0;
+    while (j < size) {
+        pr[0 * size + j] = cast(i32,
+            rt.recon_round2(pred_above(abuf, j - 1) + pred_above(abuf, j), 1));
+        j = j + 1;
+    }
+    // 2. pred[1][0].
+    pr[1 * size + 0] = cast(i32,
+        rt.recon_round2(cast(i64, lbuf[0]) + 2 * pred_above(abuf, -1)
+                        + pred_above(abuf, 0), 2));
+    // 3. rest of row 1.
+    j = 1;
+    while (j < size) {
+        pr[1 * size + j] = cast(i32,
+            rt.recon_round2(pred_above(abuf, j - 2)
+                            + 2 * pred_above(abuf, j - 1)
+                            + pred_above(abuf, j), 2));
+        j = j + 1;
+    }
+    // 4. pred[2][0].
+    pr[2 * size + 0] = cast(i32,
+        rt.recon_round2(pred_above(abuf, -1) + 2 * cast(i64, lbuf[0])
+                        + cast(i64, lbuf[1]), 2));
+    // 5. rest of column 0.
+    let is i64 as i with mut = 3;
+    while (i < size) {
+        pr[i * size + 0] = cast(i32,
+            rt.recon_round2(cast(i64, lbuf[i - 3]) + 2 * cast(i64, lbuf[i - 2])
+                            + cast(i64, lbuf[i - 1]), 2));
+        i = i + 1;
+    }
+    // 6. copy the diagonal.
+    i = 2;
+    while (i < size) {
+        j = 1;
+        while (j < size) {
+            pr[i * size + j] = pr[(i - 2) * size + (j - 1)];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_d135(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+    // 1. pred[0][0].
+    pr[0 * size + 0] = cast(i32,
+        rt.recon_round2(cast(i64, lbuf[0]) + 2 * pred_above(abuf, -1)
+                        + pred_above(abuf, 0), 2));
+    // 2. rest of row 0.
+    let is i64 as j with mut = 1;
+    while (j < size) {
+        pr[0 * size + j] = cast(i32,
+            rt.recon_round2(pred_above(abuf, j - 2)
+                            + 2 * pred_above(abuf, j - 1)
+                            + pred_above(abuf, j), 2));
+        j = j + 1;
+    }
+    // 3. pred[1][0].
+    pr[1 * size + 0] = cast(i32,
+        rt.recon_round2(pred_above(abuf, -1) + 2 * cast(i64, lbuf[0])
+                        + cast(i64, lbuf[1]), 2));
+    // 4. rest of column 0.
+    let is i64 as i with mut = 2;
+    while (i < size) {
+        pr[i * size + 0] = cast(i32,
+            rt.recon_round2(cast(i64, lbuf[i - 2]) + 2 * cast(i64, lbuf[i - 1])
+                            + cast(i64, lbuf[i]), 2));
+        i = i + 1;
+    }
+    // 5. copy the diagonal.
+    i = 1;
+    while (i < size) {
+        j = 1;
+        while (j < size) {
+            pr[i * size + j] = pr[(i - 1) * size + (j - 1)];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_d153(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+    // 1. pred[0][0].
+    pr[0 * size + 0] = cast(i32,
+        rt.recon_round2(cast(i64, lbuf[0]) + pred_above(abuf, -1), 1));
+    // 2. rest of column 0.
+    let is i64 as i with mut = 1;
+    while (i < size) {
+        pr[i * size + 0] = cast(i32,
+            rt.recon_round2(cast(i64, lbuf[i - 1]) + cast(i64, lbuf[i]), 1));
+        i = i + 1;
+    }
+    // 3. pred[0][1].
+    pr[0 * size + 1] = cast(i32,
+        rt.recon_round2(cast(i64, lbuf[0]) + 2 * pred_above(abuf, -1)
+                        + pred_above(abuf, 0), 2));
+    // 4. pred[1][1].
+    pr[1 * size + 1] = cast(i32,
+        rt.recon_round2(pred_above(abuf, -1) + 2 * cast(i64, lbuf[0])
+                        + cast(i64, lbuf[1]), 2));
+    // 5. rest of column 1.
+    i = 2;
+    while (i < size) {
+        pr[i * size + 1] = cast(i32,
+            rt.recon_round2(cast(i64, lbuf[i - 2]) + 2 * cast(i64, lbuf[i - 1])
+                            + cast(i64, lbuf[i]), 2));
+        i = i + 1;
+    }
+    // 6. rest of row 0.
+    let is i64 as j with mut = 2;
+    while (j < size) {
+        pr[0 * size + j] = cast(i32,
+            rt.recon_round2(pred_above(abuf, j - 3)
+                            + 2 * pred_above(abuf, j - 2)
+                            + pred_above(abuf, j - 1), 2));
+        j = j + 1;
+    }
+    // 7. copy the diagonal.
+    i = 1;
+    while (i < size) {
+        j = 2;
+        while (j < size) {
+            pr[i * size + j] = pr[(i - 1) * size + (j - 2)];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn pred_d207(lbuf as *i32, size as i64, pr as *i32) as void {
+    // 1. last row.
+    let is i64 as j with mut = 0;
+    while (j < size) {
+        pr[(size - 1) * size + j] = lbuf[size - 1];
+        j = j + 1;
+    }
+    // 2. column 0 above the last row.
+    let is i64 as i with mut = 0;
+    while (i < size - 1) {
+        pr[i * size + 0] = cast(i32,
+            rt.recon_round2(cast(i64, lbuf[i]) + cast(i64, lbuf[i + 1]), 1));
+        i = i + 1;
+    }
+    // 3. column 1.
+    i = 0;
+    while (i < size - 2) {
+        pr[i * size + 1] = cast(i32,
+            rt.recon_round2(cast(i64, lbuf[i]) + 2 * cast(i64, lbuf[i + 1])
+                            + cast(i64, lbuf[i + 2]), 2));
+        i = i + 1;
+    }
+    // 4. the one remaining column-1 entry.
+    pr[(size - 2) * size + 1] = cast(i32,
+        rt.recon_round2(cast(i64, lbuf[size - 2])
+                        + 3 * cast(i64, lbuf[size - 1]), 2));
+    // 5. copy the diagonal, iterating i downwards as the spec requires.
+    i = size - 2;
+    while (i >= 0) {
+        j = 2;
+        while (j < size) {
+            pr[i * size + j] = pr[(i + 1) * size + (j - 2)];
+            j = j + 1;
+        }
+        i = i - 1;
+    }
+}
+
+fn pred_tm(abuf as *i32, lbuf as *i32, size as i64, pr as *i32) as void {
+    let is i64 as tl = pred_above(abuf, -1);
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as l = cast(i64, lbuf[i]) - tl;
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            pr[i * size + j] = cast(i32, rt.recon_clip1(pred_above(abuf, j) + l));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Section 8.5.1: predict one transform block of side 1 << (tx_sz + 2).
+// `plane` points at the top-left sample of the frame plane and `stride` is
+// its row stride in bytes. Returns I_OK, or I_BADPARAM for an inconsistent
+// request (null pointers, a block outside max_x/max_y, availability flags
+// that do not match the block position, or a stride narrower than the frame).
+fn pred_intra(plane as *u8, stride as i64, x as i64, y as i64,
+              tx_sz as i64, mode as i64, e as *IntraEdge) as i64 {
+    if (cast(i64, plane) == 0 || cast(i64, e) == 0) { return errno.I_BADPARAM; }
+    if (tx_sz < rt.TX_4X4 || tx_sz > rt.TX_32X32) { return errno.I_BADPARAM; }
+    if (mode < rt.MODE_DC || mode > rt.MODE_TM) { return errno.I_BADPARAM; }
+    if (e.max_x < 0 || e.max_y < 0) { return errno.I_BADPARAM; }
+    if (stride <= 0 || stride <= e.max_x) { return errno.I_BADPARAM; }
+    if (e.have_left < 0 || e.have_left > 1) { return errno.I_BADPARAM; }
+    if (e.have_above < 0 || e.have_above > 1) { return errno.I_BADPARAM; }
+    if (e.not_on_right < 0 || e.not_on_right > 1) { return errno.I_BADPARAM; }
+    if (e.have_left == 1 && x <= 0) { return errno.I_BADPARAM; }
+    if (e.have_above == 1 && y <= 0) { return errno.I_BADPARAM; }
+    let is i64 as size = 1 << (tx_sz + 2);
+    let is i64 as log2size = tx_sz + 2;
+    if (x < 0 || y < 0) { return errno.I_BADPARAM; }
+    if (x > e.max_x || y > e.max_y) { return errno.I_BADPARAM; }
+    if (x + size - 1 > e.max_x || y + size - 1 > e.max_y) { return errno.I_BADPARAM; }
+
+    // aboveRow[-1..2*size-1] at abuf[0..2*size]; leftCol at lbuf[0..size-1].
+    let is [65]i32 as abuf;
+    let is [32]i32 as lbuf;
+    let is [1024]i32 as pred;
+
+    let is i64 as k with mut = 0;
+    while (k < size) {
+        if (e.have_above == 1) {
+            let is i64 as xx with mut = x + k;
+            if (xx > e.max_x) { xx = e.max_x; }
+            abuf[k + 1] = cast(i32, plane[(y - 1) * stride + xx]);
+        } else {
+            abuf[k + 1] = 127;
+        }
+        k = k + 1;
+    }
+    k = size;
+    while (k < 2 * size) {
+        if (e.have_above == 1 && e.not_on_right == 1 && tx_sz == rt.TX_4X4) {
+            let is i64 as xx with mut = x + k;
+            if (xx > e.max_x) { xx = e.max_x; }
+            abuf[k + 1] = cast(i32, plane[(y - 1) * stride + xx]);
+        } else {
+            abuf[k + 1] = abuf[size];
+        }
+        k = k + 1;
+    }
+    if (e.have_above == 1 && e.have_left == 1) {
+        abuf[0] = cast(i32, plane[(y - 1) * stride + (x - 1)]);
+    } else if (e.have_above == 1) {
+        abuf[0] = 129;
+    } else {
+        abuf[0] = 127;
+    }
+    k = 0;
+    while (k < size) {
+        if (e.have_left == 1) {
+            let is i64 as yy with mut = y + k;
+            if (yy > e.max_y) { yy = e.max_y; }
+            lbuf[k] = cast(i32, plane[yy * stride + (x - 1)]);
+        } else {
+            lbuf[k] = 129;
+        }
+        k = k + 1;
+    }
+
+    let is *i32 as ab = cast(*i32, &abuf);
+    let is *i32 as lb = cast(*i32, &lbuf);
+    let is *i32 as pr = cast(*i32, &pred);
+
+    if (mode == rt.MODE_V) {
+        pred_v(ab, size, pr);
+    } else if (mode == rt.MODE_H) {
+        pred_h(lb, size, pr);
+    } else if (mode == rt.MODE_DC) {
+        pred_dc(ab, lb, size, log2size, e.have_left, e.have_above, pr);
+    } else if (mode == rt.MODE_D45) {
+        pred_d45(ab, size, pr);
+    } else if (mode == rt.MODE_D63) {
+        pred_d63(ab, size, pr);
+    } else if (mode == rt.MODE_D117) {
+        pred_d117(ab, lb, size, pr);
+    } else if (mode == rt.MODE_D135) {
+        pred_d135(ab, lb, size, pr);
+    } else if (mode == rt.MODE_D153) {
+        pred_d153(ab, lb, size, pr);
+    } else if (mode == rt.MODE_D207) {
+        pred_d207(lb, size, pr);
+    } else {
+        pred_tm(ab, lb, size, pr);
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < size) {
+        let is i64 as j with mut = 0;
+        while (j < size) {
+            plane[(y + i) * stride + (x + j)] = cast(u8, pr[i * size + j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return errno.I_OK;
+}

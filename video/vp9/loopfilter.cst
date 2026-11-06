@@ -1,0 +1,551 @@
+// =======================================================
+// caustic-av/video/vp9/loopfilter.cst
+// VP9 loop filter, from the VP9 Bitstream & Decoding Process Specification
+// section 8.8. It filters one reconstructed 8-bit plane at a time, in the
+// spec's superblock raster order and in the spec's edge order; the two passes
+// (vertical boundaries, then horizontal) run for each superblock before the
+// next superblock, because the result of one edge is the input of the next.
+//
+// What the caller supplies
+// ------------------------
+// lf_frame_init builds the per-frame LvlLookup table from the loop filter
+// level, segmentation's ALT_L feature, and the ref/mode deltas (8.8.1).
+// lf_filter_plane then walks one plane, reading the per-8x8-block arrays the
+// decoder already keeps (MiSizes, TxSizes, Skips, SegmentIds, RefFrames,
+// YModes). For chroma it derives the plane transform size with
+// get_uv_tx_size before applying 8.8.3.
+//
+// Tables: none. Sections 8.8.3 and 8.8.4 define filter size, limit, blimit
+// and thresh arithmetically, and the masks are computed per sample from the
+// reconstructed samples; the four masks are the spec's filterMask, hevMask,
+// flatMask and flatMask2. The libvpx lfthr tables are a cached form of the
+// same formulas, not different data.
+//
+// Fixed point and bit depth: this is the 8-bit path, so limit/blimit/thresh
+// are used unscaled (the spec's << (BitDepth-8) factors are 1) and the narrow
+// filter's signed domain is -128..127 with a 0x80 offset.
+// =======================================================
+
+use "../../core/errno.cst" as errno;
+use "recon_tables.cst" as rt;
+
+// Upper bound on the mode-info grid: 65536 pixels per side / 8.
+let is i64 as LF_MAX_MI with imut = 8192;
+
+// Frame-level loop filter configuration (spec sections 6.2.8 and 7.2.8).
+struct LfParams {
+    mi_cols          as i64;   // MiCols
+    mi_rows          as i64;   // MiRows
+    sub_x            as i64;   // subsampling_x
+    sub_y            as i64;   // subsampling_y
+    level            as i64;   // loop_filter_level, 0..63
+    sharpness        as i64;   // loop_filter_sharpness, 0..7
+    delta_enabled    as i64;   // loop_filter_delta_enabled/update
+    seg_enabled      as i64;   // segmentation_enabled
+    seg_abs_or_delta as i64;   // segmentation_abs_or_delta_update
+    ref_deltas       as *i64;  // [MAX_REF_FRAMES], when delta_enabled
+    mode_deltas      as *i64;  // [MAX_MODE_LF_DELTAS], when delta_enabled
+    seg_alt_l_active as *u8;   // [MAX_SEGMENTS], when seg_enabled
+    seg_alt_l_data   as *i64;  // [MAX_SEGMENTS], when seg_enabled
+}
+
+// Per-frame state after init.
+struct LfFrame {
+    mi_cols       as i64;
+    mi_rows       as i64;
+    sub_x         as i64;
+    sub_y         as i64;
+    level         as i64;
+    sharpness     as i64;
+    delta_enabled as i64;
+    // LvlLookup[segment][ref][modeType], flattened as (segment*4 + ref)*2 +
+    // modeType. 8*4*2 = 64 entries.
+    lvl_lookup    as [64]i32;
+}
+
+// Per-mode-info-block arrays, row-major over [mi_rows][mi_cols]. A value of
+// ref_frames[row*mi_cols+col] equal to INTRA_FRAME is the spec's isIntra.
+struct LfBlockInfo {
+    mi_sizes    as *u8;   // BLOCK_* enum
+    tx_sizes    as *u8;   // luma TX_* enum
+    skips       as *u8;
+    segment_ids as *u8;
+    ref_frames  as *u8;   // RefFrames[..][0]
+    y_modes     as *u8;   // YModes (0..13)
+}
+
+// limit, blimit, thresh from 8.8.4.
+struct LfThresh {
+    limit  as i64;
+    blimit as i64;
+    thresh as i64;
+}
+
+// Section 8.8.1: build LvlLookup once per frame. Returns I_OK, I_BADPARAM
+// for an inconsistent configuration, or I_DIMS for a mode-info grid beyond
+// what a VP9 frame can code.
+fn lf_frame_init(lf as *LfFrame, p as *LfParams) as i64 {
+    if (cast(i64, lf) == 0 || cast(i64, p) == 0) { return errno.I_BADPARAM; }
+    if (p.mi_cols <= 0 || p.mi_rows <= 0) { return errno.I_BADPARAM; }
+    if (p.mi_cols > LF_MAX_MI || p.mi_rows > LF_MAX_MI) { return errno.I_DIMS; }
+    if (p.sub_x < 0 || p.sub_x > 1 || p.sub_y < 0 || p.sub_y > 1) { return errno.I_BADPARAM; }
+    if (p.level < 0 || p.level > rt.MAX_LOOP_FILTER) { return errno.I_BADPARAM; }
+    if (p.sharpness < 0 || p.sharpness > 7) { return errno.I_BADPARAM; }
+    if (p.delta_enabled != 0 && p.delta_enabled != 1) { return errno.I_BADPARAM; }
+    if (p.seg_enabled != 0 && p.seg_enabled != 1) { return errno.I_BADPARAM; }
+    if (p.seg_abs_or_delta != 0 && p.seg_abs_or_delta != 1) { return errno.I_BADPARAM; }
+    if (p.delta_enabled == 1) {
+        if (cast(i64, p.ref_deltas) == 0 || cast(i64, p.mode_deltas) == 0) {
+            return errno.I_BADPARAM;
+        }
+    }
+    if (p.seg_enabled == 1) {
+        if (cast(i64, p.seg_alt_l_active) == 0 || cast(i64, p.seg_alt_l_data) == 0) {
+            return errno.I_BADPARAM;
+        }
+    }
+
+    lf.mi_cols = p.mi_cols;
+    lf.mi_rows = p.mi_rows;
+    lf.sub_x = p.sub_x;
+    lf.sub_y = p.sub_y;
+    lf.level = p.level;
+    lf.sharpness = p.sharpness;
+    lf.delta_enabled = p.delta_enabled;
+
+    let is i64 as k with mut = 0;
+    while (k < 64) {
+        lf.lvl_lookup[k] = 0;
+        k = k + 1;
+    }
+
+    // nShift scales the deltas: 1 for levels 0..31, 2 for 32..63.
+    let is i64 as nshift = p.level >> 5;
+    let is i64 as scale = 1 << nshift;
+
+    let is i64 as seg with mut = 0;
+    while (seg < rt.MAX_SEGMENTS) {
+        let is i64 as lvl_seg with mut = p.level;
+        if (p.seg_enabled == 1 && cast(i64, p.seg_alt_l_active[seg]) == 1) {
+            if (p.seg_abs_or_delta == 1) {
+                lvl_seg = p.seg_alt_l_data[seg];
+            } else {
+                lvl_seg = p.level + p.seg_alt_l_data[seg];
+            }
+            lvl_seg = rt.recon_clip3(0, rt.MAX_LOOP_FILTER, lvl_seg);
+        }
+
+        if (p.delta_enabled == 0) {
+            let is i64 as ref with mut = 0;
+            while (ref < rt.MAX_REF_FRAMES) {
+                let is i64 as mode with mut = 0;
+                while (mode < rt.MAX_MODE_LF_DELTAS) {
+                    lf.lvl_lookup[(seg * 4 + ref) * 2 + mode] = cast(i32, lvl_seg);
+                    mode = mode + 1;
+                }
+                ref = ref + 1;
+            }
+        } else {
+            // INTRA_FRAME uses only its ref delta; modeType 0.
+            let is i64 as intra = lvl_seg + p.ref_deltas[rt.INTRA_FRAME] * scale;
+            lf.lvl_lookup[(seg * 4 + rt.INTRA_FRAME) * 2 + 0] =
+                cast(i32, rt.recon_clip3(0, rt.MAX_LOOP_FILTER, intra));
+
+            let is i64 as ref with mut = 1;   // LAST_FRAME..ALTREF_FRAME
+            while (ref < rt.MAX_REF_FRAMES) {
+                let is i64 as mode with mut = 0;
+                while (mode < rt.MAX_MODE_LF_DELTAS) {
+                    let is i64 as inter = lvl_seg
+                        + p.ref_deltas[ref] * scale
+                        + p.mode_deltas[mode] * scale;
+                    lf.lvl_lookup[(seg * 4 + ref) * 2 + mode] =
+                        cast(i32, rt.recon_clip3(0, rt.MAX_LOOP_FILTER, inter));
+                    mode = mode + 1;
+                }
+                ref = ref + 1;
+            }
+        }
+        seg = seg + 1;
+    }
+    return errno.I_OK;
+}
+
+// Section 8.8.4: limit, blimit and thresh for one filter level.
+fn lf_thresholds(lf as *LfFrame, lvl as i64, t as *LfThresh) as void {
+    let is i64 as shift with mut = 0;
+    if (lf.sharpness > 4) { shift = 2; }
+    else if (lf.sharpness > 0) { shift = 1; }
+
+    let is i64 as limit with mut = 0;
+    if (lf.sharpness > 0) {
+        limit = rt.recon_clip3(1, 9 - lf.sharpness, lvl >> shift);
+    } else {
+        limit = lvl >> shift;
+        if (limit < 1) { limit = 1; }
+    }
+    t.limit = limit;
+    t.blimit = 2 * (lvl + 2) + limit;
+    t.thresh = lvl >> 4;
+}
+
+// Section 8.8.3: the largest filter size allowed at this edge.
+fn lf_filter_size(lf as *LfFrame, tx_sz as i64, is32_edge as i64, pass as i64,
+                  x as i64, y as i64, subx as i64, suby as i64) as i64 {
+    let is i64 as base with mut = tx_sz;
+    if (tx_sz == rt.TX_4X4 && is32_edge == 1) {
+        base = rt.TX_8X8;
+    } else if (tx_sz > rt.TX_16X16) {
+        base = rt.TX_16X16;
+    }
+    if (pass == 0 && subx == 1 && base == rt.TX_16X16
+        && (x >> 3) == lf.mi_cols - 1) {
+        return rt.TX_8X8;
+    }
+    if (pass == 1 && suby == 1 && base == rt.TX_16X16
+        && (y >> 3) == lf.mi_rows - 1) {
+        return rt.TX_8X8;
+    }
+    return base;
+}
+
+// Sample at offset k along (dx, dy) from (x, y) in the plane.
+fn lf_at(data as *u8, stride as i64, x as i64, y as i64,
+         dx as i64, dy as i64, k as i64) as i64 {
+    return cast(i64, data[(y + k * dy) * stride + (x + k * dx)]);
+}
+
+// Section 8.8.5.2: narrow filter (4-tap, or the 4-sample high-variance form).
+fn lf_narrow(data as *u8, stride as i64, x as i64, y as i64,
+             dx as i64, dy as i64, hev as i64) as void {
+    let is i64 as p1 = lf_at(data, stride, x, y, dx, dy, 0 - 2);
+    let is i64 as p0 = lf_at(data, stride, x, y, dx, dy, 0 - 1);
+    let is i64 as q0 = lf_at(data, stride, x, y, dx, dy, 0);
+    let is i64 as q1 = lf_at(data, stride, x, y, dx, dy, 1);
+
+    let is i64 as ps1 = p1 - 128;
+    let is i64 as ps0 = p0 - 128;
+    let is i64 as qs0 = q0 - 128;
+    let is i64 as qs1 = q1 - 128;
+
+    let is i64 as filter with mut = 0;
+    if (hev == 1) {
+        filter = rt.recon_clip3(0 - 128, 127, ps1 - qs1);
+    }
+    filter = rt.recon_clip3(0 - 128, 127, filter + 3 * (qs0 - ps0));
+    let is i64 as f1 = rt.recon_clip3(0 - 128, 127, filter + 4) >> 3;
+    let is i64 as f2 = rt.recon_clip3(0 - 128, 127, filter + 3) >> 3;
+
+    let is i64 as oq0 = rt.recon_clip3(0 - 128, 127, qs0 - f1) + 128;
+    let is i64 as op0 = rt.recon_clip3(0 - 128, 127, ps0 + f2) + 128;
+    data[y * stride + x] = cast(u8, oq0);
+    data[(y - dy) * stride + (x - dx)] = cast(u8, op0);
+
+    if (hev == 0) {
+        let is i64 as f = rt.recon_round2(f1, 1);
+        let is i64 as oq1 = rt.recon_clip3(0 - 128, 127, qs1 - f) + 128;
+        let is i64 as op1 = rt.recon_clip3(0 - 128, 127, ps1 + f) + 128;
+        data[(y + dy) * stride + (x + dx)] = cast(u8, oq1);
+        data[(y - 2 * dy) * stride + (x - 2 * dx)] = cast(u8, op1);
+    }
+}
+
+// Section 8.8.5.3: wide filter with log2Size 3 or 4. The 2^log2Size tap
+// weights sum to 2^log2Size, so the rounded result is already in 0..255.
+fn lf_wide(data as *u8, stride as i64, x as i64, y as i64,
+           dx as i64, dy as i64, log2size as i64) as void {
+    let is i64 as n = (1 << (log2size - 1)) - 1;
+    let is i64 as lo = 0 - (n + 1);
+    let is [16]i64 as fbuf;
+
+    let is i64 as i with mut = 0 - n;
+    while (i < n) {
+        let is i64 as t with mut = lf_at(data, stride, x, y, dx, dy, i);
+        let is i64 as j with mut = 0 - n;
+        while (j <= n) {
+            let is i64 as p with mut = i + j;
+            if (p < lo) { p = lo; }
+            if (p > n) { p = n; }
+            t = t + lf_at(data, stride, x, y, dx, dy, p);
+            j = j + 1;
+        }
+        fbuf[i + n] = rt.recon_round2(t, log2size);
+        i = i + 1;
+    }
+    i = 0 - n;
+    while (i < n) {
+        data[(y + i * dy) * stride + (x + i * dx)] = cast(u8, fbuf[i + n]);
+        i = i + 1;
+    }
+}
+
+// Section 8.8.5: the filter mask process followed by the appropriate filter.
+fn lf_sample(data as *u8, stride as i64, x as i64, y as i64,
+             dx as i64, dy as i64, limit as i64, blimit as i64,
+             thresh as i64, filter_size as i64) as void {
+    let is i64 as p0 = lf_at(data, stride, x, y, dx, dy, 0 - 1);
+    let is i64 as p1 = lf_at(data, stride, x, y, dx, dy, 0 - 2);
+    let is i64 as p2 = lf_at(data, stride, x, y, dx, dy, 0 - 3);
+    let is i64 as p3 = lf_at(data, stride, x, y, dx, dy, 0 - 4);
+    let is i64 as q0 = lf_at(data, stride, x, y, dx, dy, 0);
+    let is i64 as q1 = lf_at(data, stride, x, y, dx, dy, 1);
+    let is i64 as q2 = lf_at(data, stride, x, y, dx, dy, 2);
+    let is i64 as q3 = lf_at(data, stride, x, y, dx, dy, 3);
+
+    // hevMask.
+    let is i64 as hev with mut = 0;
+    if (rt.recon_abs(p1 - p0) > thresh) { hev = 1; }
+    if (rt.recon_abs(q1 - q0) > thresh) { hev = 1; }
+
+    // filterMask.
+    let is i64 as mask with mut = 0;
+    if (rt.recon_abs(p3 - p2) > limit) { mask = 1; }
+    if (rt.recon_abs(p2 - p1) > limit) { mask = 1; }
+    if (rt.recon_abs(p1 - p0) > limit) { mask = 1; }
+    if (rt.recon_abs(q1 - q0) > limit) { mask = 1; }
+    if (rt.recon_abs(q2 - q1) > limit) { mask = 1; }
+    if (rt.recon_abs(q3 - q2) > limit) { mask = 1; }
+    if (rt.recon_abs(p0 - q0) * 2 + rt.recon_abs(p1 - q1) / 2 > blimit) {
+        mask = 1;
+    }
+    if (mask != 0) { return; }
+
+    let is i64 as flat with mut = 1;
+    if (filter_size >= rt.TX_8X8) {
+        // flatMask: four samples each side within 1 of the boundary sample.
+        if (rt.recon_abs(p1 - p0) > 1) { flat = 0; }
+        if (rt.recon_abs(q1 - q0) > 1) { flat = 0; }
+        if (rt.recon_abs(p2 - p0) > 1) { flat = 0; }
+        if (rt.recon_abs(q2 - q0) > 1) { flat = 0; }
+        if (rt.recon_abs(p3 - p0) > 1) { flat = 0; }
+        if (rt.recon_abs(q3 - q0) > 1) { flat = 0; }
+    }
+
+    let is i64 as flat2 with mut = 1;
+    if (filter_size >= rt.TX_16X16) {
+        // flatMask2: the next four samples each side, also within 1 of the
+        // boundary sample.
+        let is i64 as p4 = lf_at(data, stride, x, y, dx, dy, 0 - 5);
+        let is i64 as p5 = lf_at(data, stride, x, y, dx, dy, 0 - 6);
+        let is i64 as p6 = lf_at(data, stride, x, y, dx, dy, 0 - 7);
+        let is i64 as p7 = lf_at(data, stride, x, y, dx, dy, 0 - 8);
+        let is i64 as q4 = lf_at(data, stride, x, y, dx, dy, 4);
+        let is i64 as q5 = lf_at(data, stride, x, y, dx, dy, 5);
+        let is i64 as q6 = lf_at(data, stride, x, y, dx, dy, 6);
+        let is i64 as q7 = lf_at(data, stride, x, y, dx, dy, 7);
+        if (rt.recon_abs(p7 - p0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(q7 - q0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(p6 - p0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(q6 - q0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(p5 - p0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(q5 - q0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(p4 - p0) > 1) { flat2 = 0; }
+        if (rt.recon_abs(q4 - q0) > 1) { flat2 = 0; }
+    }
+
+    if (filter_size == rt.TX_4X4 || flat == 0) {
+        lf_narrow(data, stride, x, y, dx, dy, hev);
+    } else if (filter_size == rt.TX_8X8 || flat2 == 0) {
+        lf_wide(data, stride, x, y, dx, dy, 3);
+    } else {
+        lf_wide(data, stride, x, y, dx, dy, 4);
+    }
+}
+
+// Mode type used by LvlLookup: 1 for NEARESTMV/NEARMV/NEWMV, else 0
+// (spec 8.8.4, including intra and ZEROMV).
+fn lf_mode_type(mode as i64) as i64 {
+    if (mode == rt.MODE_NEARESTMV || mode == rt.MODE_NEARMV || mode == rt.MODE_NEWMV) {
+        return 1;
+    }
+    return 0;
+}
+
+// Section 8.8.2: filter one superblock of one plane in one pass.
+fn lf_filter_sb(lf as *LfFrame, blk as *LfBlockInfo, plane as i64, pass as i64,
+                row as i64, col as i64, data as *u8, stride as i64) as i64 {
+    let is i64 as subx with mut = 0;
+    let is i64 as suby with mut = 0;
+    if (plane > 0) { subx = lf.sub_x; suby = lf.sub_y; }
+
+    let is i64 as dx with mut = 0;
+    let is i64 as dy with mut = 0;
+    let is i64 as sub with mut = 0;
+    let is i64 as edge_len with mut = 0;
+    if (pass == 0) {
+        dx = 1;
+        dy = 0;
+        sub = subx;
+        edge_len = 64 >> suby;
+    } else {
+        dx = 0;
+        dy = 1;
+        sub = suby;
+        edge_len = 64 >> subx;
+    }
+
+    let is i64 as edge_count = 16 >> sub;
+    let is i64 as edge with mut = 0;
+    while (edge < edge_count) {
+        let is i64 as i with mut = 0;
+        while (i < edge_len) {
+            let is i64 as x with mut = 0;
+            let is i64 as y with mut = 0;
+            if (pass == 0) {
+                x = col * 8 + edge * (4 << subx);
+                y = row * 8 + (i << suby);
+            } else {
+                x = col * 8 + (i << subx);
+                y = row * 8 + edge * (4 << suby);
+            }
+
+            let is i64 as loop_col = ((x >> 3) >> subx) << subx;
+            let is i64 as loop_row = ((y >> 3) >> suby) << suby;
+            if (loop_row < lf.mi_rows && loop_col < lf.mi_cols) {
+                let is i64 as idx = loop_row * lf.mi_cols + loop_col;
+                let is i64 as mi_size = cast(i64, blk.mi_sizes[idx]);
+                let is i64 as tx = cast(i64, blk.tx_sizes[idx]);
+                let is i64 as skip = cast(i64, blk.skips[idx]);
+                let is i64 as seg = cast(i64, blk.segment_ids[idx]);
+                let is i64 as ref = cast(i64, blk.ref_frames[idx]);
+                let is i64 as mode = cast(i64, blk.y_modes[idx]);
+                if (mi_size < rt.BLOCK_4X4 || mi_size > rt.BLOCK_64X64) {
+                    return errno.I_CORRUPT;
+                }
+                if (tx < rt.TX_4X4 || tx > rt.TX_32X32) {
+                    return errno.I_CORRUPT;
+                }
+                if (skip > 1) { return errno.I_CORRUPT; }
+                if (seg < 0 || seg >= rt.MAX_SEGMENTS) { return errno.I_CORRUPT; }
+                if (ref < 0 || ref >= rt.MAX_REF_FRAMES) { return errno.I_CORRUPT; }
+                if (mode < 0 || mode > rt.MODE_NEWMV) { return errno.I_CORRUPT; }
+
+                let is i64 as tx_sz with mut = tx;
+                if (plane > 0) {
+                    tx_sz = rt.recon_uv_tx_size(mi_size, tx, subx, suby);
+                }
+
+                // Step 7: sbSize is at least 16x16 when the perpendicular
+                // direction is subsampled.
+                let is i64 as sb_size with mut = mi_size;
+                if (sub == 1 && sb_size < rt.BLOCK_16X16) {
+                    sb_size = rt.BLOCK_16X16;
+                }
+
+                // Step 10: isBlockEdge.
+                let is i64 as is_block_edge with mut = 0;
+                if (pass == 0) {
+                    let is i64 as bw = 8 * rt.recon_num_8x8_wide(sb_size);
+                    if (x % bw == 0) { is_block_edge = 1; }
+                } else {
+                    let is i64 as bh = 8 * rt.recon_num_8x8_high(sb_size);
+                    if (y % bh == 0) { is_block_edge = 1; }
+                }
+
+                // Step 11: isTxEdge, including the odd-MiCols chroma case
+                // where a horizontal boundary would cross the image edge.
+                let is i64 as is_tx_edge with mut = 0;
+                if (pass == 1 && subx == 1 && (lf.mi_cols & 1) == 1
+                    && (edge & 1) == 1 && (x + 8) >= lf.mi_cols * 8) {
+                    is_tx_edge = 0;
+                } else if (edge % (1 << tx_sz) == 0) {
+                    is_tx_edge = 1;
+                }
+
+                let is i64 as is32 with mut = 0;
+                if (edge % 8 == 0) { is32 = 1; }
+
+                // Step 13: onScreen.
+                let is i64 as on_screen with mut = 1;
+                if (x >= 8 * lf.mi_cols) { on_screen = 0; }
+                else if (y >= 8 * lf.mi_rows) { on_screen = 0; }
+                else if (pass == 0 && x == 0) { on_screen = 0; }
+                else if (pass == 1 && y == 0) { on_screen = 0; }
+
+                // Step 14: applyFilter.
+                let is i64 as apply with mut = 0;
+                if (on_screen == 0) { apply = 0; }
+                else if (is_block_edge == 1) { apply = 1; }
+                else if (is_tx_edge == 1 && ref == rt.INTRA_FRAME) { apply = 1; }
+                else if (is_tx_edge == 1 && skip == 0) { apply = 1; }
+
+                if (apply == 1) {
+                    let is i64 as filter_size = lf_filter_size(
+                        lf, tx_sz, is32, pass, x, y, subx, suby);
+
+                    let is i64 as lvl_idx = (seg * 4 + ref) * 2 + lf_mode_type(mode);
+                    let is i64 as lvl = cast(i64, lf.lvl_lookup[lvl_idx]);
+                    if (lvl > 0) {
+                        let is LfThresh as t;
+                        lf_thresholds(lf, lvl, &t);
+                        lf_sample(data, stride, x >> subx, y >> suby,
+                                  dx, dy, t.limit, t.blimit, t.thresh, filter_size);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        edge = edge + 1;
+    }
+    return errno.I_OK;
+}
+
+// Section 8.8: filter one plane. The traversal is superblock raster order,
+// with both passes of a superblock adjacent as the spec's note requires.
+// `plane` is 0, 1 or 2; `data` points at the top-left sample of that plane.
+fn lf_filter_plane(lf as *LfFrame, blk as *LfBlockInfo, plane as i64,
+                   data as *u8, stride as i64) as i64 {
+    if (cast(i64, lf) == 0 || cast(i64, blk) == 0) { return errno.I_BADPARAM; }
+    if (plane < 0 || plane > 2) { return errno.I_BADPARAM; }
+    if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
+    if (lf.mi_cols <= 0 || lf.mi_rows <= 0) { return errno.I_BADPARAM; }
+    if (cast(i64, blk.mi_sizes) == 0 || cast(i64, blk.tx_sizes) == 0
+        || cast(i64, blk.skips) == 0 || cast(i64, blk.segment_ids) == 0
+        || cast(i64, blk.ref_frames) == 0 || cast(i64, blk.y_modes) == 0) {
+        return errno.I_BADPARAM;
+    }
+
+    let is i64 as subx with mut = 0;
+    if (plane > 0) { subx = lf.sub_x; }
+    let is i64 as plane_w = (lf.mi_cols * 8) >> subx;
+    if (stride < plane_w) { return errno.I_BADPARAM; }
+
+    // Section 8.1 invokes the loop filter only when loop_filter_level is
+    // non-zero. A non-zero segment ALT_L value does not override that frame
+    // gate: with level 0 the filter is not run at all.
+    if (lf.level == 0) { return errno.I_OK; }
+
+    let is i64 as row with mut = 0;
+    while (row < lf.mi_rows) {
+        let is i64 as col with mut = 0;
+        while (col < lf.mi_cols) {
+            let is i64 as pass with mut = 0;
+            while (pass < 2) {
+                let is i64 as st = lf_filter_sb(lf, blk, plane, pass, row, col,
+                                                data, stride);
+                if (st < 0) { return st; }
+                pass = pass + 1;
+            }
+            col = col + 8;
+        }
+        row = row + 8;
+    }
+    return errno.I_OK;
+}
+
+// Filter the whole frame. Planes are independent, so running one plane at a
+// time is equivalent to the spec's per-superblock plane loop. The strides are
+// the caller's plane strides; each is checked against the plane width by
+// lf_filter_plane.
+fn lf_filter_frame(lf as *LfFrame, blk as *LfBlockInfo,
+                   y as *u8, u as *u8, v as *u8,
+                   stride_y as i64, stride_u as i64, stride_v as i64) as i64 {
+    if (cast(i64, lf) == 0 || cast(i64, blk) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, y) == 0 || cast(i64, u) == 0 || cast(i64, v) == 0) {
+        return errno.I_BADPARAM;
+    }
+    let is i64 as st with mut = lf_filter_plane(lf, blk, 0, y, stride_y);
+    if (st < 0) { return st; }
+    st = lf_filter_plane(lf, blk, 1, u, stride_u);
+    if (st < 0) { return st; }
+    return lf_filter_plane(lf, blk, 2, v, stride_v);
+}
