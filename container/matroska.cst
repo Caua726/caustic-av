@@ -225,6 +225,7 @@ struct Mk {
     seg_end as i64;            // end of the Segment payload
 
     in_cluster    as i64;
+    clusters_seen as i64;
     cl_pos        as i64;      // next cluster child
     cl_end        as i64;      // known end, or seg_end when unknown
     cl_unknown    as i64;
@@ -512,6 +513,7 @@ fn _mk_clear(m as *Mk) as void {
     m.seg_pos = 0;
     m.seg_end = 0;
     m.in_cluster = 0;
+    m.clusters_seen = 0;
     m.cl_pos = 0;
     m.cl_end = 0;
     m.cl_unknown = 0;
@@ -699,9 +701,13 @@ fn _next_cluster(m as *Mk, e as *ebml.Ebml) as i64 {
     while (m.seg_pos < m.seg_end) {
         let is ebml.EbmlElement as el;
         let is i64 as r = ebml.ebml_read_element(e, m.seg_pos, m.seg_end, &el);
+        // A broken element after the last cluster (a cut-off Cues, say) costs
+        // no media, so it ends the stream instead of failing it.
+        if (r < 0 && m.clusters_seen > 0) { return 0; }
         if (r < 0) { return r; }
         if (el.id == MK_CLUSTER) {
             m.in_cluster = 1;
+            m.clusters_seen = m.clusters_seen + 1;
             m.cl_pos = el.off;
             m.cl_unknown = el.unknown;
             m.cluster_timecode = 0;
