@@ -14,8 +14,9 @@ PCM synthesis is stage 8b.
 | `../../tools/gen_mp3_tables.py` | Unrun generator that reads the public bitstream description and writes `mp3_tables_data.cst`; it validates dimensions, contiguity and Huffman prefix freedom. |
 
 The parser borrows the caller's buffer. It never allocates, never opens a
-file, and returns negative `i64` errors. A frame view (`Mp3Frame`) points
-into the input and is valid only while the input is.
+file, and returns negative `i64` errors. `Mp3Frame` holds absolute offsets
+and lengths into the input, not pointers; the view is valid only while the
+input is.
 
 ## API
 
@@ -103,15 +104,18 @@ any leftover or short bits. Fields:
   `window_switching_flag` 1, then either
   `block_type` 2 / `mixed_block_flag` 1 / two `table_select` 5 each /
   three `subblock_gain` 3 each, or three `table_select` 5 each /
-  `region0_count` 4 / `region1_count` 3. MPEG-1 adds `preflag` 1;
-  MPEG-2/2.5 does not transmit it and derives it from
-  `scalefac_compress` (the 500..511 non-intensity range sets it).
+  `region0_count` 4 / `region1_count` 3. MPEG-1 adds `preflag` 1.
+  MPEG-2/2.5 does not transmit `preflag`; stage 8b must derive it as
+  `preflag = (scalefac_compress >= 500)` in the non-intensity branch (the
+  400..499 and <400 branches clear it; the intensity branch clears it).
   `scalefac_scale` and `count1table_select` are always present.
 
 When `window_switching_flag` is set, the standard supplies
-`region0_count = 7` (`8` for block_type 2 without mixed block) and
-`region1_count = 63`; the parser records those defaults. `block_type` 0
-with the flag set is rejected because the value is reserved.
+`region0_count = 7` (`8` for block_type 2 without mixed block). The
+parser also stores `region1_count = 63` as its **sentinel for "all
+remaining bands"**; 63 is not a specification band count and exceeds the
+3-bit field's range. Stage 8b must treat it that way. `block_type` 0 with
+the flag set is rejected because the value is reserved.
 
 The raw `scalefac_compress` is exposed. Stage 8b expands it with the
 MPEG-1 slen table or the MPEG-2/2.5 four-partition procedure; those are
@@ -191,10 +195,16 @@ trim audio.
   expose it. Audio is not trimmed.
 * VBRI is checked at frame start + 36, is accepted when its version is 1,
   and exposes `vbri_delay`, `vbri_quality`, `vbr_bytes` and `frame_count`.
-  A Xing/Info tag takes precedence when both are present.
+  A Xing/Info tag takes precedence when both are present. A VBRI whose 18
+  fixed bytes do not fit is silently ignored, not reported, because the
+  parser only looks for the magic when the whole header is present.
+  `has_xing` is 1 for both `"Xing"` and `"Info"`; `is_vbr` distinguishes
+  them. `has_vbri` is 1 only when a VBRI header was parsed, and
+  `xing_flags` is 0 unless Xing/Info was found.
 
-A recognised tag that is cut short is `I_CORRUPT`. `frame_count` is 0 when
-the tag did not carry it; it is not estimated by scanning.
+A truncated Xing field or a truncated LAME delay/padding field is
+`I_CORRUPT`; a truncated VBRI is the exception noted above. `frame_count`
+is 0 when the tag did not carry it; it is not estimated by scanning.
 
 ## Tables
 
@@ -231,13 +241,18 @@ No value is copied from a decoder implementation.
   freedom.
 * Scalefactor partition sizes: `mp3_slen1`/`mp3_slen2` are Table 16;
   `mp3_lsf_nsf` is the six-context, three-block-case, four-partition
-  MPEG-2/2.5 table from the procedure after Table 16.
+  MPEG-2/2.5 table from the procedure after Table 16. Context order is
+  fixed: 0 = `<400`, 1 = `400..499`, 2 = `500..511`, 3 = intensity
+  `<180`, 4 = intensity `180..243`, 5 = intensity `244..255`; block case
+  0 = long, 1 = short not mixed, 2 = short mixed.
 
-`mp3_tables_data.cst` can be reproduced by
-`tools/gen_mp3_tables.py --spec ... -o ...`. The generator is committed but
-has not been run in this phase; it validates sfb contiguity and totals,
-the 512 D values, the alias count, and Huffman dimensions and prefix
-freedom.
+`mp3_tables_data.cst` can be reproduced (value-identically, not
+comment-identically) by `tools/gen_mp3_tables.py --spec ... -o ...`. The
+generator is committed but has not been run in this phase; it validates
+sfb contiguity and totals, the 512 D values, the alias count, and Huffman
+dimensions and prefix freedom. The bitrate rows, sample-rate row, MPEG-1
+slen and MPEG-2/2.5 LSF array are transcribed in the generator rather than
+parsed from the text; the large tables are parsed.
 
 ## Pending blobs
 
@@ -253,6 +268,27 @@ written yet:
 `MP3_WINDOW_TABLES_GENERATED` is 0 and `mp3_window_tables_ready()` returns
 0. Stage 8b must not synthesise until these exist. The values have to come
 from the window definitions in the specification, not from a decoder.
+
+## Pending review notes
+
+Recorded verbatim from the stage 8a read-only review. These are LOW /
+non-blocking; none requires a code fix round, but stage 8b must read notes
+5, 6 and 12 before using the side information and table layer.
+
+1. `audio/mp3/mp3_tables.cst:324-331` — `mp3_huff_table_valid`'s comment says it returns 0 for table 0, but the code returns 1 for table 0 (correct: table 0 is a valid all-zero table; 4/14 → 0). Comment/behaviour mismatch only.
+2. `audio/mp3/mp3_tables.cst:433-439` — `mp3_count1_table_count`'s comment describes the two tables but never states that it returns 16 for `table` 0/1 (and 0 otherwise). Unused so far.
+3. `audio/mp3/mp3_tables.cst:380-382` (and the same claim at `:453`) — "Both output arrays are cleared first, so a failed load leaves no half-table behind" is false for a failure inside the token loop: entries already parsed stay in `code`/`len`. Same overstatement at `:133-134` ("rejected before out is touched"): a short blob is detected after `out[0..k)` has been written. No safety consequence; callers treat the error as fatal.
+4. `audio/mp3/mp3_tables.cst:7-9` — "a malformed blob is reported as `I_CORRUPT` instead of producing a value" holds for `_mp3_blob_i64`/`mp3_huff_load`/`mp3_count1_load`; the scalar accessors (`mp3_bitrate_kbps`, `mp3_pretab`, `mp3_huff_linbits`, …) swallow the error and return 0.
+5. `audio/mp3/mp3.md:112-113` + `audio/mp3/mp3.cst:476-481` — the standard assigns `region0_count = 7/8` for switched blocks, but **not** `region1_count = 63`; the doc only says region2 is unused. 63 is this parser's sentinel and 8b must treat it as "all remaining", not as a band count (note it also exceeds the 3-bit field range). The comment "the specification assigns these values" is inaccurate for the 63.
+6. `audio/mp3/mp3.md:106-108` + `audio/mp3/mp3.cst:78,502-504` — the parser leaves `preflag` 0 for MPEG-2/2.5 (`else { preflag = 0; }`); the md sentence "MPEG-2/2.5 … derives it from scalefac_compress" reads as if the parser derived it. The struct comment says "MPEG-2 derives it", so the split is discoverable, but the md should say explicitly that 8b must derive `preflag = (scalefac_compress >= 500)` in the non-intensity branch. No data loss: raw `scalefac_compress` and mode/mode_extension are exposed.
+7. `audio/mp3/mp3.md:196` — "A recognised tag that is cut short is `I_CORRUPT`" is not true for VBRI: `_mp3_parse_vbri`'s `off + 18 > end` guard (`mp3.cst:632`) is unreachable from `_mp3_parse_vbr` (`mp3.cst:663-670`), which only looks for "VBRI" when all 18 fixed bytes fit; a truncated VBRI is silently ignored. True for Xing fields and LAME (`mp3.cst:587-628`).
+8. `audio/mp3/mp3.cst:531-535` — `_mp3_id3v2_skip` validates neither `src`/`out_next`/`out_bytes` for null nor `start < 0` (private helper; the only caller passes valid values). Every read is bounded once those preconditions hold.
+9. `audio/mp3/mp3_tables_data.cst:20` — "Table 0 has one dummy entry": there is no `MP3_HUFF_0` blob (Table 26 is skipped, correctly); the "dummy entry" is the document's row.
+10. `audio/mp3/mp3.md:236-239` vs `tools/gen_mp3_tables.py:34-...`/`HEADER` — regeneration is value-identical but not comment-identical (different banner, no per-section comments, and `MP3_HUFF_0` is not emitted). Four blobs (both bitrate rows, sample rate, slen, LSF) are transcribed in the generator rather than parsed from the text; the file-table row at `mp3.md:24` ("reads the public bitstream description") slightly overstates this.
+11. `audio/mp3/mp3.cst:15` / `mp3.md` "A frame view (Mp3Frame) points into the input" — `Mp3Frame` holds absolute offsets and lengths, no pointer; the "borrow" wording is conceptual only.
+12. `audio/mp3/mp3_tables.cst:522-526` — the six `mp3_lsf_nsf` contexts are not enumerated in order (only "three by scalefac_compress range, three by the intensity side"). The blob order is the document's procedure order (0 = `<400`, 1 = `400..499`, 2 = `500..511`, 3 = intensity `<180`, 4 = `180..243`, 5 = `244..255`); 8b must use exactly that, so a one-line enumeration would remove a silent-wrong-scalefactor hazard.
+13. `audio/mp3/mp3.cst:576-578,134` — `has_xing` is set for both "Xing" and "Info"; the name plus the md's `is_vbr` bullet invites 8b to read `has_xing` as "Xing (VBR)" only. `has_vbri`/`has_xing`/`xing_flags` are otherwise undocumented in the md.
+14. `audio/mp3/mp3_tables.cst:280-300` — `mp3_bitrate_kbps`, `mp3_samples_per_frame`, `mp3_granule_count`, `mp3_side_info_len` do not validate `version` (unlike `mp3_sample_rate`/`mp3_version_ok`); they can only be reached with a validated version in-tree.
 
 ## What stage 8b adds
 
@@ -316,3 +352,7 @@ Nothing here is verified. The checks the original criteria require — an MD5
 of decoded PCM against a reference, `ffprobe` metadata, `trace_headers`
 field comparison, `opus_compare` (not applicable to MP3), an FFmpeg
 difference run, and an fps/throughput measurement — have **NOT RUN**.
+
+Review item 15 (not a code note): the max-absolute-PCM-difference criterion
+(alignment, sample count, tolerance) is not written here; it belongs to
+stage 8b's synthesis/test section and is still open.

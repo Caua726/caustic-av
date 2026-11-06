@@ -5,8 +5,8 @@
 // The values live in mp3_tables_data.cst as comma-separated blobs and are
 // read on demand, the same way video/vp9/inter_tables.cst keeps its filters.
 // Nothing here parses a bitstream or allocates: every accessor is a pure
-// lookup over a constant, and a malformed blob is reported as I_CORRUPT
-// instead of producing a value.
+// lookup over a constant. The blob loaders report a malformed blob as
+// I_CORRUPT; the scalar accessors return 0 when the blob cannot be read.
 //
 // Provenance of every table is the public documentation in
 // .work/docs (mp3_bitstream.txt unless noted):
@@ -131,7 +131,8 @@ fn _mp3_blob_token(s as *u8, pos as *i64, out as *i64) as i64 {
 }
 
 // Read count entries starting at entry first from a blob. Short blobs and a
-// negative first/count are rejected before out is touched.
+// negative first/count are rejected; entries already written are not rolled
+// back when a later token is short.
 fn _mp3_blob_i64(s as *u8, first as i64, count as i64, out as *i64) as i64 {
     if (cast(i64, s) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
     if (first < 0 || count < 0) { return errno.I_BADPARAM; }
@@ -321,8 +322,9 @@ fn mp3_synth_window_load(out as *f64) as i64 {
 
 // ── Huffman tables ──────────────────────────────────────────────────
 
-// 1 for a table whose codewords are defined, 0 for table 0 (the "all zero"
-// table, which carries no bits) and for the two unused numbers 4 and 14.
+// 1 for table 0 (the valid "all zero" table, which carries no codewords)
+// and for every table whose codewords are defined; 0 for the unused numbers
+// 4 and 14 and for an out-of-range index.
 fn mp3_huff_table_valid(table as i64) as i64 {
     if (table < 0 || table >= MP3_HUFF_TABLES) { return 0; }
     if (table == 0) { return 1; }
@@ -378,8 +380,9 @@ fn mp3_huff_linbits(table as i64) as i64 {
 //
 // The blobs list entries in x-major, y-minor order. Duplicate symbols, an
 // out-of-range x/y, a length above 19 or a codeword wider than its length
-// is I_CORRUPT. Both output arrays are cleared first, so a failed load leaves
-// no half-table behind.
+// is I_CORRUPT. Both output arrays are cleared before parsing; a failure
+// after parsing starts may leave the entries read so far, and callers must
+// treat the error as fatal.
 fn mp3_huff_load(table as i64, code as *i64, len as *i64) as i64 {
     if (cast(i64, code) == 0 || cast(i64, len) == 0) { return errno.I_BADPARAM; }
     if (table < 0 || table >= MP3_HUFF_TABLES) { return errno.I_BADPARAM; }
@@ -429,9 +432,9 @@ fn mp3_huff_load(table as i64, code as *i64, len as *i64) as i64 {
 
 // ── count1 tables and MPEG-2 scalefactor partitions ─────────────────
 
-// 1 for count1 table A, 2 for B. The two tables are the quadruple codes
-// used after big_values; table A maps 0000 to one bit, table B is a fixed
-// four-bit code for every symbol.
+// Returns 16 for count1 table A (0) or B (1), and 0 for any other index.
+// The two tables are the quadruple codes used after big_values; table A
+// maps 0000 to one bit, table B is a fixed four-bit code for every symbol.
 fn mp3_count1_table_count(table as i64) as i64 {
     if (table < 0 || table > 1) { return 0; }
     return MP3_COUNT1_COUNT;

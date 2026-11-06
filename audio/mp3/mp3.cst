@@ -60,9 +60,10 @@ struct Mp3Header {
 }
 
 // One granule/channel from the side information. Fields absent from a
-// version are zero. When window_switching_flag is set, region0_count and
-// region1_count are the defaults the specification assigns (7 or 8, and
-// 63); they are not transmitted.
+// version are zero. When window_switching_flag is set, region0_count is the
+// specification's default (7, or 8 for short non-mixed blocks) and is not
+// transmitted. region1_count is not transmitted either; the parser stores
+// 63 there as a sentinel meaning "all remaining bands", not a band count.
 struct Mp3Granule {
     part2_3_length       as i64;
     big_values           as i64;
@@ -471,8 +472,9 @@ fn mp3_side_info_parse(src as *u8, len as i64, version as i64,
                     s.granule[gr][ch].subblock_gain[win] = r;
                     win = win + 1;
                 }
-                // Not transmitted for switched blocks; the specification
-                // assigns these values so the region walk stays in range.
+                // Not transmitted for switched blocks. region0_count is the
+                // specification's default; region1_count = 63 is this
+                // parser's sentinel for "all remaining bands".
                 s.granule[gr][ch].region0_count = 7;
                 if (s.granule[gr][ch].block_type == 2 &&
                     s.granule[gr][ch].mixed_block_flag == 0) {

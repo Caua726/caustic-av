@@ -17,9 +17,9 @@
 //     terminated by the string literal;
 //   * each Huffman entry is four integers x,y,hlen,hcod, repeated in
 //     x-major, y-minor order. hcod is the binary codeword read as an
-//     integer. Table 0 has one dummy entry; tables 4 and 14 have no
-//     codewords at all. Tables 16-23 share MP3_HUFF_16_23 and tables
-//     24-31 share MP3_HUFF_24_31.
+//     integer. Table 0 is the document's all-zero dummy row and has no
+//     blob; tables 4 and 14 have no codewords at all. Tables 16-23 share
+//     MP3_HUFF_16_23 and tables 24-31 share MP3_HUFF_24_31.
 //
 // The scalefactor-band blobs store 22 long bands and 13 short bands per
 // sampling-rate row, in the order 44.1, 48, 32, 22.05, 24, 16, 11.025, 12,
