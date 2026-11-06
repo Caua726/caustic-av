@@ -103,20 +103,23 @@ fn bits_msb_read_wide(b as *BitsMsb, n as i64, out as *i64) as i64 {
 // Unsigned Exp-Golomb (ue): zero or more 0 bits, then a 1, then that many
 // payload bits. The value is 2^zeros - 1 + payload, so the encoding of 0 is
 // a single 1 bit. More than 31 leading zeros is rejected as I_CORRUPT rather
-// than allowed to overflow. Returns the value (>= 0) or a negative code.
+// than allowed to overflow. Every failure restores the position it started
+// with, so a truncated or malformed prefix can be retried or skipped by the
+// caller. Returns the value (>= 0) or a negative code.
 fn bits_msb_ue(b as *BitsMsb) as i64 {
+    let is i64 as start = b.pos;
     let is i64 as zeros with mut = 0;
     let is i64 as bit with mut = 0;
     while (1) {
         bit = bits_msb_bit(b);
-        if (bit < 0) { return bit; }
+        if (bit < 0) { b.pos = start; return bit; }
         if (bit == 1) { break; }
         zeros = zeros + 1;
-        if (zeros > 31) { return errno.I_CORRUPT; }
+        if (zeros > 31) { b.pos = start; return errno.I_CORRUPT; }
     }
     if (zeros == 0) { return 0; }
     let is i64 as rest = bits_msb_read(b, zeros);
-    if (rest < 0) { return rest; }
+    if (rest < 0) { b.pos = start; return rest; }
     return (1 << zeros) - 1 + rest;
 }
 
