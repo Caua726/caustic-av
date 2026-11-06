@@ -173,6 +173,10 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
     if (cutoff > 1.0) { cutoff = 1.0; }
     let is i64 as delay = rs.taps / 2;
     let is f64 as den = cast(f64, delay);
+    // Hybrid frames mix this output with CELT, so WB must land on the same
+    // sample as the reference delay: 4 samples at 48 kHz, 4/3 of an input sample.
+    let is f64 as extra with mut = 0.0;
+    if (in_rate == 16000 && out_rate == 48000) { extra = 1.3333333333333333; }
     let is f64 as i0beta = _fbessel_i0(SILK_RS_BETA);
 
     let is i64 as p with mut = 0;
@@ -186,7 +190,7 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
             // frac - delay + j. Both the sinc and the Kaiser window use
             // that distance, centring the kernel on the evaluation
             // point rather than on the integer tap position.
-            let is f64 as u = frac + cast(f64, j - delay);
+            let is f64 as u = frac + cast(f64, j - delay) - extra;
             let is f64 as v = u / den;
             let is f64 as w with mut = 1.0;
             let is f64 as arg = 1.0 - v * v;
