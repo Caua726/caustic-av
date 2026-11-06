@@ -54,7 +54,7 @@ let is i64 as SILK_LTP_ORDER        with imut = 5;
 // rates are 8, 12, 16, 24 and 48 kHz, so the largest phase count is 6
 // (8 kHz -> 48 kHz). The kernel spans 21 input samples.
 let is i64 as SILK_RS_PHASES_MAX with imut = 6;
-let is i64 as SILK_RS_TAPS       with imut = 21;
+let is i64 as SILK_RS_TAPS       with imut = 65;
 
 // Table element counts. Each count is the number of comma-separated values
 // in the matching blob of silk_tables_data.cst; tools/gen_opus_silk_tables.py

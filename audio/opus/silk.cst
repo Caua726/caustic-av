@@ -597,7 +597,7 @@ fn silk_decode(d as *SilkDecoder, r as *rc.OpusRange,
         d.prev_w1 = 0;
         d.st_side1 = 0.0;
         let is i64 as hi with mut = 0;
-        while (hi < 20) {
+        while (hi < 64) {
             d.rs.hist[1][hi] = d.rs.hist[0][hi];
             hi = hi + 1;
         }

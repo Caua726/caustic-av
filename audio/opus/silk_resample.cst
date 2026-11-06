@@ -39,7 +39,7 @@ use "silk_tables.cst" as t;
 
 let is f64 as SILK_PI      with imut = 3.141592653589793;
 let is f64 as SILK_TWO_PI  with imut = 6.283185307179586;
-let is f64 as SILK_RS_BETA with imut = 8.0;
+let is f64 as SILK_RS_BETA with imut = 5.0;
 
 struct SilkResampler {
     ready    as i64;    // 0 when input rate == output rate
@@ -48,8 +48,8 @@ struct SilkResampler {
     L        as i64;    // output samples per L/M input samples
     M        as i64;
     taps     as i64;
-    coef     as [6][21]f64;
-    hist     as [2][20]f64;   // one history per output channel
+    coef     as [6][65]f64;
+    hist     as [2][64]f64;   // one history per output channel
 }
 
 fn _fabs(x as f64) as f64 {
@@ -123,7 +123,7 @@ fn silk_resampler_reset(rs as *SilkResampler) as void {
     let is i64 as c with mut = 0;
     while (c < 2) {
         let is i64 as i with mut = 0;
-        while (i < 20) {
+        while (i < 64) {
             rs.hist[c][i] = 0.0;
             i = i + 1;
         }
@@ -171,13 +171,23 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
     // Nyquist frequency of the lower of the two rates.
     let is f64 as cutoff with mut = ratio;
     if (cutoff > 1.0) { cutoff = 1.0; }
-    let is i64 as delay = rs.taps / 2;
-    let is f64 as den = cast(f64, delay);
-    // Hybrid frames mix this output with CELT, so WB must land on the same
-    // sample as the reference delay: 4 samples at 48 kHz, 4/3 of an input sample.
-    let is f64 as extra with mut = 0.0;
-    if (in_rate == 16000 && out_rate == 48000) { extra = 1.3333333333333333; }
-    let is f64 as i0beta = _fbessel_i0(SILK_RS_BETA);
+    // Evaluation point, in input samples behind the newest one. At 48 kHz the
+    // reference path is 37 output samples late (32 at NB, one input sample of it
+    // from the mid/side stage), which sets how much look-ahead this filter gets.
+    // The window is asymmetric: short towards the future, long into the past.
+    let is f64 as delay with mut = cast(f64, rs.taps / 2);
+    if (out_rate == 48000) {
+        if (in_rate == 8000)  { delay = 4.333333333333333; }
+        if (in_rate == 12000) { delay = 8.25; }
+        if (in_rate == 16000) { delay = 11.333333333333334; }
+    }
+    let is f64 as den_future = delay;
+    let is f64 as den_past = cast(f64, rs.taps - 1) - delay;
+    // WB has the look-ahead for a steep window; NB has little, so a softer one
+    // keeps more of the band edge.
+    let is f64 as beta with mut = SILK_RS_BETA;
+    if (in_rate == 16000) { beta = 8.0; }
+    let is f64 as i0beta = _fbessel_i0(beta);
 
     let is i64 as p with mut = 0;
     while (p < L) {
@@ -190,12 +200,13 @@ fn silk_resampler_init(rs as *SilkResampler, in_rate as i64, out_rate as i64) as
             // frac - delay + j. Both the sinc and the Kaiser window use
             // that distance, centring the kernel on the evaluation
             // point rather than on the integer tap position.
-            let is f64 as u = frac + cast(f64, j - delay) - extra;
-            let is f64 as v = u / den;
+            let is f64 as u = frac + cast(f64, j) - delay;
+            let is f64 as v with mut = u / den_past;
+            if (u < 0.0) { v = u / den_future; }
             let is f64 as w with mut = 1.0;
             let is f64 as arg = 1.0 - v * v;
             if (arg > 0.0) {
-                w = _fbessel_i0(SILK_RS_BETA * _fsqrt(arg)) / i0beta;
+                w = _fbessel_i0(beta * _fsqrt(arg)) / i0beta;
             } else {
                 w = 0.0;
             }
