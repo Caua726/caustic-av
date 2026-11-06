@@ -985,9 +985,9 @@ fn _read_mv_component(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64,
             hp = vb.vp9_bool_read(br,
                 cast(i64, b.st.probs.mv_class0_hp[comp]));
             if (hp < 0) { return hp; }
-            cnt.mv_class0_hp[comp][hp] =
-                cnt.mv_class0_hp[comp][hp] + 1;
         }
+        // Counted even when not read, as hp = 1: the adaptation depends on it.
+        cnt.mv_class0_hp[comp][hp] = cnt.mv_class0_hp[comp][hp] + 1;
         mag = ((bit << 3) | (fr << 1) | hp) + 1;
     } else {
         let is i64 as d with mut = 0;
@@ -1009,9 +1009,8 @@ fn _read_mv_component(b as *Vp9Blk, br as *vb.Vp9Bool, comp as i64,
         if (use_hp == 1) {
             hp = vb.vp9_bool_read(br, cast(i64, b.st.probs.mv_hp[comp]));
             if (hp < 0) { return hp; }
-            cnt.mv_hp[comp][hp] =
-                cnt.mv_hp[comp][hp] + 1;
         }
+        cnt.mv_hp[comp][hp] = cnt.mv_hp[comp][hp] + 1;
         mag = mag + ((d << 3) | (fr << 1) | hp) + 1;
     }
     if (sign == 1) { *out = 0 - mag; }
