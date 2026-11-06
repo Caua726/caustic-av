@@ -230,7 +230,7 @@ open.
 | `I_BADMAGIC` | no recognised signature; EBML DocType neither webm nor matroska; no Layer III frame after the ID3 tag/junk. |
 | `I_UNSUPPORTED` | Ogg version other than 0; too many Ogg tracks; a Layer I/II or free-format MP3 stream that carried an ID3 tag; an MP3 frame whose rate/channels change mid-stream. Without an ID3 tag, the sniff scan accepts only a Layer III frame and reports `I_BADMAGIC`. |
 | `I_CORRUPT` | malformed page/EBML/block/header; a track index outside the published list; a timestamp past the arithmetic ceiling. |
-| `I_DIMS` | a Matroska audio rate too large to represent. |
+| `I_DIMS` | a Matroska audio rate too large to represent; an ID3-tagged MP3 larger than `core/bits`' byte ceiling. |
 
 `demux_open` clears the `Demux` first and again on failure, so a failed open
 leaves `demux_kind == DEMUX_NONE`, no tracks, and `demux_next` returning 0.
