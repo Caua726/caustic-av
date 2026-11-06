@@ -1,12 +1,33 @@
 // =======================================================
 // caustic-av/video/vp9/decode.cst
-// Frame driver for the VP9 decoder: one coded frame slice in, one
-// reconstructed 8-bit I420 surface out. It validates the parsed header,
-// selects a free pixel buffer from the caller's reference pool, binds the
-// caller's work block, decodes the tiles through block.cst/tile.cst, runs
-// the probability adaptation of section 6.1.2 through adapt_bridge.cst, runs
-// the loop filter of section 8.8, and performs the post-frame bookkeeping of
-// sections 8.1, 8.9 and 8.10.
+// Frame driver for the VP9 decoder: a packet of 1..8 coded frame slices in,
+// zero or more reconstructed 8-bit I420 output frames out. It validates the
+// parsed header, selects a free pixel buffer from the caller's reference
+// pool, binds the caller's work block, decodes the tiles through
+// block.cst/tile.cst, runs the probability adaptation of section 6.1.2
+// through adapt_bridge.cst, runs the loop filter of section 8.8, and performs
+// the post-frame bookkeeping of sections 8.1, 8.9 and 8.10.
+//
+// Packet handoff
+// --------------
+// vp9_decoder_send takes one packet (a single frame or an Annex B
+// superframe) and arms it. vp9_decoder_receive decodes slices until it has
+// one frame to display and returns that frame; it returns 0 when the packet
+// has no further output. A packet therefore yields 0..8 outputs, in bitstream
+// order, without ever producing a placeholder frame. Hidden frames
+// (show_frame == 0) update the reference slots without being returned, and
+// show_existing_frame (section 8.9) returns a stored slot without decoding a
+// tile. The caller must drain a packet (receive returns 0) before sending
+// the next one; send refuses otherwise, so every frame of every packet is
+// handed out exactly once.
+//
+// The packet bytes stay the caller's: send stores only their addresses and
+// lengths, and receive decodes from them. They must not change or be released
+// until receive has returned 0 for that packet. Decoding the packet lazily is
+// what keeps the reference pool bound: at most one displayed frame exists
+// outside the reference slots, so eight reference slots plus one decode
+// target suffice (section 8.10's FrameStore is indexed by the same eight
+// slots).
 //
 // Memory
 // ------
@@ -26,16 +47,23 @@
 // Reference lifetime and the decode target
 // ----------------------------------------
 // The decoder never reconstructs over a published reference: _decode_slice
-// picks a pool buffer whose index is named by no slot (refs.in_use) and
-// decodes there. After the loop filter the frame is published by
-// vp9_refs_publish, which stores that view in every slot named by
-// refresh_frame_flags, so the buffer becomes a reference in place (section
-// 8.10's copy of CurrFrame into FrameStore, represented as a view because
-// the pixels already are the frame). A frame with refresh_frame_flags 0
-// leaves the buffer unpublished; the next frame may reuse it once the
-// caller has consumed the output view. Up to eight slices in one
-// superframe, each either publishing one buffer or holding the current
-// output, keep the ninth buffer free.
+// picks a pool buffer that is named by no slot (vp9_refs_buffer_in_use) and
+// whose range is publishable (vp9_refs_buffer_publishable), and decodes
+// there. After the loop filter the frame is published by vp9_refs_publish,
+// which stores that view in every slot named by refresh_frame_flags, so the
+// buffer becomes a reference in place (section 8.10's copy of CurrFrame into
+// FrameStore, represented as a view because the pixels already are the
+// frame). A frame with refresh_frame_flags 0 leaves the buffer unpublished;
+// the next frame may reuse it once the caller has consumed the output view.
+//
+// Output lifetime
+// ---------------
+// The returned view points into a pool buffer. It is valid until the next
+// vp9_decoder_receive or vp9_decoder_send call, whichever comes first; after
+// that the buffer may be reused for another frame. If the frame was also
+// published as a reference, its pixels stay valid while any slot names that
+// buffer, so a show_existing view of it never expires as long as the slot is
+// live. The decoder copies no pixels into a separate display surface.
 //
 // Padded surfaces
 // ---------------
@@ -49,10 +77,12 @@
 //
 // What is decoded
 // ---------------
-// Key frames, intra-only frames and inter frames, including compound
-// prediction and scaled references. show_existing_frame is stage 6 and
-// returns I_UNSUPPORTED; so does a stream whose probability or coefficient
-// table blobs are still pending.
+// Key frames, intra-only frames, inter frames, compound prediction, scaled
+// references, the eight reference slots, show_existing_frame, error-resilient
+// frames and 1..64 x 1..4 tile layouts. Anything profile 0 cannot express
+// (other profiles, 4:2:2/4:4:4, 10/12-bit, CS_RGB) returns I_UNSUPPORTED
+// before a surface is touched, as does a stream whose probability or
+// coefficient table blobs are still pending.
 // =======================================================
 
 use "../../core/errno.cst" as errno;
@@ -76,6 +106,28 @@ let is i64 as VP9_MAX_MI with imut = 8192;
 // Pixel buffers the decoder can use: eight reference slots plus one
 // transient decode target (at least one is always free; see above).
 let is i64 as VP9_POOL_BUFFERS with imut = 9;
+
+// Slices one superframe can carry (Annex B frame count field).
+let is i64 as VP9_MAX_SUPERFRAME_FRAMES with imut = 8;
+
+// One displayed frame. The view is I420, visible width/height, with the
+// coded strides of the pool buffer; render_* is the 7.2.4 hint of the frame
+// that filled the slot (for show_existing, the hint stored with the slot).
+// order rises across every output of the stream and is only a hint for the
+// caller's presentation queue. A frame is never returned twice: a
+// show_existing frame is one output even though it reuses stored pixels.
+struct Vp9Output {
+    frame         as frame.Frame;
+    render_width  as i64;
+    render_height as i64;
+    profile       as i64;
+    bit_depth     as i64;
+    subsampling_x as i64;
+    subsampling_y as i64;
+    color_space   as i64;
+    color_range   as i64;
+    order         as i64;
+}
 
 // ── caller-owned work block ─────────────────────────────────────────
 
@@ -251,7 +303,7 @@ fn _coded_dims(width as i64, height as i64,
 }
 
 // Bytes one pool buffer needs for a visible width x height frame, i.e. the
-// value vp9_decoder_decode reports in frame_need. Returns a positive byte
+// value vp9_decoder_receive reports in frame_need. Returns a positive byte
 // count or a negative code.
 fn vp9_frame_size(width as i64, height as i64) as i64 {
     let is i64 as cw with mut = 0;
@@ -270,13 +322,21 @@ struct Vp9Decoder {
 
     work as *u8;
     work_cap as i64;
-    work_need as i64;      // set when a decode finds the work too small
-    frame_need as i64;     // set when a decode finds no usable pixel buffer
+    work_need as i64;      // set when receive finds the work too small
+    frame_need as i64;     // set when receive finds no usable pixel buffer
 
     pool_mem as [9]*u8;    // caller-owned pixel buffers
     pool_cap as [9]i64;
     pool_count as i64;
-    frame_serial as i64;   // presentation-order hint, monotonic
+    frame_serial as i64;   // order hint of the next decoded coded frame
+    out_serial as i64;     // order hint of the next returned output
+
+    // The packet armed by vp9_decoder_send and consumed by
+    // vp9_decoder_receive. The pointers belong to the caller and stay valid
+    // until the packet is drained (receive returns 0).
+    pkt as hd.Vp9Superframe;
+    pkt_index as i64;      // next slice to decode, 0..pkt.count
+    pkt_active as i64;     // 1 between send and the final receive
 
     // adapt_bridge.cst scratch: one working probability set, the counts of
     // this frame, one import slot for a saved context and the §9.3 trees.
@@ -403,15 +463,24 @@ fn vp9_decoder_free(d as *Vp9Decoder) as void {
     d.work_need = 0;
     d.frame_need = 0;
     d.pool_count = 0;
+    d.pkt_active = 0;
+    d.pkt_index = 0;
+    d.pkt.count = 0;
+    d.pkt.index_size = 0;
 }
 
-// Index of a free buffer that can host `need` bytes, skipping `held` (the
-// buffer the current superframe still returns as output), or -1.
-fn _pick_buffer(d as *Vp9Decoder, need as i64, held as i64) as i64 {
+// Index of a buffer that can host `need` bytes, is not named by a published
+// reference slot, and whose range is publishable, or -1. The publishable
+// check repeats the id lookup against the actual pixel ranges, so a caller
+// that mixed two bookkeeping schemes still cannot reconstruct over a live
+// reference.
+fn _pick_buffer(d as *Vp9Decoder, need as i64) as i64 {
     let is i64 as i with mut = 0;
     while (i < d.pool_count) {
-        if (i != held && d.pool_cap[i] >= need
-            && refs.vp9_refs_buffer_in_use(&d.refs, i) == 0) {
+        if (d.pool_cap[i] >= need
+            && refs.vp9_refs_buffer_in_use(&d.refs, i) == 0
+            && refs.vp9_refs_buffer_publishable(&d.refs, d.pool_mem[i],
+                                                d.pool_cap[i]) == 1) {
             return i;
         }
         i = i + 1;
@@ -519,14 +588,47 @@ fn _update_prev_mv(w as *Vp9Work, b as *blk.Vp9Blk) as void {
 
 // ── one coded frame slice ───────────────────────────────────────────
 
+// Fill one output record from a published slot view. Used by the
+// show_existing path, which takes every geometry and format field from the
+// slot and never from the current header (7.2.6's note: neither frame_size
+// nor compute_image_size ran for it).
+fn _out_from_slot(out as *Vp9Output, v as *refs.Vp9RefView, order as i64) as void {
+    _frame_copy(&out.frame, &v.view);
+    out.render_width = v.render_width;
+    out.render_height = v.render_height;
+    out.profile = v.profile;
+    out.bit_depth = v.bit_depth;
+    out.subsampling_x = v.subsampling_x;
+    out.subsampling_y = v.subsampling_y;
+    out.color_space = v.color_space;
+    out.color_range = v.color_range;
+    out.order = order;
+}
+
+// Decode one coded frame slice, in bitstream order. Returns 1 when the slice
+// produced a displayed frame (written to out), 0 when it was hidden
+// (show_frame == 0) or produced no output, or a negative code. A packet is
+// consumed one slice at a time so a displayed frame never forces a second
+// output buffer to exist beside the eight reference slots.
 fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
-                 out as *frame.Frame, held as *i64) as i64 {
+                 out as *Vp9Output) as i64 {
     let is i64 as st with mut = hd.vp9_header_parse(&d.state, &d.hdr, data, len);
     if (st < 0) { return st; }
     let is *hd.Vp9Header as h = &d.hdr;
 
-    // Stage 6 owns showing an already decoded slot.
-    if (h.show_existing_frame == 1) { return errno.I_UNSUPPORTED; }
+    // Section 8.9: output a stored reference. Nothing is decoded, no tile is
+    // read, no slot or persistent field changes (refresh_frame_flags is 0 and
+    // 8.10 step 2 is skipped when show_existing_frame is 1). The header
+    // already checked that Vp9State believes the slot is published; this
+    // check is against the pixel slots themselves.
+    if (h.show_existing_frame == 1) {
+        let is refs.Vp9RefView as v;
+        st = refs.vp9_refs_show_existing(&d.refs, h.frame_to_show_map_idx, &v);
+        if (st < 0) { return st; }
+        _out_from_slot(out, &v, d.out_serial);
+        d.out_serial = d.out_serial + 1;
+        return 1;
+    }
     // The probability blobs and the coefficient tables must exist before any
     // tile is decoded; both modules report their generated state.
     if (h.probs_pending == 1 || t.vp9_tables_ready() == 0) {
@@ -577,7 +679,7 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
     let is i64 as fsz = frame.frame_size(coded_w, coded_h);
     if (fsz < 0) { return fsz; }
 
-    let is i64 as buf = _pick_buffer(d, fsz, held[0]);
+    let is i64 as buf = _pick_buffer(d, fsz);
     if (buf < 0) { d.frame_need = fsz; return errno.I_NOMEM; }
     let is *u8 as mem = d.pool_mem[buf];
     let is i64 as cap = d.pool_cap[buf];
@@ -695,33 +797,42 @@ fn _decode_slice(d as *Vp9Decoder, data as *u8, len as i64,
     if (st < 0) { return st; }
     d.frame_serial = d.frame_serial + 1;
 
-    if (h.show_frame == 1) {
-        _frame_copy(out, &cf);
-        held[0] = buf;
-    }
-    return errno.I_OK;
+    // Section 8.9's second branch: show_frame == 1 displays the frame just
+    // decoded. A hidden frame only updated the reference state above.
+    if (h.show_frame == 0) { return 0; }
+    _frame_copy(&out.frame, &cf);
+    out.render_width = h.render_width;
+    out.render_height = h.render_height;
+    out.profile = h.profile;
+    out.bit_depth = h.bit_depth;
+    out.subsampling_x = h.subsampling_x;
+    out.subsampling_y = h.subsampling_y;
+    out.color_space = h.color_space;
+    out.color_range = h.color_range;
+    out.order = d.out_serial;
+    d.out_serial = d.out_serial + 1;
+    return 1;
 }
 
-// ── public entry point ──────────────────────────────────────────────
+// ── public entry points ─────────────────────────────────────────────
 
-// Decode one packet. A packet may be an Annex B superframe; its slices are
-// decoded in order. The output surface holds the last displayed slice
-// (`show_frame == 1`); a packet made only of hidden frames returns I_OK with
-// a cleared frame view, which the caller can recognise by out->width == 0
-// (stage 6 owns display order and stored reference frames).
+// Arm one packet for vp9_decoder_receive. A packet is either a single coded
+// frame or an Annex B superframe of 1..8 frames; the split is validated here
+// (sizes, markers, ranges) so receive only walks slices already known to lie
+// inside the caller's buffer. The packet bytes are not copied: data must stay
+// valid and unchanged until receive has returned 0 for this packet.
 //
-// Errors: I_BADPARAM for null pointers, an unbound decoder or a bad buffer
-// registration, I_NOMEM when the bound work block is too small
-// (d.work_need) or no free pixel buffer holds this frame (d.frame_need, then
-// vp9_decoder_replace_buffer on a free index), I_UNSUPPORTED for
-// show-existing/pending tables, and the header/tile modules' negative codes
-// otherwise. A rejected frame leaves the persistent state tainted until the
-// next key or intra-only frame, as recorded in vp9.md.
-fn vp9_decoder_decode(d as *Vp9Decoder, data as *u8, len as i64,
-                      out as *frame.Frame) as i64 {
-    if (cast(i64, d) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+// The previous packet must be drained first. Refusing send otherwise is what
+// guarantees that no output of a packet can be skipped or handed out twice.
+//
+// Errors: I_BADPARAM for a null decoder, an unbound decoder, a null or
+// negative buffer, a bad length, or a packet still being consumed; I_EOF for
+// an empty packet; I_CORRUPT for a malformed superframe index; I_DIMS for
+// more than VP9_MAX_SUPERFRAME_FRAMES frames.
+fn vp9_decoder_send(d as *Vp9Decoder, data as *u8, len as i64) as i64 {
+    if (cast(i64, d) == 0) { return errno.I_BADPARAM; }
     if (cast(i64, d.work) == 0) { return errno.I_BADPARAM; }
-    frame.frame_free(out);
+    if (d.pkt_active != 0) { return errno.I_BADPARAM; }
     if (len < 0) { return errno.I_BADPARAM; }
     if (len == 0) { return errno.I_EOF; }
     if (cast(i64, data) == 0) { return errno.I_BADPARAM; }
@@ -729,19 +840,70 @@ fn vp9_decoder_decode(d as *Vp9Decoder, data as *u8, len as i64,
     d.work_need = 0;
 
     let is hd.Vp9Superframe as sf;
-    let is i64 as st with mut = hd.vp9_superframe_split(data, len, &sf);
+    let is i64 as st = hd.vp9_superframe_split(data, len, &sf);
     if (st < 0) { return st; }
-    if (sf.count < 1 || sf.count > 8) { return errno.I_CORRUPT; }
+    if (sf.count < 1) { return errno.I_CORRUPT; }
+    if (sf.count > VP9_MAX_SUPERFRAME_FRAMES) { return errno.I_DIMS; }
 
-    let is i64 as held with mut = 0 - 1;
+    d.pkt.count = sf.count;
+    d.pkt.index_size = sf.index_size;
     let is i64 as i with mut = 0;
     while (i < sf.count) {
-        st = _decode_slice(d, sf.ptr[i], sf.len[i], out, &held);
-        if (st < 0) {
-            frame.frame_free(out);
-            return st;
-        }
+        d.pkt.ptr[i] = sf.ptr[i];
+        d.pkt.len[i] = sf.len[i];
         i = i + 1;
     }
+    d.pkt_index = 0;
+    d.pkt_active = 1;
     return errno.I_OK;
+}
+
+// Hand out the next displayed frame of the armed packet. Returns 1 when out
+// holds a frame, 0 when the packet produced no further output (the packet is
+// then finished and a new send is allowed), or a negative code. Hidden frames
+// and show-existing frames are handled in bitstream order:
+//
+//   * a hidden coded frame updates the reference slots and yields no output;
+//   * a shown coded frame yields its freshly reconstructed pixels;
+//   * show_existing_frame yields the stored slot named by
+//     frame_to_show_map_idx without decoding a tile.
+//
+// out is cleared before decoding. Its view is valid until the next receive or
+// send call; see the output-lifetime note at the top. No placeholder frame is
+// ever produced: a packet whose slices are all hidden returns 0.
+//
+// Errors: I_BADPARAM for null pointers or an unbound decoder, I_NOMEM when
+// the bound work block is too small (d.work_need) or no free pixel buffer can
+// host the next frame (d.frame_need, then vp9_decoder_replace_buffer on a
+// free index), I_UNSUPPORTED for pending table blobs or a profile-0 surface
+// this library does not produce, and the header/tile modules' negative codes
+// otherwise. An error abandons the rest of the packet; the persistent state
+// is tainted until the next key or intra-only frame, as recorded in vp9.md.
+fn vp9_decoder_receive(d as *Vp9Decoder, out as *Vp9Output) as i64 {
+    if (cast(i64, d) == 0 || cast(i64, out) == 0) { return errno.I_BADPARAM; }
+    if (cast(i64, d.work) == 0) { return errno.I_BADPARAM; }
+    frame.frame_free(&out.frame);
+    out.render_width = 0;
+    out.render_height = 0;
+    out.profile = 0;
+    out.bit_depth = 0;
+    out.subsampling_x = 0;
+    out.subsampling_y = 0;
+    out.color_space = 0;
+    out.color_range = 0;
+    out.order = 0 - 1;
+
+    while (d.pkt_active == 1 && d.pkt_index < d.pkt.count) {
+        let is i64 as i = d.pkt_index;
+        let is i64 as st = _decode_slice(d, d.pkt.ptr[i], d.pkt.len[i], out);
+        d.pkt_index = i + 1;
+        if (st < 0) {
+            d.pkt_active = 0;
+            frame.frame_free(&out.frame);
+            return st;
+        }
+        if (st == 1) { return 1; }
+    }
+    d.pkt_active = 0;
+    return 0;
 }
