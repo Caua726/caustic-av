@@ -208,150 +208,170 @@ fn lf_filter_size(lf as *LfFrame, tx_sz as i64, is32_edge as i64, pass as i64,
 }
 
 // Sample at offset k along (dx, dy) from (x, y) in the plane.
-fn lf_at(data as *u8, stride as i64, x as i64, y as i64,
-         dx as i64, dy as i64, k as i64) as i64 {
-    return cast(i64, data[(y + k * dy) * stride + (x + k * dx)]);
-}
-
-// Section 8.8.5.2: narrow filter (4-tap, or the 4-sample high-variance form).
-fn lf_narrow(data as *u8, stride as i64, x as i64, y as i64,
-             dx as i64, dy as i64, hev as i64) as void {
-    let is i64 as p1 = lf_at(data, stride, x, y, dx, dy, 0 - 2);
-    let is i64 as p0 = lf_at(data, stride, x, y, dx, dy, 0 - 1);
-    let is i64 as q0 = lf_at(data, stride, x, y, dx, dy, 0);
-    let is i64 as q1 = lf_at(data, stride, x, y, dx, dy, 1);
-
-    let is i64 as ps1 = p1 - 128;
-    let is i64 as ps0 = p0 - 128;
-    let is i64 as qs0 = q0 - 128;
-    let is i64 as qs1 = q1 - 128;
+// The filters address samples by pointer: q0 is p[0], p0 is p[-step], and step
+// is 1 across a vertical edge or the stride across a horizontal one.
+fn lf_narrow(p as *u8, step as i64, hev as i64) as void {
+    let is i64 as ps1 = cast(i64, p[0 - 2 * step]) - 128;
+    let is i64 as ps0 = cast(i64, p[0 - step]) - 128;
+    let is i64 as qs0 = cast(i64, p[0]) - 128;
+    let is i64 as qs1 = cast(i64, p[step]) - 128;
 
     let is i64 as filter with mut = 0;
     if (hev == 1) {
-        filter = rt.recon_clip3(0 - 128, 127, ps1 - qs1);
+        filter = ps1 - qs1;
+        if (filter < 0 - 128) { filter = 0 - 128; }
+        if (filter > 127) { filter = 127; }
     }
-    filter = rt.recon_clip3(0 - 128, 127, filter + 3 * (qs0 - ps0));
-    let is i64 as f1 = rt.recon_clip3(0 - 128, 127, filter + 4) >> 3;
-    let is i64 as f2 = rt.recon_clip3(0 - 128, 127, filter + 3) >> 3;
+    filter = filter + 3 * (qs0 - ps0);
+    if (filter < 0 - 128) { filter = 0 - 128; }
+    if (filter > 127) { filter = 127; }
 
-    let is i64 as oq0 = rt.recon_clip3(0 - 128, 127, qs0 - f1) + 128;
-    let is i64 as op0 = rt.recon_clip3(0 - 128, 127, ps0 + f2) + 128;
-    data[y * stride + x] = cast(u8, oq0);
-    data[(y - dy) * stride + (x - dx)] = cast(u8, op0);
+    let is i64 as f1 with mut = filter + 4;
+    if (f1 > 127) { f1 = 127; }
+    f1 = f1 >> 3;
+    let is i64 as f2 with mut = filter + 3;
+    if (f2 > 127) { f2 = 127; }
+    f2 = f2 >> 3;
+
+    let is i64 as oq0 with mut = qs0 - f1;
+    if (oq0 < 0 - 128) { oq0 = 0 - 128; }
+    if (oq0 > 127) { oq0 = 127; }
+    let is i64 as op0 with mut = ps0 + f2;
+    if (op0 < 0 - 128) { op0 = 0 - 128; }
+    if (op0 > 127) { op0 = 127; }
+    p[0] = cast(u8, oq0 + 128);
+    p[0 - step] = cast(u8, op0 + 128);
 
     if (hev == 0) {
-        let is i64 as f = rt.recon_round2(f1, 1);
-        let is i64 as oq1 = rt.recon_clip3(0 - 128, 127, qs1 - f) + 128;
-        let is i64 as op1 = rt.recon_clip3(0 - 128, 127, ps1 + f) + 128;
-        data[(y + dy) * stride + (x + dx)] = cast(u8, oq1);
-        data[(y - 2 * dy) * stride + (x - 2 * dx)] = cast(u8, op1);
+        let is i64 as f = (f1 + 1) >> 1;
+        let is i64 as oq1 with mut = qs1 - f;
+        if (oq1 < 0 - 128) { oq1 = 0 - 128; }
+        if (oq1 > 127) { oq1 = 127; }
+        let is i64 as op1 with mut = ps1 + f;
+        if (op1 < 0 - 128) { op1 = 0 - 128; }
+        if (op1 > 127) { op1 = 127; }
+        p[step] = cast(u8, oq1 + 128);
+        p[0 - 2 * step] = cast(u8, op1 + 128);
     }
 }
 
-// Section 8.8.5.3: wide filter with log2Size 3 or 4. The 2^log2Size tap
-// weights sum to 2^log2Size, so the rounded result is already in 0..255.
-fn lf_wide(data as *u8, stride as i64, x as i64, y as i64,
-           dx as i64, dy as i64, log2size as i64) as void {
+// Spec 8.8.2 wide filter. Output i is
+//   Round2(v[i] + sum over j in -n..n of v[Clip3(-(n+1), n, i + j)], log2size)
+// computed with a sliding window instead of the double loop.
+fn lf_wide(p as *u8, step as i64, log2size as i64) as void {
     let is i64 as n = (1 << (log2size - 1)) - 1;
     let is i64 as lo = 0 - (n + 1);
-    let is [16]i64 as fbuf;
+    let is [16]i64 as v;
+    let is i64 as k with mut = lo;
+    while (k <= n) {
+        v[k - lo] = cast(i64, p[k * step]);
+        k = k + 1;
+    }
 
+    // Window for i = -n: Clip3 makes the indices -2n..0 collapse onto lo.
+    let is i64 as win with mut = 0;
+    let is i64 as j with mut = 0 - n;
+    while (j <= n) {
+        let is i64 as q with mut = j - n;
+        if (q < lo) { q = lo; }
+        win = win + v[q - lo];
+        j = j + 1;
+    }
+    let is i64 as round = 1 << (log2size - 1);
     let is i64 as i with mut = 0 - n;
     while (i < n) {
-        let is i64 as t with mut = lf_at(data, stride, x, y, dx, dy, i);
-        let is i64 as j with mut = 0 - n;
-        while (j <= n) {
-            let is i64 as p with mut = i + j;
-            if (p < lo) { p = lo; }
-            if (p > n) { p = n; }
-            t = t + lf_at(data, stride, x, y, dx, dy, p);
-            j = j + 1;
-        }
-        fbuf[i + n] = rt.recon_round2(t, log2size);
-        i = i + 1;
-    }
-    i = 0 - n;
-    while (i < n) {
-        data[(y + i * dy) * stride + (x + i * dx)] = cast(u8, fbuf[i + n]);
+        p[i * step] = cast(u8, (v[i - lo] + win + round) >> log2size);
+        // Slide to i + 1: drop Clip3(i - n), add Clip3(i + 1 + n).
+        let is i64 as d with mut = i - n;
+        if (d < lo) { d = lo; }
+        let is i64 as a with mut = i + 1 + n;
+        if (a > n) { a = n; }
+        win = win - v[d - lo] + v[a - lo];
         i = i + 1;
     }
 }
 
-// Section 8.8.5: the filter mask process followed by the appropriate filter.
-fn lf_sample(data as *u8, stride as i64, x as i64, y as i64,
-             dx as i64, dy as i64, limit as i64, blimit as i64,
+// Spec 8.8.2 for the one sample at p.
+fn lf_sample(p as *u8, step as i64, limit as i64, blimit as i64,
              thresh as i64, filter_size as i64) as void {
-    let is i64 as p0 = lf_at(data, stride, x, y, dx, dy, 0 - 1);
-    let is i64 as p1 = lf_at(data, stride, x, y, dx, dy, 0 - 2);
-    let is i64 as p2 = lf_at(data, stride, x, y, dx, dy, 0 - 3);
-    let is i64 as p3 = lf_at(data, stride, x, y, dx, dy, 0 - 4);
-    let is i64 as q0 = lf_at(data, stride, x, y, dx, dy, 0);
-    let is i64 as q1 = lf_at(data, stride, x, y, dx, dy, 1);
-    let is i64 as q2 = lf_at(data, stride, x, y, dx, dy, 2);
-    let is i64 as q3 = lf_at(data, stride, x, y, dx, dy, 3);
+    let is i64 as p0 = cast(i64, p[0 - step]);
+    let is i64 as p1 = cast(i64, p[0 - 2 * step]);
+    let is i64 as p2 = cast(i64, p[0 - 3 * step]);
+    let is i64 as p3 = cast(i64, p[0 - 4 * step]);
+    let is i64 as q0 = cast(i64, p[0]);
+    let is i64 as q1 = cast(i64, p[step]);
+    let is i64 as q2 = cast(i64, p[2 * step]);
+    let is i64 as q3 = cast(i64, p[3 * step]);
 
-    // hevMask.
+    let is i64 as ap1p0 with mut = p1 - p0;
+    if (ap1p0 < 0) { ap1p0 = 0 - ap1p0; }
+    let is i64 as aq1q0 with mut = q1 - q0;
+    if (aq1q0 < 0) { aq1q0 = 0 - aq1q0; }
+    if (ap1p0 > limit || aq1q0 > limit) { return; }
+    let is i64 as d with mut = p3 - p2;
+    if (d < 0) { d = 0 - d; }
+    if (d > limit) { return; }
+    d = p2 - p1;
+    if (d < 0) { d = 0 - d; }
+    if (d > limit) { return; }
+    d = q2 - q1;
+    if (d < 0) { d = 0 - d; }
+    if (d > limit) { return; }
+    d = q3 - q2;
+    if (d < 0) { d = 0 - d; }
+    if (d > limit) { return; }
+    d = p0 - q0;
+    if (d < 0) { d = 0 - d; }
+    let is i64 as e with mut = p1 - q1;
+    if (e < 0) { e = 0 - e; }
+    if (d * 2 + e / 2 > blimit) { return; }
+
     let is i64 as hev with mut = 0;
-    if (rt.recon_abs(p1 - p0) > thresh) { hev = 1; }
-    if (rt.recon_abs(q1 - q0) > thresh) { hev = 1; }
+    if (ap1p0 > thresh || aq1q0 > thresh) { hev = 1; }
 
-    // filterMask.
-    let is i64 as mask with mut = 0;
-    if (rt.recon_abs(p3 - p2) > limit) { mask = 1; }
-    if (rt.recon_abs(p2 - p1) > limit) { mask = 1; }
-    if (rt.recon_abs(p1 - p0) > limit) { mask = 1; }
-    if (rt.recon_abs(q1 - q0) > limit) { mask = 1; }
-    if (rt.recon_abs(q2 - q1) > limit) { mask = 1; }
-    if (rt.recon_abs(q3 - q2) > limit) { mask = 1; }
-    if (rt.recon_abs(p0 - q0) * 2 + rt.recon_abs(p1 - q1) / 2 > blimit) {
-        mask = 1;
+    if (filter_size == rt.TX_4X4) {
+        lf_narrow(p, step, hev);
+        return;
     }
-    if (mask != 0) { return; }
 
     let is i64 as flat with mut = 1;
-    if (filter_size >= rt.TX_8X8) {
-        // flatMask: four samples each side within 1 of the boundary sample.
-        if (rt.recon_abs(p1 - p0) > 1) { flat = 0; }
-        if (rt.recon_abs(q1 - q0) > 1) { flat = 0; }
-        if (rt.recon_abs(p2 - p0) > 1) { flat = 0; }
-        if (rt.recon_abs(q2 - q0) > 1) { flat = 0; }
-        if (rt.recon_abs(p3 - p0) > 1) { flat = 0; }
-        if (rt.recon_abs(q3 - q0) > 1) { flat = 0; }
+    if (ap1p0 > 1 || aq1q0 > 1) { flat = 0; }
+    if (flat == 1) {
+        d = p2 - p0;
+        if (d < 0) { d = 0 - d; }
+        if (d > 1) { flat = 0; }
+        d = q2 - q0;
+        if (d < 0) { d = 0 - d; }
+        if (d > 1) { flat = 0; }
+        d = p3 - p0;
+        if (d < 0) { d = 0 - d; }
+        if (d > 1) { flat = 0; }
+        d = q3 - q0;
+        if (d < 0) { d = 0 - d; }
+        if (d > 1) { flat = 0; }
+    }
+    if (flat == 0) {
+        lf_narrow(p, step, hev);
+        return;
+    }
+    if (filter_size == rt.TX_8X8) {
+        lf_wide(p, step, 3);
+        return;
     }
 
-    let is i64 as flat2 with mut = 1;
-    if (filter_size >= rt.TX_16X16) {
-        // flatMask2: the next four samples each side, also within 1 of the
-        // boundary sample.
-        let is i64 as p4 = lf_at(data, stride, x, y, dx, dy, 0 - 5);
-        let is i64 as p5 = lf_at(data, stride, x, y, dx, dy, 0 - 6);
-        let is i64 as p6 = lf_at(data, stride, x, y, dx, dy, 0 - 7);
-        let is i64 as p7 = lf_at(data, stride, x, y, dx, dy, 0 - 8);
-        let is i64 as q4 = lf_at(data, stride, x, y, dx, dy, 4);
-        let is i64 as q5 = lf_at(data, stride, x, y, dx, dy, 5);
-        let is i64 as q6 = lf_at(data, stride, x, y, dx, dy, 6);
-        let is i64 as q7 = lf_at(data, stride, x, y, dx, dy, 7);
-        if (rt.recon_abs(p7 - p0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(q7 - q0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(p6 - p0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(q6 - q0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(p5 - p0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(q5 - q0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(p4 - p0) > 1) { flat2 = 0; }
-        if (rt.recon_abs(q4 - q0) > 1) { flat2 = 0; }
+    let is i64 as k with mut = 4;
+    while (k < 8) {
+        d = cast(i64, p[(0 - k - 1) * step]) - p0;
+        if (d < 0) { d = 0 - d; }
+        if (d > 1) { lf_wide(p, step, 3); return; }
+        d = cast(i64, p[k * step]) - q0;
+        if (d < 0) { d = 0 - d; }
+        if (d > 1) { lf_wide(p, step, 3); return; }
+        k = k + 1;
     }
-
-    if (filter_size == rt.TX_4X4 || flat == 0) {
-        lf_narrow(data, stride, x, y, dx, dy, hev);
-    } else if (filter_size == rt.TX_8X8 || flat2 == 0) {
-        lf_wide(data, stride, x, y, dx, dy, 3);
-    } else {
-        lf_wide(data, stride, x, y, dx, dy, 4);
-    }
+    lf_wide(p, step, 4);
 }
 
-// Mode type used by LvlLookup: 1 for NEARESTMV/NEARMV/NEWMV, else 0
-// (spec 8.8.4, including intra and ZEROMV).
 fn lf_mode_type(mode as i64) as i64 {
     if (mode == rt.MODE_NEARESTMV || mode == rt.MODE_NEARMV || mode == rt.MODE_NEWMV) {
         return 1;
@@ -382,11 +402,20 @@ fn lf_filter_sb(lf as *LfFrame, blk as *LfBlockInfo, plane as i64, pass as i64,
         edge_len = 64 >> subx;
     }
 
+    // Samples of one edge in the same 8x8 luma unit share every decision, so
+    // those are made once per run.
+    let is i64 as along_sub with mut = suby;
+    if (pass == 1) { along_sub = subx; }
+    let is i64 as filt_step with mut = 1;
+    let is i64 as next_step with mut = stride;
+    if (pass == 1) { filt_step = stride; next_step = 1; }
+
     let is i64 as edge_count = 16 >> sub;
     let is i64 as edge with mut = 0;
     while (edge < edge_count) {
         let is i64 as i with mut = 0;
         while (i < edge_len) {
+            let is i64 as run_end = (((i << along_sub) | 7) + 1) >> along_sub;
             let is i64 as x with mut = 0;
             let is i64 as y with mut = 0;
             if (pass == 0) {
@@ -476,12 +505,19 @@ fn lf_filter_sb(lf as *LfFrame, blk as *LfBlockInfo, plane as i64, pass as i64,
                     if (lvl > 0) {
                         let is LfThresh as t;
                         lf_thresholds(lf, lvl, &t);
-                        lf_sample(data, stride, x >> subx, y >> suby,
-                                  dx, dy, t.limit, t.blimit, t.thresh, filter_size);
+                        let is *u8 as sp with mut =
+                            data + (y >> suby) * stride + (x >> subx);
+                        let is i64 as k with mut = i;
+                        while (k < run_end && k < edge_len) {
+                            lf_sample(sp, filt_step, t.limit, t.blimit, t.thresh,
+                                      filter_size);
+                            sp = sp + next_step;
+                            k = k + 1;
+                        }
                     }
                 }
             }
-            i = i + 1;
+            i = run_end;
         }
         edge = edge + 1;
     }
