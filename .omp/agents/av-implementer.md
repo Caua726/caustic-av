@@ -72,8 +72,8 @@ the reference files you read.
 - A reviewer marks any finding that changes a public interface as
   INTERFACE-BLOCKING. The stage N+1 writer then stops until the fix is on
   stage N's branch, rebases, and adapts.
-- Up to four agents may write at once (writers, reviewers and fixers share
-the 4-agent cap). A stage may be split among several writers when its slices
+- Up to six agents may run at once (writers, reviewers and fixers share the
+6-agent cap); reviews and writing must not compete for slots. A stage may be split among several writers when its slices
 are independent, and a later stage within the three-stage limit may start
 while an earlier one is still being written if the interfaces it needs are
 already fixed. Nothing is run, compiled or tested.
@@ -107,6 +107,9 @@ When you finish, reply with:
 4. status: WRITTEN, NOT VERIFIED
 5. the checks the brief's original criteria would require (MD5, ffprobe,
    trace_headers, opus_compare, FFmpeg difference, fps), listed as NOT RUN
-6. anything unsupported, deferred, pending or left unverified
+6. PENDING review notes to record in the codec .md: document/wording, naming,
+   style or minor robustness that does not affect valid-stream output or
+   memory safety
+7. anything unsupported, deferred, pending or left unverified
 
 Never claim a command passed. Nothing is run in this phase.

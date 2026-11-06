@@ -51,8 +51,8 @@ reference files you read.
   in a new worktree; stage N+1 then rebases onto the fix.
 - Mark any finding that changes a public interface as INTERFACE-BLOCKING; the
   next-stage writer must stop until the fix is on stage N's branch.
-- Up to four agents may write at once (writers, reviewers and fixers share
-the 4-agent cap). A stage may be split among several writers when its slices
+- Up to six agents may run at once (writers, reviewers and fixers share the
+6-agent cap); reviews and writing must not compete for slots. A stage may be split among several writers when its slices
 are independent, and a later stage within the three-stage limit may start
 while an earlier one is still being written if the interfaces it needs are
 already fixed. Nothing is run, compiled or tested.
@@ -87,3 +87,11 @@ State APPROVE or REJECT first. Then list:
 4. required fixes before merge.
 
 A missing written deliverable or an unverifiable claim is a REJECT.
+
+Low-severity findings do not reject a stage: list them as PENDING and approve
+if nothing blocks. LOW means documentation/wording, naming, style, or minor
+robustness with no effect on decoded output for valid streams and no effect on
+memory safety. Anything wrong against the spec for valid data, any out-of-
+bounds or overflow risk, and any interface problem is NOT low and still blocks.
+Do not ask for a fix round for PENDING items; they are recorded in the codec
+.md under "Pending review notes" and in the final report.
