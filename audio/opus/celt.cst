@@ -307,6 +307,8 @@ fn celt_decode_with_range(d as *st.CeltDec, r as *rc.OpusRange,
                           pcm as *f64, pcm_cap as i64) as i64 {
     if (cast(i64, r) == 0) { return errno.I_BADPARAM; }
     let is i64 as len = r.len;
+    if (len < 0) { return errno.I_BADPARAM; }
+    if (len > 0 && cast(i64, r.ptr) == 0) { return errno.I_BADPARAM; }
     if (len < 1) { return errno.I_UNSUPPORTED; }
     if (len > 1275) { return errno.I_CORRUPT; }
     if (tbl.celt_tables_ready(&d.tab) == 0) { return errno.I_UNSUPPORTED; }

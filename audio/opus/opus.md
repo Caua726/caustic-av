@@ -95,7 +95,7 @@ The CELT end band comes from the audio bandwidth, per Table 55:
 
 | Bandwidth | First uncoded band (`end`) | Last coded frequency |
 |---|---|---|
-| NB | 13 | 4.8 kHz |
+| NB | 13 | 4.0 kHz |
 | MB / WB | 17 | 8 kHz |
 | SWB | 19 | 12 kHz |
 | FB | 21 | 20 kHz |
@@ -161,18 +161,18 @@ decoded but discarded at the start. They are never skipped before decoding,
 because the codec is predictive. `opus_decoder_init` arms the count;
 `opus_decode` decodes every frame and drops the first `pre_skip` output
 frames, reporting fewer frames on the packets that overlap the skip. The
-returned frame count is already net of the skip, so the Ogg layer must not
+returned frame count is already net of the skip, so the caller must not
 subtract `pre_skip` a second time when it assigns timestamps; it only uses
 the value to compute PCM positions.
 
 RFC 7845 Section 4.4: the EOS page may carry a granule smaller than the
-decoded length. The Ogg layer computes the difference and calls
-`opus_decoder_set_end_trim` before decoding the last packet; `opus_decode`
-drops that many frames from the end of that packet. A count larger than the
-packet's emitted frames continues into the following packet, so a trim that
-crosses a packet boundary is honoured; a correct Ogg caller never needs
-that, because the RFC says the discarded amount SHOULD fit in the last
-packet.
+decoded length. The caller must compute the difference from the page
+granule and call `opus_decoder_set_end_trim` before decoding the last
+packet; `opus_decode` drops that many frames from the end of that packet. A
+count larger than the packet's emitted frames continues into the following
+packet, so a trim that crosses a packet boundary is honoured; a correct
+caller never needs that, because the RFC says the discarded amount SHOULD
+fit in the last packet.
 
 Hooks:
 
@@ -205,7 +205,9 @@ buffers are fixed-size arrays inside it. `opus_decoder_init` parses
 `OpusHead`, initialises both codecs and sets the fixed output rate to
 48 kHz. `opus_decoder_reset` clears both codecs, the mode history, the
 pre-skip and the end trim for a new logical stream with the same header.
-Destroying the decoder is the caller's job; the struct never allocates.
+`opus_decoder_packets` reports the number of successfully decoded packets;
+`opus_decoder_clear` and `opus_decoder_reset` zero the counter. Destroying
+the decoder is the caller's job; the struct never allocates.
 
 Reset rules implemented from RFC 6716 Section 4.5.2:
 
@@ -213,11 +215,14 @@ Reset rules implemented from RFC 6716 Section 4.5.2:
 - CELT is reset whenever the operating mode changes and the new mode is
   Hybrid or CELT-only.
 - A SILK bandwidth change resets SILK inside `silk_decode`.
-- Hybrid to WB SILK keeps both states and adds the final CELT overlap to the
-  first 2.5 ms of SILK output. This is done by decoding a 2.5 ms silence
+- Hybrid to SILK adds the final CELT overlap to the first 2.5 ms of SILK
+  output on every SILK bandwidth. This is done by decoding a 2.5 ms silence
   frame with CELT (`start = 0`, the SILK packet's end band) and summing its
-  output into the SILK block, the same construction as the reference.
-- Hybrid to NB/MB SILK resets SILK through the bandwidth change.
+  output into the SILK block, the same construction as the reference. WB is
+  the normative direct-mixing case; NB/MB also reset SILK through the
+  bandwidth change and still receive the CELT overlap.
+- Hybrid to NB/MB SILK resets SILK through the bandwidth change (the CELT
+  overlap is still added, as above).
 - Transitions that the reference handles with PLC (SILK to CELT without
   redundancy, CELT to SILK without redundancy, and similar non-normative
   cases) are not concealed here. CELT is reset as required, SILK is reset
@@ -245,10 +250,10 @@ therefore correct, but a stream that relies on redundancy for a clean
 transition will have a discontinuity rather than the reference's cross-faded
 redundant frame.
 
-The Hybrid to WB SILK overlap flush is independent of this: the reference
+The Hybrid to SILK overlap flush is independent of this: the reference
 skips that flush only in one redundancy combination, and this decoder has
 no redundant frame to combine with, so it performs the flush on every
-Hybrid to WB SILK transition.
+Hybrid to SILK transition (WB, NB and MB).
 
 ## Packet-loss concealment, DTX and FEC
 
@@ -271,7 +276,7 @@ There is no PLC and no FEC output:
 
 A caller that wants concealment must implement it outside this decoder. The
 one place the spec's silence behaviour is used deliberately is the Hybrid
-to WB SILK overlap flush described above: that silence frame is not a
+to SILK overlap flush described above: that silence frame is not a
 concealment, it is the normative way to drain the CELT overlap buffer.
 
 ## Ogg and WebM packet paths
@@ -280,10 +285,11 @@ No file I/O is performed anywhere in the library. Both containers expose
 borrowed packet bytes:
 
 - **Ogg:** `ogg_open` / `ogg_next` in `container/ogg.cst` hand out the
-  `OpusHead` BOS packet as the track's `head` and each audio packet as
-  `OggPacket.ptr` / `OggPacket.len`. Granules are 48 kHz sample counts;
-  pre-skip and EOS trimming are applied with the hooks above. A packet that
-  spans pages is assembled in the container, never in the decoder.
+  `OpusHead` BOS packet as the track's `head`/`head_len` and each audio
+  packet as a `core/packet.Packet` (`Packet.data` / `Packet.len`). Granules
+  are 48 kHz sample counts; the caller must apply pre-skip and the EOS trim
+  with the hooks above. A packet that spans pages is assembled in the
+  container, never in the decoder.
 - **WebM/Matroska:** `mk_open` / `mk_next` in `container/matroska.cst` hand
   out each block's bytes as `Packet.data` / `Packet.len`; the track's
   `codec_priv` is the `OpusHead` for an `A_OPUS` track. `mk_next` also
@@ -445,7 +451,7 @@ was compiled or executed in the writing phase.
 - **Hard saturation instead of soft clipping.** The reference decoder can
   apply a soft clip after decoding. This decoder rounds and saturates; loud
   signals may differ by more than rounding.
-- **Hybrid -> WB SILK overlap flush.** Implemented with a 2-byte
+- **Hybrid -> SILK overlap flush.** Implemented with a 2-byte
   `0xFF 0xFF` CELT silence frame, which depends on the CELT silence
   detection and on the CELT overlap state being preserved across the mode
   switch. The construction follows the reference, but no hybrid stream has
@@ -470,6 +476,30 @@ was compiled or executed in the writing phase.
 ## Pending review notes
 
 Low-severity notes; none affects valid-stream memory safety.
+
+### Integration review (7d)
+
+The seven findings from the 7d integration review and their resolution:
+
+1. **NB band label.** The last coded NB band ends at 4.0 kHz; `end = 13`
+   remains correct (band 13 is the first uncoded band).
+2. **Call-graph name.** The call graph uses `_opus_skip_redundancy`, the
+   actual private function name.
+3. **Hybrid -> SILK flush.** The text now says Hybrid -> SILK on every
+   bandwidth; WB is the normative direct-mixing case, NB/MB also reset
+   SILK and still receive the CELT overlap.
+4. **Ogg path type and caller.** There is no audio caller in the library;
+   `ogg_next` hands out `core/packet.Packet` (`Packet.data`/`Packet.len`),
+   and the caller must apply pre-skip and the EOS trim.
+5. **Shared-range pointer.** `celt_decode_with_range` rejects a null
+   `r.ptr` when `r.len > 0` with `I_BADPARAM`, in addition to the `r.len`
+   checks.
+6. **Packet counter.** `opus_decoder_packets` exposes the successful
+   `OpusDecoder.packets` count.
+7. **celt.md slice wording.** After a 4.5.1 shrink, `r.len` is the reduced
+   main-frame slice, not the original frame size.
+
+### Other notes
 
 - **The second Opus header is consumed without a magic check.** `ogg.cst`
   advances past the OpusTags packet and does not verify its `OpusTags`
@@ -499,17 +529,37 @@ Low-severity notes; none affects valid-stream memory safety.
 - **`opus_decoder_clear` zeroes the whole struct, including the CELT table
   cache.** Re-initialising rebuilds the tables. This is simple but not the
   cheapest path for a seek-heavy player.
-- **The `Hybrid -> WB SILK` flush changes CELT state.** It programs
+- **The `Hybrid -> SILK` flush changes CELT state.** It programs
   `start = 0`, `lm = 0` and the SILK packet's end band. The next CELT or
   Hybrid frame resets CELT anyway under Section 4.5.2, so this is
   intentional.
 - **End trim may span packets.** The count is carried into the following
   packet when it exceeds the current one, so a segment-level crop is not
-  silently truncated. A correct Ogg caller does not need the carry: RFC
+  silently truncated. A correct caller does not need the carry: RFC
   7845 Section 4.4 says the discarded amount SHOULD fit in the last packet.
 - **No end-of-stream flush for the SILK resampler.** The last resampler
   delay samples are not emitted; pre-skip and end trim address the start
   and the EOS granule, not the resampler tail.
+
+## Scope gaps
+
+- **Redundant CELT frames are skipped, not synthesised.** The 4.5.1 header
+  is parsed and the main frame stays aligned, but a transition that relies
+  on the redundant frame's audio/cross-fade is not yet conformance for
+  redundancy transitions.
+- **PLC/FEC/DTX are refused.** `opus_decode_lost`, `opus_decode_fec` and any
+  packet containing a zero-length frame return `I_UNSUPPORTED`; there is no
+  concealment and no fabricated silence.
+- **Version 0 is accepted for OpusHead.** RFC 7845 Section 5.1 defines
+  version 1 and says implementations SHOULD accept values up to 15; this
+  decoder accepts 0..15.
+- **Output gain is off by default.** The raw `OpusHead` gain is stored and
+  the linear factor is computed, but it is applied only after
+  `opus_decoder_set_apply_gain`.
+- **CELT data provenance.** The three RFC-named CELT data blobs
+  (`e_means`, `e_prob`, `caps`) are committed in `celt_tables_data.cst`;
+  the generator has not been run and the derived tables are UNCONFIRMED
+  (see `celt.md`).
 
 ## References read
 
@@ -525,7 +575,7 @@ was copied, ported or transcribed. Every URL below prefixed with
 `https://raw.githubusercontent.com/`:
 
 - `xiph/opus/main/src/opus_decoder.c` — packet-to-frame loop, the SILK/CELT
-  mode split, hybrid start/end bands, `celt_accum`, the Hybrid -> WB SILK
+  mode split, hybrid start/end bands, `celt_accum`, the Hybrid -> SILK
   silence flush, pre-skip and output gain.
 - `xiph/opus/main/silk/dec_API.c` — superframe handling, `payloadSize_ms`,
   internal sample rate, LBRR skipping, stereo/mono transitions and the

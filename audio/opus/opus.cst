@@ -35,7 +35,7 @@
 // the main frame stays aligned, but that redundant frame is not
 // synthesised. Packet-loss concealment and FEC are not implemented.
 //
-// Pre-skip and end trimming are hooks for the Ogg layer (RFC 7845 Sections
+// Pre-skip and end trimming are hooks for the caller (RFC 7845 Sections
 // 4.2 and 4.4). Decoding is never skipped: the first pre_skip samples are
 // produced and then dropped, because the decoder is predictive. The hooks
 // are stateful, so a caller can decode a whole page and let the decoder drop
@@ -182,6 +182,13 @@ fn opus_decoder_skip_remaining(d as *OpusDecoder) as i64 {
     return d.skip_remaining;
 }
 
+// Packets decoded successfully since init or reset. A packet that returned
+// a negative code is not counted.
+fn opus_decoder_packets(d as *OpusDecoder) as i64 {
+    if (cast(i64, d) == 0) { return 0; }
+    return d.packets;
+}
+
 // Replace the effective pre-skip and re-arm it. It is a stream-start
 // control: set it before the first packet (or when cropping a stream).
 // Calling it after decoding has started begins a new skip at the current
@@ -214,7 +221,7 @@ fn opus_decoder_apply_gain(d as *OpusDecoder) as i64 {
     return d.apply_gain;
 }
 
-// Samples to drop from the end of the next decoded output. The Ogg layer
+// Samples to drop from the end of the next decoded output. The caller
 // sets this from the EOS granule (RFC 7845 Section 4.4) just before the
 // final packet. A count larger than that packet can emit continues into the
 // following packet, so a trim that spans a packet boundary also works.
@@ -245,8 +252,9 @@ fn _opus_duration_ms(samples as i64) as i64 {
 }
 
 // First uncoded CELT band for an audio bandwidth (Section 4.3, Table 55).
-// NB stops at band 13 (4.8 kHz), MB and WB at 17 (8 kHz), SWB at 19
-// (12 kHz) and FB at 21 (20 kHz).
+// NB stops at band 13, so the last coded band is band 12 and the coded
+// range ends at 4.0 kHz; MB and WB at 17 (8 kHz), SWB at 19 (12 kHz) and
+// FB at 21 (20 kHz). The value is the first *uncoded* band.
 fn _opus_celt_end(bandwidth as i64) as i64 {
     if (bandwidth == opus_packet.OPUS_BANDWIDTH_NARROWBAND) { return 13; }
     if (bandwidth == opus_packet.OPUS_BANDWIDTH_MEDIUMBAND) { return 17; }
@@ -333,12 +341,14 @@ fn _opus_skip_redundancy(r as *rc.OpusRange, mode as i64) as i64 {
     return errno.I_OK;
 }
 
-// RFC 6716 Section 4.5.2 and Figure 18: switching from Hybrid to WB SILK
-// adds the final CELT overlap buffer to the first 2.5 ms of the SILK-only
+// RFC 6716 Section 4.5.2 and Figure 18: switching from Hybrid to SILK adds
+// the final CELT overlap buffer to the first 2.5 ms of the SILK-only
 // packet. Decoding a 2.5 ms silence frame with CELT flushes that tail
 // without adding any new high-band audio. The CELT state is deliberately
 // not reset before this, and the caller has already decoded the SILK part
-// of the frame.
+// of the frame. This runs for every SILK bandwidth: WB is the normative
+// direct-mixing case, while NB/MB also reset SILK through the bandwidth
+// change and still receive the CELT overlap.
 fn _opus_hybrid_to_silk(d as *OpusDecoder, end as i64,
                         stream_channels as i64) as i64 {
     let is i64 as fr = celt.celt_set_frame(&d.celt, 0, end, 0,
@@ -487,8 +497,10 @@ fn opus_decode(d as *OpusDecoder, pkt as *u8, len as i64, out as *i16,
             if (xr < 0) { return xr; }
             planar = 1;
 
-            // Normative Hybrid -> WB SILK transition: mix in the retained
-            // CELT overlap before the SILK output is used.
+            // Hybrid -> SILK transition: mix in the retained CELT overlap
+            // before the SILK output is used. WB keeps the SILK state (the
+            // normative direct-mixing case); NB/MB reset SILK inside
+            // silk_decode and still get the CELT overlap.
             if (d.prev_mode == opus_packet.OPUS_MODE_HYBRID) {
                 let is i64 as hr = _opus_hybrid_to_silk(d,
                     _opus_celt_end(p.bandwidth), p.stereo + 1);

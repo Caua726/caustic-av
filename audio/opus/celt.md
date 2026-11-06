@@ -214,7 +214,12 @@ celt.celt_decode_with_range(&d, r, pcm, pcm_cap)      // frames or <0
   is one range stream shared with SILK, so the Opus layer calls
   `celt_decode_with_range` with the decoder SILK has already advanced; the
   CELT bit budget is measured against `r.len`, which must be the same frame
-  slice.
+  slice. If the caller has already parsed a 4.5.1 redundancy header,
+  `r.len` is the *reduced* main-frame slice with the redundant tail
+  excluded, not the original frame size. `r.len` must be non-negative (a
+  negative length is `I_BADPARAM`); `r.len == 0` is the PLC/DTX case and
+  returns `I_UNSUPPORTED`; `r.ptr` must be non-null when `r.len > 0`
+  (`I_BADPARAM`).
 
 The range decoder contract used is the one agreed for the Ogg/packet/range
 slice:
