@@ -87,7 +87,9 @@ The `Decoder` is a value the caller owns and is deliberately large:
 Nothing in `decode.cst` allocates. A `Decoder` is used only after
 `decode_open` has returned 0: open initialises the selected codec and every
 wrapper field, so the caller does not have to zero the object first. Before a
-successful open, send and receive return `I_BADPARAM`.
+successful open, send and receive return `I_BADPARAM`. A `Decoder` is a single
+value: do not copy it after open, because the codec state and, for VP9, the
+pointers to the caller's work and pixel blocks would be duplicated.
 
 VP9 additionally needs caller blocks, which this module forwards to
 `video/vp9/decode.cst`:
